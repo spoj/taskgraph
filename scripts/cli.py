@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import duckdb
+import os
 import sys
 import click
 import tomllib
@@ -26,9 +27,10 @@ from dotenv import load_dotenv, find_dotenv
 
 # Load .env by walking upward from the CWD.
 # This matches common "app repo has a .env" workflows.
-dotenv_path = find_dotenv(usecwd=True)
-if dotenv_path:
-    load_dotenv(dotenv_path)
+_dotenv_path = find_dotenv(usecwd=True)
+DOTENV_PATH = Path(_dotenv_path) if _dotenv_path else None
+if _dotenv_path:
+    load_dotenv(_dotenv_path)
 
 # Allow importing local spec modules (e.g. specs.main) from the CWD.
 # Console-script entrypoints don't reliably include the working directory.
@@ -49,6 +51,18 @@ def _meta_json(meta: dict[str, str], key: str) -> dict[str, Any]:
     """Parse a JSON blob from workspace meta."""
     raw = meta.get(key)
     return json.loads(raw) if raw else {}
+
+
+def _require_openrouter_api_key() -> None:
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return
+
+    hint = (
+        f"Set OPENROUTER_API_KEY in your environment or in {DOTENV_PATH}"
+        if DOTENV_PATH
+        else "Set OPENROUTER_API_KEY in your environment or in a .env in the current directory (or a parent directory)."
+    )
+    raise click.ClickException(f"OPENROUTER_API_KEY is required. {hint}")
 
 
 @click.group()
@@ -265,6 +279,8 @@ def run(
     log.info("Model: %s", model)
     log.info("Tasks: %d\n", len(loaded["tasks"]))
 
+    _require_openrouter_api_key()
+
     async def _run():
         async with OpenRouterClient(reasoning_effort=reasoning_effort) as client:
             return await workspace.run(
@@ -475,6 +491,8 @@ def rerun(
     )
     log.info("Tasks: %d\n", len(loaded["tasks"]))
 
+    _require_openrouter_api_key()
+
     async def _run():
         async with OpenRouterClient(reasoning_effort=reasoning_effort) as client:
             return await workspace.rerun(
@@ -518,17 +536,22 @@ def extract_spec_cmd(db_file: Path, out_file: Path):
 
 
 @main.command()
+@click.argument("target", required=False, type=click.Path(path_type=Path))
 @click.option(
     "--spec",
     "-s",
     default=None,
     help="Spec module path (default: [tool.taskgraph].spec from pyproject.toml)",
 )
-def show(spec: str | None):
-    """Show spec structure: inputs, DAG layers, task details.
+def show(target: Path | None, spec: str | None):
+    """Show a spec or workspace database.
+
+    If TARGET is a .db file, shows workspace metadata and outputs.
+    Otherwise, shows the spec structure.
 
     \b
     Example:
+        taskgraph show output.db
         taskgraph show --spec my_app.specs.main
         taskgraph show
     """
@@ -537,6 +560,58 @@ def show(spec: str | None):
         format="%(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+
+    if target is not None:
+        conn = duckdb.connect(str(target), read_only=True)
+        meta = read_workspace_meta(conn)
+        conn.close()
+        if not meta:
+            raise click.ClickException(
+                f"{target} has no workspace metadata — not a Taskgraph workspace."
+            )
+
+        run = _meta_json(meta, "run")
+        spec_m = _meta_json(meta, "spec")
+        exports = _meta_json(meta, "exports")
+
+        click.echo(f"Workspace: {target}\n")
+        click.echo(f"Created: {meta.get('created_at_utc', '(unknown)')}")
+        click.echo(f"Model: {meta.get('llm_model', '(unknown)')}")
+        click.echo(f"Mode: {run.get('mode', '(unknown)')}")
+        if run.get("source_db"):
+            click.echo(f"Source: {run.get('source_db')}")
+        if spec_m.get("module"):
+            click.echo(f"Spec: {spec_m.get('module')}")
+        if spec_m.get("git_commit"):
+            click.echo(f"Spec commit: {spec_m.get('git_commit')}")
+
+        counts = _meta_json(meta, "inputs_row_counts")
+        if counts:
+            click.echo("\nInputs:")
+            for name in sorted(counts.keys()):
+                click.echo(f"  {name}: {counts[name]} rows")
+
+        fp = _meta_json(meta, "structural_fingerprint")
+        tasks = fp.get("tasks") or []
+        if tasks:
+            click.echo(f"\nTasks ({len(tasks)}):")
+            for t in tasks:
+                click.echo(f"  {t.get('name')}")
+
+        if exports:
+            attempted = exports.get("attempted")
+            results = exports.get("results") or {}
+            click.echo("\nExports:")
+            click.echo(f"  attempted: {attempted}")
+            for name in sorted(results.keys()):
+                r = results[name]
+                ok = r.get("ok")
+                err = r.get("error")
+                if ok:
+                    click.echo(f"  {name}: OK")
+                else:
+                    click.echo(f"  {name}: FAILED ({err})")
+        return
 
     if spec is None:
         spec = _default_spec_module()

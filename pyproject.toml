@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 taskgraph = "scripts.cli:main"
+tg = "scripts.cli:main"
 
 [build-system]
 requires = ["hatchling"]

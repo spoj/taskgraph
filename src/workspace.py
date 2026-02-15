@@ -213,6 +213,29 @@ def read_workspace_meta(conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
         return {}
 
 
+def upsert_workspace_meta(
+    conn: duckdb.DuckDBPyConnection, rows: list[tuple[str, str]]
+) -> None:
+    """Upsert additional workspace metadata rows.
+
+    Unlike persist_workspace_meta(), this does not clear existing keys.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS _workspace_meta (
+            key VARCHAR PRIMARY KEY,
+            value VARCHAR
+        )
+    """)
+    conn.executemany(
+        """
+        INSERT INTO _workspace_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        rows,
+    )
+
+
 def check_fingerprint_compatibility(
     source_conn: duckdb.DuckDBPyConnection,
     current_fingerprint: dict[str, Any],
@@ -598,6 +621,23 @@ class Workspace:
             log.info("--- Exports (%d) ---", len(self.exports))
             export_errors = self._run_exports(conn)
 
+        # Persist export results for later inspection
+        if self.exports:
+            results: dict[str, dict[str, Any]] = {}
+            for name in sorted(self.exports.keys()):
+                if name in export_errors:
+                    results[name] = {"ok": False, "error": export_errors[name]}
+                else:
+                    results[name] = {"ok": bool(all_success), "error": None}
+            exports_meta = {
+                "attempted": bool(all_success),
+                "results": results,
+            }
+            upsert_workspace_meta(
+                conn,
+                [("exports", json.dumps(exports_meta, sort_keys=True))],
+            )
+
         conn.close()
         elapsed_s = time.time() - start_time
 
@@ -821,6 +861,23 @@ class Workspace:
         if all_success and self.exports:
             log.info("--- Exports (%d) ---", len(self.exports))
             export_errors = self._run_exports(conn)
+
+        # Persist export results for later inspection
+        if self.exports:
+            results: dict[str, dict[str, Any]] = {}
+            for name in sorted(self.exports.keys()):
+                if name in export_errors:
+                    results[name] = {"ok": False, "error": export_errors[name]}
+                else:
+                    results[name] = {"ok": bool(all_success), "error": None}
+            exports_meta = {
+                "attempted": bool(all_success),
+                "results": results,
+            }
+            upsert_workspace_meta(
+                conn,
+                [("exports", json.dumps(exports_meta, sort_keys=True))],
+            )
 
         conn.close()
         elapsed_s = time.time() - start_time

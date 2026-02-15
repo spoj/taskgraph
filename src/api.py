@@ -21,12 +21,6 @@ import sys
 from typing import Any, Awaitable, Callable
 
 import httpx
-from dotenv import load_dotenv
-from pathlib import Path
-
-# Load .env from project root
-_env_path = Path(__file__).parent.parent / ".env"
-load_dotenv(_env_path)
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
