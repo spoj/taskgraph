@@ -1,16 +1,73 @@
-# Workspace Spec Writer's Guide
+# Workspace Spec Guide (For Spec Writers)
 
-A workspace spec is a Python module that defines what data to load, what to ask the LLM agent to do, how to validate the results, and optionally how to export them.
+This guide targets people writing **workspace specs**: Python modules (usually shipped inside your own package) that call Taskgraph.
+
+A spec defines:
+- `INPUTS`: how to ingest data into DuckDB tables
+- `TASKS`: a DAG of LLM tasks; each task produces one or more SQL views
+- `EXPORTS` (optional): functions that export files from the final workspace
+
+Specs are imported as modules (e.g. `my_app.specs.main`). Taskgraph does not load specs from file paths.
+
+## Recommended Layout
+
+Two common patterns:
+
+1) In an application package
+
+```text
+my_app/
+  __init__.py
+  specs/
+    __init__.py
+    main.py
+    jan_2026.py
+    feb_2026.py
+pyproject.toml
+```
+
+Run with:
+
+```bash
+uv run taskgraph run --spec my_app.specs.main -o output.db
+```
+
+2) In a repo-local `specs/` directory (what `taskgraph init` scaffolds)
+
+```text
+specs/
+  main.py
+pyproject.toml
+```
+
+Run with:
+
+```bash
+uv run taskgraph run -o output.db
+```
+
+## Spec Discovery
+
+If you don't pass `--spec`, Taskgraph uses:
+- `[tool.taskgraph].spec` in `pyproject.toml`, otherwise
+- `specs.main` (only if `specs/main.py` exists)
+
+`pyproject.toml` example:
+
+```toml
+[tool.taskgraph]
+spec = "my_app.specs.main"
+```
 
 ## Minimal Example
 
 ```python
 import polars as pl
 
-def load_invoices():
+def load_invoices() -> pl.DataFrame:
     return pl.read_csv("data/invoices.csv")
 
-def load_payments():
+def load_payments() -> pl.DataFrame:
     return pl.read_csv("data/payments.csv")
 
 INPUTS = {
@@ -21,23 +78,31 @@ INPUTS = {
 TASKS = [
     {
         "name": "match",
-        "prompt": "Match invoices to payments by amount and date...",
+        "prompt": (
+            "Match invoices to payments. Create view 'matches' with columns:\n"
+            "- invoice_row_id: invoices._row_id\n"
+            "- payment_row_id: payments._row_id\n"
+            "- match_reason: brief explanation\n"
+            "One invoice matches at most one payment; leave unmatched invoices out."
+        ),
         "inputs": ["invoices", "payments"],
-        "outputs": ["output"],
+        "outputs": ["matches"],
+        "output_columns": {"matches": ["invoice_row_id", "payment_row_id", "match_reason"]},
     },
 ]
 ```
 
 Run it:
+
 ```bash
-taskgraph run --spec my_app.specs.main -o output.db
+uv run taskgraph run --spec my_app.specs.main -o output.db
 ```
 
 ---
 
 ## INPUTS
 
-A dict mapping table names to data sources. Each table is ingested into DuckDB before any tasks run.
+`INPUTS` is a dict mapping **table names** to data sources. Each key becomes a DuckDB table before any tasks run.
 
 ### Simple format
 
@@ -86,7 +151,7 @@ Every ingested table gets a `_row_id INTEGER` column: a 1-based sequential row n
 
 ### Data loading guidelines
 
-- **Allowed imports**: `polars`, `openpyxl`, and Python stdlib (`pathlib`, `csv`, `json`, etc.). No other third-party libraries.
+- **Allowed imports in spec modules**: `polars`, `openpyxl`, and Python stdlib (`pathlib`, `csv`, `json`, etc.). No other third-party libraries.
 - Callables are invoked at ingest time, not import time. Exceptions are caught and reported with context.
 - Empty tables (0 rows) produce a warning but do not abort the run.
 - Polars handles type inference. If you need specific types, cast explicitly:
@@ -128,6 +193,13 @@ TASKS = [
 | `outputs` | `list[str]` | Yes | Views the agent must create. Validation checks these exist. |
 | `output_columns` | `dict[str, list[str]]` | No | Required columns per output view. Checks names only, not types. Extra columns are fine. |
 | `validate_sql` | `list[str]` | No | SQL queries that must return 0 rows after the agent finishes. See [Validation SQL](#validation-sql). |
+
+### Naming and dependencies
+
+- A task may read any ingested table.
+- A task may also read other tasks' outputs by listing those output view names in `inputs`.
+- If an input name matches a prior task's output, Taskgraph wires the dependency automatically.
+- Two tasks may not declare the same output view name.
 
 ### What the agent sees
 
@@ -210,6 +282,26 @@ View 'output' is missing required column(s): left_ids. Actual columns: category,
 Each query in `validate_sql` must return 0 rows. Queries run sequentially and short-circuit — the first query that returns rows stops validation.
 
 **Returned rows become the error message.** Design your SELECT so each row is a human-readable diagnostic. The agent sees these errors and attempts to fix them.
+
+### Validation patterns that work well
+
+Aim for queries that tell the agent exactly what to fix:
+
+```sql
+-- Completeness: every invoice has a match
+SELECT 'unmatched invoice _row_id=' || CAST(i._row_id AS VARCHAR)
+FROM invoices i
+LEFT JOIN matches m ON m.invoice_row_id = i._row_id
+WHERE m.invoice_row_id IS NULL
+```
+
+```sql
+-- No duplicates: one payment used at most once
+SELECT 'payment _row_id=' || CAST(payment_row_id AS VARCHAR) || ' used ' || CAST(COUNT(*) AS VARCHAR) || ' times'
+FROM matches
+GROUP BY payment_row_id
+HAVING COUNT(*) > 1
+```
 
 Single-column result — each row's value is the error text:
 ```sql
@@ -385,7 +477,7 @@ If any task in a layer fails, all downstream layers are skipped. Earlier tasks i
 
 ## Reruns
 
-The `.db` file stores the spec module reference, resolved prompts, data, views, and metadata. Reruns use the recorded spec module and git commit; Taskgraph will warn (but not fail) if your repo is dirty.
+The `.db` file stores the spec module reference, resolved prompts, data, views, and metadata. Reruns use the recorded spec module (and can enforce the original git commit when you don't override `--spec`). Taskgraph will warn (but not fail) if your repo is dirty.
 
 ### Spec-free rerun (same data)
 
@@ -515,6 +607,17 @@ The agent must produce these columns or validation fails. The prompt should expl
 
 The prompt is the most important part of the spec. The agent has access to the data schema and DuckDB features — your prompt should focus on the **domain logic**.
 
+### Treat the prompt as a contract
+
+Include (in plain English) all of the things you would put in a code review checklist:
+- output view names
+- required columns (and semantics)
+- uniqueness/completeness constraints
+- tolerances for numeric comparisons
+- how to break ties
+
+Then enforce it with `output_columns` and `validate_sql`.
+
 ### Be specific about the matching criteria
 
 ```
@@ -615,3 +718,18 @@ taskgraph extract-spec DB_FILE OUT_FILE
 ```
 
 Extracts embedded spec source from a `.db` file.
+
+## Appendix: Debugging a Workspace
+
+When a spec isn't doing what you expect, treat `output.db` as the ground truth:
+
+```bash
+# What views exist?
+duckdb output.db "SELECT view_name FROM duckdb_views() WHERE internal = false ORDER BY 1"
+
+# What's the SQL for a view?
+duckdb output.db "SELECT sql FROM duckdb_views() WHERE view_name = 'matches'"
+
+# What did the agent try?
+duckdb output.db "SELECT id, task, success, row_count, elapsed_ms, query FROM _trace ORDER BY id"
+```

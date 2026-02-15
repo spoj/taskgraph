@@ -2,7 +2,14 @@
 
 Usage:
     taskgraph init
+
+    # Run the default spec (pyproject [tool.taskgraph].spec, else specs.main)
     taskgraph run -o output.db
+
+    # Run an explicit spec module
+    taskgraph run --spec my_app.specs.main -o output.db
+
+    # Validate + fix only failing tasks from a prior run
     taskgraph rerun previous.db -o output.db
 """
 
@@ -13,10 +20,13 @@ import sys
 import click
 import tomllib
 from pathlib import Path
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-# Load .env file from project root
-load_dotenv(Path(__file__).parent.parent / ".env")
+# Load .env by walking upward from the CWD.
+# This matches common "app repo has a .env" workflows.
+dotenv_path = find_dotenv(usecwd=True)
+if dotenv_path:
+    load_dotenv(dotenv_path)
 
 # Allow importing local spec modules (e.g. specs.main) from the CWD.
 # Console-script entrypoints don't reliably include the working directory.
@@ -44,7 +54,6 @@ def _default_spec_module() -> str:
     Precedence:
     1) [tool.taskgraph].spec in pyproject.toml (if present)
     2) specs.main (repo-local default)
-    3) <project_name>.specs.main (backward compatible fallback)
     """
     pyproject_path = Path.cwd() / "pyproject.toml"
     data: dict | None = None

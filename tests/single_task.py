@@ -4,7 +4,7 @@ The simplest possible spec: one input, one task, one output.
 Agent classifies employees by department and computes headcount.
 
 Usage:
-    taskgraph run tests/single_task.py -o output.db
+    taskgraph run --spec tests.single_task -o output.db
 """
 
 # --- Inputs ---

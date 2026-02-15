@@ -6,7 +6,7 @@ Complements diamond_dag.py by testing a pure linear dependency chain
 where each layer has exactly one task.
 
 Usage:
-    taskgraph run tests/linear_chain.py -o output.db
+    taskgraph run --spec tests.linear_chain -o output.db
 """
 
 # --- Inputs ---
