@@ -320,19 +320,21 @@ def _format_allowed_names(allowed_views: set[str] | None, namespace: str | None)
 def persist_task_meta(
     conn: duckdb.DuckDBPyConnection, task_name: str, meta: dict[str, Any]
 ) -> None:
-    """Persist per-task run metadata in _task_meta table."""
+    """Persist per-task run metadata in _task_meta.
+
+    _task_meta is a simple per-task JSON blob. It is overwritten per run.
+    """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _task_meta (
-            task VARCHAR NOT NULL,
-            key VARCHAR NOT NULL,
-            value VARCHAR,
-            PRIMARY KEY (task, key)
+            task VARCHAR PRIMARY KEY,
+            meta_json VARCHAR NOT NULL
         )
     """)
+
     conn.execute("DELETE FROM _task_meta WHERE task = ?", [task_name])
-    conn.executemany(
-        "INSERT INTO _task_meta (task, key, value) VALUES (?, ?, ?)",
-        [(task_name, k, json.dumps(v)) for k, v in meta.items()],
+    conn.execute(
+        "INSERT INTO _task_meta (task, meta_json) VALUES (?, ?)",
+        [task_name, json.dumps(meta, sort_keys=True)],
     )
 
 

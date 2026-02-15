@@ -1862,10 +1862,11 @@ class TestPersistTaskMeta:
 
         persist_task_meta(conn, "task1", {"model": "gpt-5", "iterations": 3})
 
-        rows = conn.execute(
-            "SELECT key, value FROM _task_meta WHERE task = 'task1' ORDER BY key"
-        ).fetchall()
-        meta = {row[0]: json.loads(row[1]) for row in rows}
+        row = conn.execute(
+            "SELECT meta_json FROM _task_meta WHERE task = 'task1'"
+        ).fetchone()
+        assert row is not None
+        meta = json.loads(row[0])
         assert meta["model"] == "gpt-5"
         assert meta["iterations"] == 3
 
@@ -1876,14 +1877,14 @@ class TestPersistTaskMeta:
         persist_task_meta(conn, "task1", {"v": 1})
         persist_task_meta(conn, "task1", {"v": 2, "extra": "new"})
 
-        rows = conn.execute(
-            "SELECT key, value FROM _task_meta WHERE task = 'task1' ORDER BY key"
-        ).fetchall()
-        meta = {row[0]: json.loads(row[1]) for row in rows}
+        row = conn.execute(
+            "SELECT meta_json FROM _task_meta WHERE task = 'task1'"
+        ).fetchone()
+        assert row is not None
+        meta = json.loads(row[0])
         assert meta["v"] == 2
         assert meta["extra"] == "new"
-        # Old key 'v' with value 1 should be gone
-        assert len(meta) == 2
+        assert set(meta.keys()) == {"v", "extra"}
 
     def test_multiple_tasks_isolated(self, conn):
         """Different tasks have independent metadata."""
@@ -1892,15 +1893,16 @@ class TestPersistTaskMeta:
         persist_task_meta(conn, "a", {"x": 1})
         persist_task_meta(conn, "b", {"x": 2})
 
-        a_rows = conn.execute(
-            "SELECT value FROM _task_meta WHERE task = 'a' AND key = 'x'"
-        ).fetchall()
-        b_rows = conn.execute(
-            "SELECT value FROM _task_meta WHERE task = 'b' AND key = 'x'"
-        ).fetchall()
-
-        assert json.loads(a_rows[0][0]) == 1
-        assert json.loads(b_rows[0][0]) == 2
+        a_row = conn.execute(
+            "SELECT meta_json FROM _task_meta WHERE task = 'a'"
+        ).fetchone()
+        b_row = conn.execute(
+            "SELECT meta_json FROM _task_meta WHERE task = 'b'"
+        ).fetchone()
+        assert a_row is not None
+        assert b_row is not None
+        assert json.loads(a_row[0])["x"] == 1
+        assert json.loads(b_row[0])["x"] == 2
 
     def test_json_serialization(self, conn):
         """Complex values are JSON-serialized."""
@@ -1908,10 +1910,11 @@ class TestPersistTaskMeta:
 
         persist_task_meta(conn, "t", {"list_val": [1, 2, 3], "dict_val": {"a": "b"}})
 
-        rows = conn.execute(
-            "SELECT key, value FROM _task_meta WHERE task = 't' ORDER BY key"
-        ).fetchall()
-        meta = {row[0]: json.loads(row[1]) for row in rows}
+        row = conn.execute(
+            "SELECT meta_json FROM _task_meta WHERE task = 't'"
+        ).fetchone()
+        assert row is not None
+        meta = json.loads(row[0])
         assert meta["dict_val"] == {"a": "b"}
         assert meta["list_val"] == [1, 2, 3]
 
@@ -2200,17 +2203,19 @@ class TestWorkspaceMeta:
             input_row_counts={"data": 100},
         )
         meta = read_workspace_meta(conn)
-        assert meta["model"] == "gpt-5"
-        assert "fingerprint" in meta
-        assert "prompts" in meta
-        assert "timestamp" in meta
+        assert meta["llm_model"] == "gpt-5"
+        assert meta["meta_version"] == "2"
+        assert "created_at_utc" in meta
+        assert "structural_fingerprint" in meta
+        assert "task_prompts" in meta
+        assert "run" in meta
 
         # Check prompts stored correctly
-        prompts = json.loads(meta["prompts"])
+        prompts = json.loads(meta["task_prompts"])
         assert prompts["t"] == "test prompt"
 
         # Check input row counts
-        counts = json.loads(meta["input_row_counts"])
+        counts = json.loads(meta["inputs_row_counts"])
         assert counts["data"] == 100
 
     def test_rerun_fields(self, conn):
@@ -2225,8 +2230,10 @@ class TestWorkspaceMeta:
             rerun_mode="review",
         )
         meta = read_workspace_meta(conn)
-        assert meta["source_db"] == "/tmp/prev.db"
-        assert meta["rerun_mode"] == "review"
+        run = json.loads(meta["run"])
+        assert run["mode"] == "rerun"
+        assert run["source_db"] == "/tmp/prev.db"
+        assert run["rerun_mode"] == "review"
 
     def test_no_rerun_fields_when_fresh(self, conn):
         """Rerun fields are absent for fresh runs."""
@@ -2238,8 +2245,10 @@ class TestWorkspaceMeta:
             tasks=[],
         )
         meta = read_workspace_meta(conn)
-        assert "source_db" not in meta
-        assert "rerun_mode" not in meta
+        run = json.loads(meta["run"])
+        assert run["mode"] == "run"
+        assert "source_db" not in run
+        assert "rerun_mode" not in run
 
     def test_overwrites_on_rewrite(self, conn):
         """Second call replaces all metadata."""
@@ -2257,7 +2266,7 @@ class TestWorkspaceMeta:
             tasks=[],
         )
         meta = read_workspace_meta(conn)
-        assert meta["model"] == "m2"
+        assert meta["llm_model"] == "m2"
 
     def test_read_missing_table(self):
         """read_workspace_meta returns empty dict if table doesn't exist."""
@@ -2277,7 +2286,7 @@ class TestWorkspaceMeta:
             tasks=tasks,
         )
         meta = read_workspace_meta(conn)
-        prompts = json.loads(meta["prompts"])
+        prompts = json.loads(meta["task_prompts"])
         assert prompts["t"] == long_prompt
         assert len(prompts["t"]) == 1000
 
@@ -2293,7 +2302,8 @@ class TestWorkspaceMeta:
             spec_source=source,
         )
         meta = read_workspace_meta(conn)
-        assert meta["spec_source"] == source
+        spec = json.loads(meta["spec"])
+        assert spec["source"] == source
 
     def test_spec_source_absent_when_not_provided(self, conn):
         """spec_source is absent when not provided."""
@@ -2305,7 +2315,7 @@ class TestWorkspaceMeta:
             tasks=[],
         )
         meta = read_workspace_meta(conn)
-        assert "spec_source" not in meta
+        assert "spec" not in meta
 
 
 # ===========================================================================
@@ -2425,7 +2435,7 @@ class TestFingerprintCompatibility:
         )
         conn.execute("INSERT INTO _workspace_meta VALUES ('model', 'test')")
         errors = check_fingerprint_compatibility(conn, {"inputs": {}, "tasks": []})
-        assert any("no fingerprint" in e.lower() for e in errors)
+        assert any("no structural_fingerprint" in e.lower() for e in errors)
         conn.close()
 
     def test_prompt_change_compatible(self):
@@ -2624,8 +2634,9 @@ class TestRerun:
 
         # Verify workspace metadata was updated
         meta = read_workspace_meta(conn)
-        assert meta["source_db"] == str(source_path)
-        assert meta["rerun_mode"] == "validate"
+        run = json.loads(meta["run"])
+        assert run["source_db"] == str(source_path)
+        assert run["rerun_mode"] == "validate"
         conn.close()
 
     def test_incompatible_source_raises(self, tmp_path):
@@ -2994,19 +3005,21 @@ EXPORTS = {"report.csv": export_report}
         conn = duckdb.connect(str(db_path), read_only=True)
         meta = read_workspace_meta(conn)
 
+        spec = json.loads(meta["spec"])
+
         # Spec source is the full Python file
-        assert "def load_sales" in meta["spec_source"]
-        assert "EXPORTS" in meta["spec_source"]
-        assert meta["spec_module"] == spec_module
+        assert "def load_sales" in spec["source"]
+        assert "EXPORTS" in spec["source"]
+        assert spec["module"] == spec_module
 
         # Prompts stored per task
-        prompts = json.loads(meta["prompts"])
+        prompts = json.loads(meta["task_prompts"])
         assert "summarize" in prompts
         assert "compare" in prompts
         assert "Summarize sales by region" in prompts["summarize"]
 
         # Fingerprint has structural info
-        fp = json.loads(meta["fingerprint"])
+        fp = json.loads(meta["structural_fingerprint"])
         assert "sales" in fp["inputs"]
         assert "targets" in fp["inputs"]
         assert len(fp["tasks"]) == 2
@@ -3036,8 +3049,10 @@ EXPORTS = {"report.csv": export_report}
         meta = read_workspace_meta(conn)
         conn.close()
 
+        spec_meta = json.loads(meta["spec"])
+
         # Load extracted spec
-        spec = load_spec_from_source(meta["spec_source"])
+        spec = load_spec_from_source(spec_meta["source"])
         assert len(spec["tasks"]) == 2
         assert spec["tasks"][0].name == "summarize"
         assert spec["input_columns"]["sales"] == ["id", "month", "amount", "region"]
@@ -3060,7 +3075,9 @@ EXPORTS = {"report.csv": export_report}
         meta = read_workspace_meta(conn)
         conn.close()
 
-        spec = load_spec_from_source(meta["spec_source"])
+        spec_meta = json.loads(meta["spec"])
+
+        spec = load_spec_from_source(spec_meta["source"])
 
         ws = Workspace(
             db_path=str(output_path),
@@ -3098,9 +3115,10 @@ EXPORTS = {"report.csv": export_report}
 
         # Metadata chain
         meta2 = read_workspace_meta(conn)
-        assert meta2["source_db"] == str(db_path)
-        assert meta2["rerun_mode"] == "validate"
-        assert "spec_source" in meta2
+        run2 = json.loads(meta2["run"])
+        assert run2["source_db"] == str(db_path)
+        assert run2["rerun_mode"] == "validate"
+        assert "spec" in meta2
         conn.close()
 
     def test_jan_to_feb_with_spec_override(self, tmp_path):
@@ -3167,15 +3185,17 @@ EXPORTS = {"report.csv": export_report}
 
         # Metadata should reflect Feb run
         meta = read_workspace_meta(conn)
-        assert meta["source_db"] == str(db_path)
-        assert meta["rerun_mode"] == "validate"
+        run = json.loads(meta["run"])
+        assert run["source_db"] == str(db_path)
+        assert run["rerun_mode"] == "validate"
         # Feb prompts stored (not Jan's)
-        prompts = json.loads(meta["prompts"])
+        prompts = json.loads(meta["task_prompts"])
         assert "Include row count" in prompts["summarize"]
         assert "pct_of_target" in prompts["compare"]
         # Spec source is Feb's
-        assert "def load_sales" in meta["spec_source"]
-        assert '"feb"' in meta["spec_source"]
+        spec_meta = json.loads(meta["spec"])
+        assert "def load_sales" in spec_meta["source"]
+        assert '"feb"' in spec_meta["source"]
 
         conn.close()
 
@@ -3233,7 +3253,8 @@ EXPORTS = {"report.csv": export_report}
         meta = read_workspace_meta(conn)
         conn.close()
 
-        spec = load_spec_from_source(meta["spec_source"])
+        spec_meta = json.loads(meta["spec"])
+        spec = load_spec_from_source(spec_meta["source"])
 
         ws = Workspace(
             db_path=str(feb_path),
@@ -3260,7 +3281,8 @@ EXPORTS = {"report.csv": export_report}
         meta_feb = read_workspace_meta(conn)
         conn.close()
 
-        spec_feb = load_spec_from_source(meta_feb["spec_source"])
+        spec_meta_feb = json.loads(meta_feb["spec"])
+        spec_feb = load_spec_from_source(spec_meta_feb["source"])
 
         ws2 = Workspace(
             db_path=str(mar_path),
@@ -3284,12 +3306,14 @@ EXPORTS = {"report.csv": export_report}
         # Verify lineage
         conn = duckdb.connect(str(feb_path), read_only=True)
         feb_meta = read_workspace_meta(conn)
-        assert feb_meta["source_db"] == str(jan_path)
+        feb_run = json.loads(feb_meta["run"])
+        assert feb_run["source_db"] == str(jan_path)
         conn.close()
 
         conn = duckdb.connect(str(mar_path), read_only=True)
         mar_meta = read_workspace_meta(conn)
-        assert mar_meta["source_db"] == str(feb_path)
+        mar_run = json.loads(mar_meta["run"])
+        assert mar_run["source_db"] == str(feb_path)
         conn.close()
 
     def test_incompatible_spec_override_rejected(self, tmp_path):
@@ -3391,7 +3415,7 @@ EXPORTS = {"report.csv": export_report}
         conn = duckdb.connect(str(db_path), read_only=True)
         jan_meta = read_workspace_meta(conn)
         conn.close()
-        jan_prompts = json.loads(jan_meta["prompts"])
+        jan_prompts = json.loads(jan_meta["task_prompts"])
         assert jan_prompts["summarize"] == "Summarize sales by region."
 
         # Feb spec has different prompts
@@ -3422,7 +3446,7 @@ EXPORTS = {"report.csv": export_report}
         conn = duckdb.connect(str(output_path), read_only=True)
         feb_meta = read_workspace_meta(conn)
         conn.close()
-        feb_prompts = json.loads(feb_meta["prompts"])
+        feb_prompts = json.loads(feb_meta["task_prompts"])
         assert "Include row count" in feb_prompts["summarize"]
         assert "pct_of_target" in feb_prompts["compare"]
         # And they're different from Jan

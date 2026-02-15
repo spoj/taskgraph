@@ -101,6 +101,8 @@ def persist_workspace_meta(
     fingerprint: dict[str, Any],
     model: str,
     tasks: list[Task],
+    reasoning_effort: str | None = None,
+    max_iterations: int | None = None,
     input_row_counts: dict[str, int] | None = None,
     source_db: str | None = None,
     rerun_mode: str | None = None,
@@ -110,18 +112,14 @@ def persist_workspace_meta(
     spec_git_root: str | None = None,
     spec_git_dirty: bool | None = None,
 ) -> None:
-    """Write workspace-level metadata to _workspace_meta table.
+    """Write workspace-level metadata to _workspace_meta.
 
-    Stores everything needed for auditability and spec-free reruns:
-    - fingerprint: structural identity for rerun compatibility
-    - prompts: resolved prompt text per task (handles Path-based prompts)
-    - spec_source: raw Python source of the spec module (if available)
-    - spec_module: module path used to load the spec
-    - spec_git_commit: git commit hash for the spec repo
-    - spec_git_root: git repo root for the spec module
-    - spec_git_dirty: whether the spec repo had uncommitted changes
-    - run context: model, timestamp
-    - input_row_counts: row counts per input table
+    Contract: store enough information to make a workspace:
+    - auditable (what was asked, what ran, when, with which runtime/model)
+    - rerunnable (structural fingerprint + spec identity)
+    - debuggable (inputs overview + run parameters)
+
+    Values are stored as strings. Most complex values are JSON.
     """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _workspace_meta (
@@ -131,37 +129,67 @@ def persist_workspace_meta(
     """)
     conn.execute("DELETE FROM _workspace_meta")
 
-    # Resolved prompts per task — the only thing not recoverable from
-    # spec_source (Path-based prompts reference files that may not exist
-    # at rerun time).
-    prompts = {t.name: t.prompt for t in tasks}
+    task_prompts = {t.name: t.prompt for t in tasks}
+
+    created_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    input_tables = list(sorted(input_row_counts.keys())) if input_row_counts else []
+    input_schemas: dict[str, list[dict[str, str]]] = {}
+    if input_tables:
+        for table in input_tables:
+            try:
+                rows_cols = conn.execute(
+                    """
+                    SELECT column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_name = ?
+                    ORDER BY ordinal_position
+                    """,
+                    [table],
+                ).fetchall()
+                input_schemas[table] = [{"name": r[0], "type": r[1]} for r in rows_cols]
+            except duckdb.Error:
+                input_schemas[table] = []
 
     rows: list[tuple[str, str]] = [
-        ("fingerprint", json.dumps(fingerprint, sort_keys=True)),
-        ("prompts", json.dumps(prompts)),
-        ("model", model),
-        ("timestamp", time.strftime("%Y-%m-%dT%H:%M:%S%z")),
+        ("meta_version", "2"),
+        ("created_at_utc", created_at_utc),
+        ("structural_fingerprint", json.dumps(fingerprint, sort_keys=True)),
+        ("task_prompts", json.dumps(task_prompts)),
+        ("llm_model", model),
     ]
 
+    if reasoning_effort:
+        rows.append(("llm_reasoning_effort", reasoning_effort))
+    if max_iterations is not None:
+        rows.append(("llm_max_iterations", str(max_iterations)))
+
     if input_row_counts:
-        rows.append(("input_row_counts", json.dumps(input_row_counts, sort_keys=True)))
+        rows.append(("inputs_row_counts", json.dumps(input_row_counts, sort_keys=True)))
+        rows.append(("inputs_schema", json.dumps(input_schemas)))
 
+    run_context: dict[str, Any] = {
+        "mode": "rerun" if source_db else "run",
+    }
     if source_db:
-        rows.append(("source_db", source_db))
+        run_context["source_db"] = source_db
     if rerun_mode:
-        rows.append(("rerun_mode", rerun_mode))
+        run_context["rerun_mode"] = rerun_mode
+    rows.append(("run", json.dumps(run_context, sort_keys=True)))
 
-    if spec_source:
-        rows.append(("spec_source", spec_source))
-
+    spec: dict[str, Any] = {}
     if spec_module:
-        rows.append(("spec_module", spec_module))
+        spec["module"] = spec_module
     if spec_git_commit:
-        rows.append(("spec_git_commit", spec_git_commit))
+        spec["git_commit"] = spec_git_commit
     if spec_git_root:
-        rows.append(("spec_git_root", spec_git_root))
+        spec["git_root"] = spec_git_root
     if spec_git_dirty is not None:
-        rows.append(("spec_git_dirty", "true" if spec_git_dirty else "false"))
+        spec["git_dirty"] = bool(spec_git_dirty)
+    if spec_source:
+        spec["source"] = spec_source
+    if spec:
+        rows.append(("spec", json.dumps(spec, sort_keys=True)))
 
     conn.executemany("INSERT INTO _workspace_meta (key, value) VALUES (?, ?)", rows)
 
@@ -186,9 +214,9 @@ def check_fingerprint_compatibility(
     if not meta:
         return ["Database has no _workspace_meta table (not a Taskgraph workspace)."]
 
-    stored_fp_str = meta.get("fingerprint")
+    stored_fp_str = meta.get("structural_fingerprint")
     if not stored_fp_str:
-        return ["Database has no fingerprint in _workspace_meta."]
+        return ["Database has no structural_fingerprint in _workspace_meta."]
 
     stored_fp = json.loads(stored_fp_str)
     current_fp_str = json.dumps(current_fingerprint, sort_keys=True)
@@ -513,6 +541,8 @@ class Workspace:
             fingerprint,
             model,
             tasks=self.tasks,
+            reasoning_effort=client.reasoning_effort,
+            max_iterations=max_iterations,
             input_row_counts=input_row_counts,
             spec_source=self.spec_source,
             spec_module=self.spec_module,
@@ -603,7 +633,11 @@ class Workspace:
         result = []
         for v in sorted(task_views):
             try:
-                count = conn.execute(f'SELECT COUNT(*) FROM "{v}"').fetchone()[0]  # type: ignore[index]
+                row = conn.execute(f'SELECT COUNT(*) FROM "{v}"').fetchone()
+                if row is None:
+                    count = -1
+                else:
+                    count = int(row[0])
             except duckdb.Error:
                 count = -1  # View exists but is broken
             result.append((v, count))
@@ -698,6 +732,8 @@ class Workspace:
             fingerprint,
             model,
             tasks=self.tasks,
+            reasoning_effort=client.reasoning_effort,
+            max_iterations=max_iterations,
             input_row_counts=input_row_counts,
             source_db=str(source_db),
             rerun_mode=mode,

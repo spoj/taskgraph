@@ -567,10 +567,10 @@ ORDER BY id
 
 Per-task stats are in `_task_meta`:
 ```sql
-SELECT task, key, value FROM _task_meta ORDER BY task, key
+SELECT task, meta_json FROM _task_meta ORDER BY task
 ```
 
-Keys: `model`, `iterations`, `tool_calls`, `elapsed_s`, `validation`, `prompt_tokens`, `completion_tokens`, `timestamp`.
+`meta_json` includes fields like `model`, `reasoning_effort`, `iterations`, `tool_calls`, `elapsed_s`, `validation`, token counts, and a timestamp.
 
 ### Workspace metadata
 
@@ -579,7 +579,15 @@ Run-level metadata is in `_workspace_meta`:
 SELECT key, value FROM _workspace_meta
 ```
 
-Keys: `fingerprint`, `prompts`, `model`, `timestamp`, `input_row_counts`, `spec_module`, `spec_git_commit`, `spec_git_root`, `spec_git_dirty`, `spec_source`.
+Keys (v2):
+- `meta_version`
+- `created_at_utc`
+- `structural_fingerprint`
+- `task_prompts`
+- `llm_model`, `llm_reasoning_effort`, `llm_max_iterations`
+- `inputs_row_counts`, `inputs_schema`
+- `run` (JSON: run vs rerun context)
+- `spec` (JSON: module/git info, optional embedded source)
 
 ### Adding provenance columns
 

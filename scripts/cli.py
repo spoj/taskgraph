@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
 import duckdb
 import sys
@@ -268,7 +269,7 @@ def run(
     result = asyncio.run(_run())
 
     log.info("\nSaved to: %s", output)
-    log.info("Task metadata: SELECT task, key, value FROM _task_meta")
+    log.info("Task metadata: SELECT task, meta_json FROM _task_meta")
     log.info("SQL trace: SELECT * FROM _trace")
 
     sys.exit(0 if result.success else 1)
@@ -386,7 +387,9 @@ def rerun(
         spec_module = spec
         log.info("Spec override: %s", spec_module)
     else:
-        spec_module = meta.get("spec_module")
+        spec_json = meta.get("spec")
+        spec_meta = json.loads(spec_json) if spec_json else {}
+        spec_module = spec_meta.get("module")
         if not spec_module:
             raise click.ClickException(
                 f"{db_file} has no spec module reference. Use --spec to provide one."
@@ -405,7 +408,9 @@ def rerun(
         )
 
     if not spec:
-        expected_commit = meta.get("spec_git_commit")
+        spec_json = meta.get("spec")
+        spec_meta = json.loads(spec_json) if spec_json else {}
+        expected_commit = spec_meta.get("git_commit")
         if not expected_commit:
             raise click.ClickException(
                 f"{db_file} has no recorded spec commit. Use --spec to provide one."
@@ -487,7 +492,9 @@ def extract_spec_cmd(db_file: Path, out_file: Path):
             f"{db_file} has no workspace metadata — not a Taskgraph workspace."
         )
 
-    spec_source = meta.get("spec_source")
+    spec_json = meta.get("spec")
+    spec_meta = json.loads(spec_json) if spec_json else {}
+    spec_source = spec_meta.get("source")
     if not spec_source:
         raise click.ClickException(f"{db_file} has no embedded spec source.")
 
