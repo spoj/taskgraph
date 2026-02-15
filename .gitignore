@@ -1,0 +1,38 @@
+# Example data / artifacts (keep out of git)
+sample/
+results/
+
+# Environment
+.env
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Output databases
+output*.db
+
+# Test artifacts
+report.csv
+
+# Ruff cache
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
