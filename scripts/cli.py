@@ -21,6 +21,7 @@ import sys
 import click
 import tomllib
 from pathlib import Path
+from typing import Any
 from dotenv import load_dotenv, find_dotenv
 
 # Load .env by walking upward from the CWD.
@@ -36,12 +37,18 @@ sys.path.insert(0, str(Path.cwd()))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.api import OpenRouterClient
-from src.spec import load_spec_from_module, resolve_module_path
+from src.spec import load_spec_from_module, load_spec_from_source, resolve_module_path
 from src.spec_repo import get_spec_repo_info
 from src.workspace import Workspace, read_workspace_meta
 from src.task import resolve_dag, validate_task_graph
 
 log = logging.getLogger(__name__)
+
+
+def _meta_json(meta: dict[str, str], key: str) -> dict[str, Any]:
+    """Parse a JSON blob from workspace meta."""
+    raw = meta.get(key)
+    return json.loads(raw) if raw else {}
 
 
 @click.group()
@@ -383,48 +390,53 @@ def rerun(
             f"{db_file} has no workspace metadata — not a Taskgraph workspace."
         )
 
+    spec_meta = _meta_json(meta, "spec")
+    embedded_source = spec_meta.get("source")
+
     if spec:
         spec_module = spec
         log.info("Spec override: %s", spec_module)
     else:
-        spec_json = meta.get("spec")
-        spec_meta = json.loads(spec_json) if spec_json else {}
         spec_module = spec_meta.get("module")
-        if not spec_module:
-            raise click.ClickException(
-                f"{db_file} has no spec module reference. Use --spec to provide one."
-            )
 
-    try:
-        spec_path = resolve_module_path(spec_module)
-        repo_info = get_spec_repo_info(spec_path)
-    except ValueError as e:
-        raise click.ClickException(str(e))
-
-    if repo_info.dirty:
-        click.echo(
-            f"WARNING: spec repo is dirty ({repo_info.root}); rerun is not strictly reproducible.",
-            err=True,
+    using_embedded_source = spec is None and bool(embedded_source)
+    if spec is None and not using_embedded_source and not spec_module:
+        raise click.ClickException(
+            f"{db_file} has no embedded spec source or spec module reference. Use --spec."
         )
 
-    if not spec:
-        spec_json = meta.get("spec")
-        spec_meta = json.loads(spec_json) if spec_json else {}
-        expected_commit = spec_meta.get("git_commit")
-        if not expected_commit:
-            raise click.ClickException(
-                f"{db_file} has no recorded spec commit. Use --spec to provide one."
-            )
-        if repo_info.commit != expected_commit:
-            raise click.ClickException(
-                "Spec commit mismatch: expected "
-                f"{expected_commit}, found {repo_info.commit}."
+    repo_info = None
+    if using_embedded_source:
+        try:
+            loaded = load_spec_from_source(str(embedded_source))
+        except Exception as e:
+            raise click.ClickException(str(e))
+    else:
+        try:
+            assert spec_module is not None
+            spec_path = resolve_module_path(spec_module)
+            repo_info = get_spec_repo_info(spec_path)
+        except ValueError as e:
+            raise click.ClickException(str(e))
+
+        if repo_info.dirty:
+            click.echo(
+                f"WARNING: spec repo is dirty ({repo_info.root}); rerun is not strictly reproducible.",
+                err=True,
             )
 
-    try:
-        loaded = load_spec_from_module(spec_module)
-    except Exception as e:
-        raise click.ClickException(str(e))
+        if spec is None:
+            expected_commit = spec_meta.get("git_commit")
+            if expected_commit and repo_info.commit != expected_commit:
+                raise click.ClickException(
+                    "Spec commit mismatch: expected "
+                    f"{expected_commit}, found {repo_info.commit}."
+                )
+
+        try:
+            loaded = load_spec_from_module(spec_module)
+        except Exception as e:
+            raise click.ClickException(str(e))
 
     # Overwrite check
     if output.exists():
@@ -443,9 +455,9 @@ def rerun(
         input_validate_sql=loaded["input_validate_sql"],
         spec_source=loaded.get("spec_source"),
         spec_module=spec_module,
-        spec_git_commit=repo_info.commit,
-        spec_git_root=str(repo_info.root),
-        spec_git_dirty=repo_info.dirty,
+        spec_git_commit=repo_info.commit if repo_info else spec_meta.get("git_commit"),
+        spec_git_root=str(repo_info.root) if repo_info else spec_meta.get("git_root"),
+        spec_git_dirty=repo_info.dirty if repo_info else spec_meta.get("git_dirty"),
     )
 
     log.info("Rerun: %s", db_file)
@@ -453,7 +465,10 @@ def rerun(
     log.info("Model: %s", model)
     log.info("Mode: %s", mode)
     log.info("Spec: %s", spec_module)
-    log.info("Spec commit: %s", repo_info.commit)
+    if repo_info:
+        log.info("Spec commit: %s", repo_info.commit)
+    elif spec_meta.get("git_commit"):
+        log.info("Spec commit: %s", spec_meta.get("git_commit"))
     log.info(
         "Ingestion: %s",
         "skipped (using existing data)" if skip_ingest else "fresh",

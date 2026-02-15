@@ -38,6 +38,9 @@ import logging
 import shutil
 import duckdb
 import time
+import sys
+import platform
+import importlib.metadata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -151,11 +154,19 @@ def persist_workspace_meta(
             except duckdb.Error:
                 input_schemas[table] = []
 
+    try:
+        tg_version = importlib.metadata.version("taskgraph")
+    except Exception:
+        tg_version = "unknown"
+
     rows: list[tuple[str, str]] = [
         ("meta_version", "2"),
         ("created_at_utc", created_at_utc),
+        ("taskgraph_version", tg_version),
+        ("python_version", sys.version.split()[0]),
+        ("platform", platform.platform()),
         ("structural_fingerprint", json.dumps(fingerprint, sort_keys=True)),
-        ("task_prompts", json.dumps(task_prompts)),
+        ("task_prompts", json.dumps(task_prompts, sort_keys=True)),
         ("llm_model", model),
     ]
 
@@ -166,7 +177,7 @@ def persist_workspace_meta(
 
     if input_row_counts:
         rows.append(("inputs_row_counts", json.dumps(input_row_counts, sort_keys=True)))
-        rows.append(("inputs_schema", json.dumps(input_schemas)))
+        rows.append(("inputs_schema", json.dumps(input_schemas, sort_keys=True)))
 
     run_context: dict[str, Any] = {
         "mode": "rerun" if source_db else "run",
