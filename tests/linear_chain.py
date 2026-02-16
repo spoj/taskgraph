@@ -61,7 +61,7 @@ INPUTS = {
 
 parse = {
     "name": "parse",
-    "prompt": (
+    "repair_context": (
         "Parse the raw_orders table. The 'items' column contains comma-separated\n"
         "entries in the format 'sku:quantity' (e.g. 'widget_a:2,widget_b:1').\n\n"
         "Create a view 'order_lines' with one row per item per order:\n"
@@ -73,6 +73,17 @@ parse = {
         "Hint: Use string_split() and unnest() to explode the comma-separated\n"
         "items into individual rows.\n"
     ),
+    "sql": """
+        CREATE OR REPLACE VIEW order_lines AS
+        SELECT
+            o.order_id,
+            o.customer,
+            o.date,
+            split_part(item, ':', 1) AS sku,
+            CAST(split_part(item, ':', 2) AS INTEGER) AS quantity
+        FROM raw_orders o,
+        UNNEST(string_split(o.items, ',')) AS t(item)
+        """,
     "inputs": ["raw_orders"],
     "outputs": ["order_lines"],
     "output_columns": {
@@ -82,12 +93,19 @@ parse = {
 
 enrich = {
     "name": "enrich",
-    "prompt": (
+    "repair_context": (
         "Join order_lines with price_list to compute line totals.\n\n"
         "Create a view 'enriched_lines' with all columns from order_lines plus:\n"
         "- unit_price: from the price_list\n"
         "- line_total: quantity * unit_price\n"
     ),
+    "sql": """
+        CREATE OR REPLACE VIEW enriched_lines AS
+        SELECT
+            l.*, p.unit_price, l.quantity * p.unit_price AS line_total
+        FROM order_lines l
+        JOIN price_list p ON p.sku = l.sku
+        """,
     "inputs": ["order_lines", "price_list"],
     "outputs": ["enriched_lines"],
     "output_columns": {
@@ -97,7 +115,7 @@ enrich = {
 
 aggregate = {
     "name": "aggregate",
-    "prompt": (
+    "repair_context": (
         "Create two summary views from enriched_lines:\n\n"
         "1. 'customer_totals' with columns:\n"
         "   - customer\n"
@@ -109,6 +127,24 @@ aggregate = {
         "   - total_quantity: sum of quantities across all orders\n"
         "   - total_revenue: sum of line_total\n"
     ),
+    "sql": """
+        CREATE OR REPLACE VIEW customer_totals AS
+        SELECT
+            customer,
+            COUNT(DISTINCT order_id) AS order_count,
+            SUM(quantity) AS total_items,
+            SUM(line_total) AS total_spend
+        FROM enriched_lines
+        GROUP BY customer;
+
+        CREATE OR REPLACE VIEW sku_totals AS
+        SELECT
+            sku,
+            SUM(quantity) AS total_quantity,
+            SUM(line_total) AS total_revenue
+        FROM enriched_lines
+        GROUP BY sku
+        """,
     "inputs": ["enriched_lines"],
     "outputs": ["customer_totals", "sku_totals"],
     "output_columns": {

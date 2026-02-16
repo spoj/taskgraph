@@ -6,7 +6,7 @@ A workspace is a single DuckDB database containing:
 - Metadata and trace tables
  - Optional spec source (for audit)
 
-  The .db file stores resolved prompts and all data.
+  The .db file stores repair contexts and all data.
  Spec source may be stored for audit, but reruns are driven by the
  spec module reference captured in workspace metadata.
 
@@ -88,7 +88,7 @@ def persist_workspace_meta(
     """)
     conn.execute("DELETE FROM _workspace_meta")
 
-    task_prompts = {t.name: t.prompt for t in tasks}
+    task_repair_contexts = {t.name: t.repair_context for t in tasks}
 
     created_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -121,7 +121,7 @@ def persist_workspace_meta(
         ("taskgraph_version", tg_version),
         ("python_version", sys.version.split()[0]),
         ("platform", platform.platform()),
-        ("task_prompts", json.dumps(task_prompts, sort_keys=True)),
+        ("task_repair_contexts", json.dumps(task_repair_contexts, sort_keys=True)),
         ("llm_model", model),
     ]
 
@@ -427,6 +427,27 @@ class Workspace:
         if mode == "sql":
             result = await run_sql_only_task(conn=conn, task=task)
             if result.success:
+                if task.repair_on_warn:
+                    warnings = task.validation_warnings(conn)
+                    if warnings:
+                        log.warning(
+                            "[%s] Validation warnings; attempting LLM repair",
+                            task.name,
+                        )
+                        issue = "Warnings:\n" + "\n".join(f"- {w}" for w in warnings)
+                        schema_info = get_schema_info_for_tables(conn, task.inputs)
+                        repair_prompt = build_sql_repair_prompt(task, issue)
+                        return await run_task_agent(
+                            conn=conn,
+                            task=task,
+                            schema_info=schema_info,
+                            client=client,
+                            model=model,
+                            max_iterations=max_iterations,
+                            existing_views=existing_views,
+                            validation_errors=validation_errors,
+                            prompt_override=repair_prompt,
+                        )
                 return result
 
             log.warning("[%s] SQL failed; attempting LLM repair", task.name)
@@ -444,17 +465,7 @@ class Workspace:
                 prompt_override=repair_prompt,
             )
 
-        schema_info = get_schema_info_for_tables(conn, task.inputs)
-        return await run_task_agent(
-            conn=conn,
-            task=task,
-            schema_info=schema_info,
-            client=client,
-            model=model,
-            max_iterations=max_iterations,
-            existing_views=existing_views,
-            validation_errors=validation_errors,
-        )
+        raise RuntimeError(f"Unknown task mode: {mode}")
 
     async def run(
         self,

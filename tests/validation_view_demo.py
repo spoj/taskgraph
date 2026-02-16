@@ -101,7 +101,7 @@ INPUTS = {
 TASKS = [
     {
         "name": "categorize",
-        "prompt": (
+        "repair_context": (
             "Categorize each expense line into a spending category based on the\n"
             "vendor and description. Use these categories:\n"
             "- 'Office' for office supplies, furniture, toner (vendor: Acme Corp)\n"
@@ -116,6 +116,60 @@ TASKS = [
             "   Add a row with status='fail' if any expense row is missing from categorized,\n"
             "   or if the categorized total differs from expected_total by > 0.01.\n"
         ),
+        "sql": """
+            CREATE OR REPLACE VIEW categorized AS
+            SELECT
+                e.*,
+                CASE
+                    WHEN e.vendor = 'Acme Corp' THEN 'Office'
+                    WHEN e.vendor = 'CloudHost Inc' THEN 'Technology'
+                    WHEN e.vendor = 'TravelCo' THEN 'Travel'
+                    WHEN e.vendor = 'LegalEase LLP' THEN 'Professional'
+                    ELSE 'Other'
+                END AS category
+            FROM expenses e;
+
+            CREATE OR REPLACE VIEW category_summary AS
+            SELECT
+                category,
+                COUNT(*) AS item_count,
+                SUM(amount) AS total_amount
+            FROM categorized
+            GROUP BY category
+            UNION ALL
+            SELECT
+                'TOTAL' AS category,
+                COUNT(*) AS item_count,
+                SUM(amount) AS total_amount
+            FROM categorized;
+
+            CREATE OR REPLACE VIEW categorize__validation AS
+            WITH
+            exp AS (SELECT COUNT(*) AS cnt FROM expenses),
+            cat AS (SELECT COUNT(*) AS cnt FROM categorized),
+            sumcat AS (SELECT SUM(amount) AS total_amount FROM categorized),
+            tot AS (SELECT total FROM expected_total)
+            SELECT
+                'fail' AS status,
+                'missing rows: expected ' || CAST(exp.cnt AS VARCHAR) ||
+                ' got ' || CAST(cat.cnt AS VARCHAR) AS message
+            FROM exp, cat
+            WHERE exp.cnt <> cat.cnt
+
+            UNION ALL
+            SELECT
+                'fail' AS status,
+                'total mismatch: expected ' || CAST(tot.total AS VARCHAR) ||
+                ' got ' || CAST(sumcat.total_amount AS VARCHAR) AS message
+            FROM tot, sumcat
+            WHERE ABS(tot.total - sumcat.total_amount) > 0.01
+
+            UNION ALL
+            SELECT 'pass' AS status, 'ok' AS message
+            FROM exp, cat, tot, sumcat
+            WHERE exp.cnt = cat.cnt
+              AND ABS(tot.total - sumcat.total_amount) <= 0.01
+            """,
         "inputs": ["expenses", "expected_total"],
         "outputs": ["categorized", "category_summary", "categorize__validation"],
         "output_columns": {

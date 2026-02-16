@@ -547,7 +547,7 @@ def _build_task_user_message(
 
     parts.append(f"TASK: {task.name}")
     parts.append("")
-    prompt_text = task.prompt if prompt_override is None else prompt_override
+    prompt_text = task.repair_context if prompt_override is None else prompt_override
     parts.append(prompt_text)
     parts.append("")
 
@@ -609,7 +609,7 @@ def _build_task_user_message(
     return "\n".join(parts)
 
 
-def build_sql_repair_prompt(task: Task, error: str) -> str:
+def build_sql_repair_prompt(task: Task, issue: str) -> str:
     """Build a prompt to repair a failed SQL task using the LLM."""
     statements = task.sql_statements()
     sql_block_lines = []
@@ -621,15 +621,18 @@ def build_sql_repair_prompt(task: Task, error: str) -> str:
 
     parts = [
         "SQL REPAIR MODE",
-        "This task failed running deterministic SQL. Fix the SQL and repair the views.",
+        "Fix the SQL and repair the views.",
+        "",
+        "OBJECTIVE:",
+        task.repair_context or "(no repair context provided)",
         "",
         "ORIGINAL SQL:",
         "```sql",
         sql_block,
         "```",
         "",
-        "ERROR:",
-        error or "(no error message)",
+        "ISSUE:",
+        issue or "(no issue details)",
         "",
         "INSTRUCTIONS:",
         "- Use CREATE OR REPLACE VIEW/MACRO to fix outputs.",
@@ -671,7 +674,7 @@ async def run_task_agent(
             for views already in this task's namespace.
         validation_errors: For reruns — errors from validating the
             existing views against fresh input data.
-        prompt_override: Optional replacement for task.prompt.
+        prompt_override: Optional replacement for task.repair_context.
     Returns:
         AgentResult with success status, final message, and usage stats.
     """

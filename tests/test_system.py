@@ -90,7 +90,12 @@ def conn():
 
 def _make_task(**kwargs) -> Task:
     """Helper to create a Task with defaults."""
-    defaults = {"name": "t", "prompt": "test", "inputs": [], "outputs": []}
+    defaults = {
+        "name": "t",
+        "repair_context": "test",
+        "inputs": [],
+        "outputs": [],
+    }
     defaults.update(kwargs)
     return Task(**defaults)
 
@@ -250,10 +255,8 @@ class TestSqlOnlyTasks:
             name="sql_task",
             inputs=[],
             outputs=["out_view", "sql_task__validation"],
-            sql=[
-                "CREATE VIEW out_view AS SELECT 1 AS x",
-                "CREATE VIEW sql_task__validation AS SELECT 'pass' AS status, 'ok' AS message",
-            ],
+            sql="CREATE VIEW out_view AS SELECT 1 AS x;"
+            "CREATE VIEW sql_task__validation AS SELECT 'pass' AS status, 'ok' AS message",
         )
 
         result = asyncio.run(run_sql_only_task(conn=conn, task=task))
@@ -263,14 +266,14 @@ class TestSqlOnlyTasks:
         task = _make_task(
             name="sql_task",
             outputs=["out_view"],
-            sql=["SELECT 1"],
+            sql="SELECT 1",
         )
         result = asyncio.run(run_sql_only_task(conn=conn, task=task))
         assert result.success is False
         assert "only allow" in result.final_message.lower()
 
     def test_sql_only_task_requires_sql(self, conn):
-        task = _make_task(name="sql_task", outputs=["sql_task__validation"], sql=[])
+        task = _make_task(name="sql_task", outputs=["sql_task__validation"], sql="")
         result = asyncio.run(run_sql_only_task(conn=conn, task=task))
         assert result.success is False
 
@@ -1256,50 +1259,66 @@ class TestInputValidation:
 
 
 # ===========================================================================
-# 8. Prompt Resolution
+# 8. Repair Context Resolution
 # ===========================================================================
 
 
-class TestPromptResolution:
-    """Tests for prompt handling: prompts must be strings."""
+class TestRepairContextResolution:
+    """Tests for repair_context handling in spec loading."""
 
-    def test_string_passthrough(self, tmp_path):
-        """Plain string prompt is accepted in spec loading."""
+    def test_string_repair_context_passthrough(self, tmp_path):
+        """Plain string repair_context is accepted in spec loading."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "a", "prompt": "do the thing", '
+            'TASKS = [{"name": "a", "repair_context": "do the thing", '
+            '"sql": "CREATE VIEW out AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
         result = load_spec_from_module(module_path)
-        assert result["tasks"][0].prompt == "do the thing"
+        assert result["tasks"][0].repair_context == "do the thing"
 
-    def test_non_string_prompt_raises(self, tmp_path):
-        """Non-string prompt raises ValueError."""
+    def test_non_string_repair_context_raises(self, tmp_path):
+        """Non-string repair_context raises ValueError."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "a", "prompt": 123, '
+            'TASKS = [{"name": "a", "repair_context": 123, '
+            '"sql": "CREATE VIEW out AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
-        with pytest.raises(ValueError, match="prompt must be a string"):
+        with pytest.raises(ValueError, match="repair_context must be a string"):
             load_spec_from_module(module_path)
 
-    def test_list_prompt_raises(self, tmp_path):
-        """List prompt raises ValueError."""
+    def test_empty_repair_context_raises(self, tmp_path):
+        """SQL tasks must provide non-empty repair_context."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "a", "prompt": ["first", "second"], '
+            'TASKS = [{"name": "a", "repair_context": " ", '
+            '"sql": "CREATE VIEW out AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
-        with pytest.raises(ValueError, match="prompt must be a string"):
+        with pytest.raises(ValueError, match="must specify non-empty repair_context"):
+            load_spec_from_module(module_path)
+
+    def test_prompt_rejected(self, tmp_path):
+        """prompt is no longer supported in specs."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            'INPUTS = {"t": [{"x": 1}]}\n'
+            'TASKS = [{"name": "a", "prompt": "do it", '
+            '"inputs": ["t"], "outputs": ["out"]}]\n',
+        )
+        with pytest.raises(ValueError, match="prompt.*no longer supported"):
             load_spec_from_module(module_path)
 
 
@@ -1440,7 +1459,8 @@ class TestLoadSpec:
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"data": [{"x": 1}]}\n'
-            'TASKS = [{"name": "t1", "prompt": "do it", '
+            'TASKS = [{"name": "t1", "repair_context": "do it", '
+            '"sql": "CREATE VIEW out AS SELECT 1 AS x", '
             '"inputs": ["data"], "outputs": ["out"]}]\n',
         )
 
@@ -1448,7 +1468,7 @@ class TestLoadSpec:
         assert "data" in result["inputs"]
         assert len(result["tasks"]) == 1
         assert result["tasks"][0].name == "t1"
-        assert result["tasks"][0].prompt == "do it"
+        assert result["tasks"][0].repair_context == "do it"
 
     def test_rich_inputs_extracted(self, tmp_path):
         """Rich INPUTS with columns and validate_sql are parsed."""
@@ -1463,7 +1483,9 @@ class TestLoadSpec:
             '        "validate_sql": ["SELECT 1 FROM tbl WHERE a IS NULL"],\n'
             "    }\n"
             "}\n"
-            'TASKS = [{"name": "t", "prompt": "p", "inputs": ["tbl"], "outputs": ["o"]}]\n',
+            'TASKS = [{"name": "t", "repair_context": "p", '
+            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
+            '"inputs": ["tbl"], "outputs": ["o"]}]\n',
         )
 
         result = load_spec_from_module(module_path)
@@ -1481,7 +1503,9 @@ class TestLoadSpec:
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "t", "prompt": "p", "inputs": ["t"], "outputs": ["o"]}]\n',
+            'TASKS = [{"name": "t", "repair_context": "p", '
+            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
+            '"inputs": ["t"], "outputs": ["o"]}]\n',
         )
 
         result = load_spec_from_module(module_path)
@@ -1513,7 +1537,9 @@ class TestLoadSpec:
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": []}\n'
-            'TASKS = [{"name": "t", "prompt": "p", "inputs": ["t"], "outputs": ["o"]}]\n',
+            'TASKS = [{"name": "t", "repair_context": "p", '
+            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
+            '"inputs": ["t"], "outputs": ["o"]}]\n',
         )
 
         result = load_spec_from_module(module_path)
@@ -1526,7 +1552,9 @@ class TestLoadSpec:
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": []}\n'
-            'TASKS = [{"name": "t", "prompt": "p", "inputs": ["t"], "outputs": ["o"]}]\n'
+            'TASKS = [{"name": "t", "repair_context": "p", '
+            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
+            '"inputs": ["t"], "outputs": ["o"]}]\n'
             "def my_export(conn, path): pass\n"
             'EXPORTS = {"out.csv": my_export}\n',
         )
@@ -1536,7 +1564,7 @@ class TestLoadSpec:
         assert callable(result["exports"]["out.csv"])
 
     def test_path_prompt_rejected(self, tmp_path):
-        """Path prompts are rejected (prompts must be strings)."""
+        """prompt is rejected for any type."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
@@ -1547,11 +1575,11 @@ class TestLoadSpec:
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
 
-        with pytest.raises(ValueError, match="prompt must be a string"):
+        with pytest.raises(ValueError, match="prompt.*no longer supported"):
             load_spec_from_module(module_path)
 
     def test_list_prompt_rejected(self, tmp_path):
-        """List prompts are rejected (prompts must be strings)."""
+        """prompt is rejected for any type."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
@@ -1561,7 +1589,7 @@ class TestLoadSpec:
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
 
-        with pytest.raises(ValueError, match="prompt must be a string"):
+        with pytest.raises(ValueError, match="prompt.*no longer supported"):
             load_spec_from_module(module_path)
 
     def test_task_objects_accepted(self, tmp_path):
@@ -1572,7 +1600,9 @@ class TestLoadSpec:
             tmp_path,
             "from src.task import Task\n"
             'INPUTS = {"t": []}\n'
-            'TASKS = [Task(name="t", prompt="p", inputs=["t"], outputs=["o"])]\n',
+            'TASKS = [Task(name="t", repair_context="p", '
+            'sql="CREATE VIEW o AS SELECT 1 AS x", '
+            'inputs=["t"], outputs=["o"])]\n',
         )
 
         result = load_spec_from_module(module_path)
@@ -1598,7 +1628,9 @@ class TestLoadSpec:
             tmp_path,
             'def load_data(): return [{"x": 1}]\n'
             'INPUTS = {"t": load_data}\n'
-            'TASKS = [{"name": "t", "prompt": "p", "inputs": ["t"], "outputs": ["o"]}]\n',
+            'TASKS = [{"name": "t", "repair_context": "p", '
+            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
+            '"inputs": ["t"], "outputs": ["o"]}]\n',
         )
 
         result = load_spec_from_module(module_path)
@@ -2187,7 +2219,7 @@ class TestWorkspaceMeta:
 
     def test_roundtrip(self, conn):
         """Write and read workspace metadata."""
-        tasks = [_make_task(name="t", prompt="test prompt", outputs=["out"])]
+        tasks = [_make_task(name="t", repair_context="test context", outputs=["out"])]
         persist_workspace_meta(
             conn,
             model="gpt-5",
@@ -2198,12 +2230,12 @@ class TestWorkspaceMeta:
         assert meta["llm_model"] == "gpt-5"
         assert meta["meta_version"] == "2"
         assert "created_at_utc" in meta
-        assert "task_prompts" in meta
+        assert "task_repair_contexts" in meta
         assert "run" in meta
 
-        # Check prompts stored correctly
-        prompts = json.loads(meta["task_prompts"])
-        assert prompts["t"] == "test prompt"
+        # Check repair contexts stored correctly
+        contexts = json.loads(meta["task_repair_contexts"])
+        assert contexts["t"] == "test context"
 
         # Check input row counts
         counts = json.loads(meta["inputs_row_counts"])
@@ -2255,19 +2287,19 @@ class TestWorkspaceMeta:
         assert read_workspace_meta(c) == {}
         c.close()
 
-    def test_full_prompts_stored(self, conn):
-        """Full prompts are stored without truncation."""
-        long_prompt = "x" * 1000
-        tasks = [_make_task(name="t", prompt=long_prompt, outputs=["out"])]
+    def test_full_repair_contexts_stored(self, conn):
+        """Full repair contexts are stored without truncation."""
+        long_context = "x" * 1000
+        tasks = [_make_task(name="t", repair_context=long_context, outputs=["out"])]
         persist_workspace_meta(
             conn,
             model="m",
             tasks=tasks,
         )
         meta = read_workspace_meta(conn)
-        prompts = json.loads(meta["task_prompts"])
-        assert prompts["t"] == long_prompt
-        assert len(prompts["t"]) == 1000
+        contexts = json.loads(meta["task_repair_contexts"])
+        assert contexts["t"] == long_context
+        assert len(contexts["t"]) == 1000
 
 
 # Spec source embedding removed.
@@ -2319,15 +2351,15 @@ class TestGetTaskViews:
 
 
 # ===========================================================================
-# Agent review prompt
+# Agent repair context
 # ===========================================================================
 
 
-class TestAgentReviewPrompt:
-    """Tests for _build_task_user_message with review context."""
+class TestAgentRepairContext:
+    """Tests for _build_task_user_message with repair context."""
 
-    def test_basic_prompt_no_review(self):
-        """Without review context, prompt has standard structure."""
+    def test_basic_context_no_review(self):
+        """Without review context, message has standard structure."""
         task = _make_task(name="match", inputs=["data"], outputs=["output"])
         msg = _build_task_user_message(task, "Table: data\n  Columns: x (INT)")
         assert "TASK: match" in msg
@@ -2590,8 +2622,8 @@ class TestRerunE2E:
     """End-to-end tests for the rerun lifecycle.
 
     Simulates the full Jan-to-Feb workflow without LLM calls by manually
-    creating views (as an agent would), then verifying that rerun correctly
-    handles spec overrides, data refresh, prompt changes, and metadata chains.
+    creating views, then verifying that rerun correctly handles spec overrides,
+    data refresh, repair context changes, and metadata chains.
     """
 
     # -- helpers --
@@ -2620,14 +2652,26 @@ INPUTS = {
 TASKS = [
     {
         "name": "summarize",
-        "prompt": "Summarize sales by region.",
+        "repair_context": "Summarize sales by region.",
+        "sql": "CREATE OR REPLACE VIEW summary AS\n"
+        "SELECT region, SUM(amount) AS total\n"
+        "FROM sales\n"
+        "GROUP BY region",
         "inputs": ["sales"],
         "outputs": ["summary"],
         "output_columns": {"summary": ["region", "total"]},
     },
     {
         "name": "compare",
-        "prompt": "Compare summary to targets. Flag regions below target.",
+        "repair_context": "Compare summary to targets. Flag regions below target.",
+        "sql": "CREATE OR REPLACE VIEW comparison AS\n"
+        "SELECT\n"
+        "    s.region,\n"
+        "    s.total,\n"
+        "    t.target,\n"
+        "    s.total - t.target AS gap\n"
+        "FROM summary s\n"
+        "JOIN targets t ON s.region = t.region",
         "inputs": ["summary", "targets"],
         "outputs": ["comparison"],
         "output_columns": {"comparison": ["region", "total", "target", "gap"]},
@@ -2670,14 +2714,26 @@ INPUTS = {
 TASKS = [
     {
         "name": "summarize",
-        "prompt": "Summarize sales by region. Include row count per region.",
+        "repair_context": "Summarize sales by region. Include row count per region.",
+        "sql": "CREATE OR REPLACE VIEW summary AS\n"
+        "SELECT region, SUM(amount) AS total\n"
+        "FROM sales\n"
+        "GROUP BY region",
         "inputs": ["sales"],
         "outputs": ["summary"],
         "output_columns": {"summary": ["region", "total"]},
     },
     {
         "name": "compare",
-        "prompt": "Compare summary to targets. Flag regions below target. Add pct_of_target column.",
+        "repair_context": "Compare summary to targets. Flag regions below target. Add pct_of_target column.",
+        "sql": "CREATE OR REPLACE VIEW comparison AS\n"
+        "SELECT\n"
+        "    s.region,\n"
+        "    s.total,\n"
+        "    t.target,\n"
+        "    s.total - t.target AS gap\n"
+        "FROM summary s\n"
+        "JOIN targets t ON s.region = t.region",
         "inputs": ["summary", "targets"],
         "outputs": ["comparison"],
         "output_columns": {"comparison": ["region", "total", "target", "gap"]},
@@ -2748,7 +2804,7 @@ EXPORTS = {"report.csv": export_report}
     # -- tests --
 
     def test_jan_db_is_self_contained(self, tmp_path):
-        """jan.db stores prompts and spec module reference."""
+        """jan.db stores repair contexts and spec module reference."""
         db_path, spec_module = self._simulate_jan_run(tmp_path)
 
         conn = duckdb.connect(str(db_path), read_only=True)
@@ -2757,11 +2813,11 @@ EXPORTS = {"report.csv": export_report}
         spec = json.loads(meta["spec"])
         assert spec["module"] == spec_module
 
-        # Prompts stored per task
-        prompts = json.loads(meta["task_prompts"])
-        assert "summarize" in prompts
-        assert "compare" in prompts
-        assert "Summarize sales by region" in prompts["summarize"]
+        # Repair contexts stored per task
+        contexts = json.loads(meta["task_repair_contexts"])
+        assert "summarize" in contexts
+        assert "compare" in contexts
+        assert "Summarize sales by region" in contexts["summarize"]
 
         # Data is present
         sales = conn.execute("SELECT COUNT(*) FROM sales").fetchone()
@@ -2780,7 +2836,7 @@ EXPORTS = {"report.csv": export_report}
     def test_jan_to_feb_with_spec_override(self, tmp_path, monkeypatch):
         """Full month-to-month workflow: jan.db + feb_spec -> feb.db.
 
-        Feb spec has different data (4 rows vs 3) and tweaked prompts.
+        Feb spec has different data (4 rows vs 3) and tweaked repair context.
         Views auto-update via late-binding (DuckDB recalculates from new tables).
         """
         from src.spec import load_spec_from_module
@@ -2853,10 +2909,10 @@ EXPORTS = {"report.csv": export_report}
         meta = read_workspace_meta(conn)
         run = json.loads(meta["run"])
         assert run["source_db"] == str(db_path)
-        # Feb prompts stored (not Jan's)
-        prompts = json.loads(meta["task_prompts"])
-        assert "Include row count" in prompts["summarize"]
-        assert "pct_of_target" in prompts["compare"]
+        # Feb repair contexts stored (not Jan's)
+        contexts = json.loads(meta["task_repair_contexts"])
+        assert "Include row count" in contexts["summarize"]
+        assert "pct_of_target" in contexts["compare"]
         spec_meta = json.loads(meta["spec"])
         assert "module" in spec_meta
 
@@ -3022,24 +3078,24 @@ EXPORTS = {"report.csv": export_report}
         assert int(west["total"]) == 150
         assert int(west["gap"]) == -100
 
-    def test_prompt_evolution_across_reruns(self, tmp_path, monkeypatch):
-        """Prompts can evolve between reruns while keeping same structure."""
+    def test_repair_context_evolution_across_reruns(self, tmp_path, monkeypatch):
+        """Repair contexts can evolve between reruns while keeping same structure."""
         from src.spec import load_spec_from_module
 
         db_path, _ = self._simulate_jan_run(tmp_path)
 
-        # Jan prompts
+        # Jan repair contexts
         conn = duckdb.connect(str(db_path), read_only=True)
         jan_meta = read_workspace_meta(conn)
         conn.close()
-        jan_prompts = json.loads(jan_meta["task_prompts"])
-        assert jan_prompts["summarize"] == "Summarize sales by region."
+        jan_contexts = json.loads(jan_meta["task_repair_contexts"])
+        assert jan_contexts["summarize"] == "Summarize sales by region."
 
-        # Feb spec has different prompts
+        # Feb spec has different repair contexts
         feb_module = _write_spec_module(tmp_path, self.FEB_SPEC)
         feb_spec = load_spec_from_module(feb_module)
 
-        output_path = tmp_path / "feb_prompts.db"
+        output_path = tmp_path / "feb_contexts.db"
         ws = Workspace(
             db_path=str(output_path),
             inputs=feb_spec["inputs"],
@@ -3075,15 +3131,15 @@ EXPORTS = {"report.csv": export_report}
 
         asyncio.run(_run())
 
-        # Feb db stores Feb's prompts, not Jan's
+        # Feb db stores Feb's repair contexts, not Jan's
         conn = duckdb.connect(str(output_path), read_only=True)
         feb_meta = read_workspace_meta(conn)
         conn.close()
-        feb_prompts = json.loads(feb_meta["task_prompts"])
-        assert "Include row count" in feb_prompts["summarize"]
-        assert "pct_of_target" in feb_prompts["compare"]
+        feb_contexts = json.loads(feb_meta["task_repair_contexts"])
+        assert "Include row count" in feb_contexts["summarize"]
+        assert "pct_of_target" in feb_contexts["compare"]
         # And they're different from Jan
-        assert feb_prompts["summarize"] != jan_prompts["summarize"]
+        assert feb_contexts["summarize"] != jan_contexts["summarize"]
 
 
 def test_default_output_db_path_is_stable():

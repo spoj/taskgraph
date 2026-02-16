@@ -330,8 +330,7 @@ def run(
     log.info("Tasks: %d\n", len(loaded["tasks"]))
 
     needs_llm = any(
-        getattr(t, "run_mode", lambda: "agent")() in {"agent", "sql"}
-        for t in loaded["tasks"]
+        getattr(t, "run_mode", lambda: "sql")() == "sql" for t in loaded["tasks"]
     )
     if needs_llm:
         _require_openrouter_api_key()
@@ -382,7 +381,97 @@ def run(
     log.info("Task metadata: SELECT task, meta_json FROM _task_meta")
     log.info("SQL trace: SELECT * FROM _trace")
 
+    if not quiet:
+        _report_run_summary(output, loaded["tasks"])
+
     sys.exit(0 if result.success else 1)
+
+
+def _report_run_summary(output: Path, tasks: list[Task]) -> None:
+    try:
+        conn = duckdb.connect(str(output), read_only=True)
+    except duckdb.Error:
+        return
+
+    try:
+        view_rows = conn.execute(
+            "SELECT view_name FROM duckdb_views() WHERE internal = false"
+        ).fetchall()
+        views = {row[0] for row in view_rows}
+        click.echo(f"\nViews: {len(views)}")
+
+        for task in tasks:
+            if not task.outputs:
+                continue
+
+            click.echo(f"\nTask {task.name}:")
+            for output_name in task.outputs:
+                if output_name in views:
+                    try:
+                        count = conn.execute(
+                            f'SELECT COUNT(*) FROM "{output_name}"'
+                        ).fetchone()
+                        count_s = str(count[0]) if count else "0"
+                        click.echo(f"  {output_name}: {count_s} rows")
+                    except duckdb.Error:
+                        click.echo(f"  {output_name}: error counting rows")
+                else:
+                    click.echo(f"  {output_name}: MISSING")
+
+            warn_count, warn_msgs = _collect_warnings(conn, task, views)
+            if warn_count:
+                click.echo(f"  warnings: {warn_count}")
+                for msg in warn_msgs:
+                    click.echo(f"    - {msg}")
+
+            errors = task.validate(conn)
+            if errors:
+                click.echo(f"  errors: {len(errors)}")
+                for msg in errors:
+                    click.echo(f"    - {msg}")
+    finally:
+        conn.close()
+
+
+def _collect_warnings(
+    conn: duckdb.DuckDBPyConnection, task: Task, views: set[str], limit: int = 20
+) -> tuple[int, list[str]]:
+    warnings: list[str] = []
+    total = 0
+    remaining = max(1, limit)
+
+    for view_name in validation_outputs(task):
+        if view_name not in views:
+            continue
+
+        try:
+            count_row = conn.execute(
+                f"SELECT COUNT(*) FROM \"{view_name}\" WHERE lower(status) = 'warn'"
+            ).fetchone()
+            view_count = int(count_row[0]) if count_row else 0
+        except duckdb.Error:
+            continue
+
+        if view_count <= 0:
+            continue
+
+        total += view_count
+        if remaining <= 0:
+            continue
+
+        try:
+            rows = conn.execute(
+                f'SELECT message FROM "{view_name}" '
+                f"WHERE lower(status) = 'warn' LIMIT {remaining}"
+            ).fetchall()
+        except duckdb.Error:
+            continue
+
+        if rows:
+            warnings.extend([str(r[0]) for r in rows])
+            remaining -= len(rows)
+
+    return total, warnings
 
 
 @main.command()
@@ -439,10 +528,10 @@ def show(target: Path | None, spec: str | None):
             for name in sorted(counts.keys()):
                 click.echo(f"  {name}: {counts[name]} rows")
 
-        prompts = _meta_json(meta, "task_prompts")
-        if prompts:
-            click.echo(f"\nTasks ({len(prompts)}):")
-            for name in sorted(prompts.keys()):
+        contexts = _meta_json(meta, "task_repair_contexts")
+        if contexts:
+            click.echo(f"\nTasks ({len(contexts)}):")
+            for name in sorted(contexts.keys()):
                 click.echo(f"  {name}")
 
         if exports:

@@ -28,7 +28,7 @@ INPUTS = {
 TASKS = [
     {
         "name": "summarize",
-        "prompt": (
+        "repair_context": (
             "Summarize employees by department. Create a view 'department_summary' with:\n"
             "- department: department name\n"
             "- headcount: number of employees\n"
@@ -36,6 +36,17 @@ TASKS = [
             "- avg_salary: average salary (rounded to nearest integer)\n"
             "Order by department name.\n"
         ),
+        "sql": """
+            CREATE OR REPLACE VIEW department_summary AS
+            SELECT
+                department,
+                COUNT(*) AS headcount,
+                SUM(salary) AS total_salary,
+                CAST(ROUND(AVG(salary), 0) AS INTEGER) AS avg_salary
+            FROM employees
+            GROUP BY department
+            ORDER BY department
+            """,
         "inputs": ["employees"],
         "outputs": ["department_summary"],
         "output_columns": {

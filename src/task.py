@@ -12,13 +12,15 @@ Example:
             name="prep",
             inputs=["raw_rows"],
             outputs=["rows_clean"],
-            prompt="Clean and normalize raw rows...",
+            repair_context="Clean and normalize raw rows...",
+            sql="CREATE OR REPLACE VIEW rows_clean AS SELECT ...",
         ),
         Task(
             name="match",
             inputs=["rows_clean", "reference"],
             outputs=["matches", "match_summary", "match__validation"],
-            prompt="Match normalized rows against a reference table...",
+            repair_context="Match normalized rows against a reference table...",
+            sql="CREATE OR REPLACE VIEW matches AS SELECT ...",
             # Create a view named 'match__validation' with status/message rows.
         ),
     ]
@@ -65,7 +67,6 @@ class Task:
 
     Attributes:
         name: Unique identifier, also used as namespace prefix for intermediate views.
-        prompt: Task-specific instructions for the agent.
         inputs: Table/view names this task reads from. These must exist before the task runs.
         outputs: View names this task must produce. Other tasks can depend on these.
         Validation views: a task may declare one or more outputs named
@@ -74,36 +75,50 @@ class Task:
             task to fail.
         output_columns: Optional schema check. Maps view_name -> list of required column
             names. Validation fails if a view is missing any declared column.
+        repair_context: Objective text used when repairing failed SQL tasks.
+        repair_on_warn: If True, warnings in validation views trigger LLM repair.
     """
 
     name: str
-    prompt: str = ""
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
     output_columns: dict[str, list[str]] = field(default_factory=dict)
 
-    # Deterministic SQL statements (views/macros only). If provided, the
-    # workspace harness executes these statements directly; on failure
-    # it may optionally attempt LLM repair.
-    sql: list[str] = field(default_factory=list)
+    # Deterministic SQL (views/macros only). If provided, the workspace
+    # harness executes these statements directly; on failure it may
+    # optionally attempt LLM repair.
+    sql: str = ""
 
     # Immutable deterministic SQL (no LLM repair). Same constraints as sql.
-    sql_strict: list[str] = field(default_factory=list)
+    sql_strict: str = ""
+
+    # Objective for repair mode when sql fails.
+    repair_context: str = ""
+
+    # If True, validation warnings trigger LLM repair.
+    repair_on_warn: bool = False
 
     def run_mode(self) -> str:
-        """Return execution mode: 'sql_strict', 'sql', or 'agent'.
+        """Return execution mode: 'sql_strict' or 'sql'.
 
-        Spec parsing enforces exactly one of (sql_strict, sql, prompt) is provided.
+        Spec parsing enforces exactly one of (sql_strict, sql) is provided.
         """
-        if self.sql_strict:
-            return "sql_strict"
-        if self.sql:
-            return "sql"
-        return "agent"
+        return "sql_strict" if self.sql_strict else "sql"
 
     def sql_statements(self) -> list[str]:
         """Return SQL statements for sql/sql_strict tasks."""
-        return self.sql_strict or self.sql
+        sql_text = self.sql_strict or self.sql
+        sql_text = (sql_text or "").strip()
+        if not sql_text:
+            return []
+        conn = duckdb.connect()
+        try:
+            statements = conn.extract_statements(sql_text)
+        except duckdb.Error:
+            return [sql_text]
+        finally:
+            conn.close()
+        return [s.query.strip() for s in statements if s.query.strip()]
 
     def validate(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
         """Run validation. Returns error messages (empty = pass).
@@ -189,6 +204,74 @@ class Task:
                     break
 
         return errors
+
+    def validation_warnings(
+        self, conn: duckdb.DuckDBPyConnection, limit: int = 50
+    ) -> list[str]:
+        """Return warning messages from validation views.
+
+        Assumes validation views exist and are well-formed.
+        """
+        views = validation_outputs(self)
+        if not views:
+            return []
+
+        warnings: list[str] = []
+        remaining = max(1, limit)
+
+        for view_name in views:
+            if remaining <= 0:
+                break
+
+            try:
+                cols = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+                        [view_name],
+                    ).fetchall()
+                ]
+            except duckdb.Error:
+                continue
+
+            actual = {c.lower() for c in cols}
+            if "status" not in actual or "message" not in actual:
+                continue
+
+            has_evidence_view = "evidence_view" in actual
+
+            try:
+                if has_evidence_view:
+                    rows = conn.execute(
+                        f'SELECT status, message, evidence_view FROM "{view_name}" '
+                        f"WHERE lower(status) = 'warn' LIMIT {remaining}"
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        f'SELECT status, message FROM "{view_name}" '
+                        f"WHERE lower(status) = 'warn' LIMIT {remaining}"
+                    ).fetchall()
+            except duckdb.Error:
+                continue
+
+            if rows:
+                msgs: list[str] = []
+                evidence_views: set[str] = set()
+                if has_evidence_view:
+                    for _status, msg, ev in rows:
+                        msgs.append(str(msg))
+                        if ev:
+                            evidence_views.add(str(ev))
+                else:
+                    msgs = [str(msg) for _status, msg in rows]
+
+                header = f"Warnings via '{view_name}':"
+                if evidence_views:
+                    header += f" evidence_view={', '.join(sorted(evidence_views))}"
+                warnings.extend([header] + msgs)
+                remaining -= len(msgs)
+
+        return warnings
 
     def _validate_one_validation_view(
         self, conn: duckdb.DuckDBPyConnection, view_name: str, remaining: int

@@ -6,7 +6,7 @@ INPUTS values can be:
 - Simple: callable or raw data
 - Rich: dict with "data" key + optional "columns" and "validate_sql"
 
-Task prompts must be strings.
+Task repair_context values must be strings.
 """
 
 import importlib
@@ -77,68 +77,63 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
     # Accept tasks as dicts or Task objects
     tasks = []
 
-    def _normalize_sql(task_name: str, value: Any, key: str) -> list[str]:
-        if isinstance(value, str):
-            sql = [value]
-        elif isinstance(value, list) and all(isinstance(s, str) for s in value):
-            sql = value
-        else:
-            raise ValueError(f"Task '{task_name}' {key} must be a string or list[str]")
-        stripped: list[str] = []
-        for s in sql:
-            s2 = s.strip()
-            if not s2:
-                raise ValueError(
-                    f"Task '{task_name}' {key} contains an empty statement"
-                )
-            stripped.append(s2)
-        return stripped
+    def _normalize_sql(task_name: str, value: Any, key: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"Task '{task_name}' {key} must be a string")
+        s2 = value.strip()
+        if not s2:
+            raise ValueError(f"Task '{task_name}' {key} must not be empty")
+        return s2
 
     for t in module.TASKS:
         if isinstance(t, dict):
             t = dict(t)  # shallow copy to avoid mutating the original
             task_name = t.get("name", "")
 
-            if "prompt" in t and not isinstance(t["prompt"], str):
+            if "prompt" in t:
                 raise ValueError(
-                    f"Task '{task_name}' prompt must be a string, "
-                    f"got {type(t['prompt']).__name__}"
+                    f"Task '{task_name}' uses 'prompt', which is no longer supported. "
+                    "Use 'sql' (repairable) or 'sql_strict' instead."
                 )
 
             # Deterministic SQL (optional). If present, the harness will
             # execute it directly (no LLM). Accept str or list[str].
             if "sql" in t:
-                t["sql"] = _normalize_sql(task_name, t.get("sql", []), "sql")
+                t["sql"] = _normalize_sql(task_name, t.get("sql", ""), "sql")
 
             # Immutable deterministic SQL (optional). No LLM repair.
             if "sql_strict" in t:
                 t["sql_strict"] = _normalize_sql(
-                    task_name, t.get("sql_strict", []), "sql_strict"
+                    task_name, t.get("sql_strict", ""), "sql_strict"
                 )
 
-            # prompt is optional to specify in the dict, but tasks must provide
-            # exactly one of: sql or prompt (non-empty).
-            t.setdefault("prompt", "")
+            # repair_context is used only for sql repair mode.
+            if "repair_context" in t and not isinstance(t["repair_context"], str):
+                raise ValueError(
+                    f"Task '{task_name}' repair_context must be a string, "
+                    f"got {type(t['repair_context']).__name__}"
+                )
+            if "repair_on_warn" in t and not isinstance(t["repair_on_warn"], bool):
+                raise ValueError(f"Task '{task_name}' repair_on_warn must be a bool")
 
-            sql_statements = t.get("sql") or []
-            sql_strict_statements = t.get("sql_strict") or []
-            prompt_text = (t.get("prompt") or "").strip()
+            sql_statements = (t.get("sql") or "").strip()
+            sql_strict_statements = (t.get("sql_strict") or "").strip()
 
             if sql_statements and sql_strict_statements:
                 raise ValueError(
                     f"Task '{task_name}' must not specify both 'sql' and 'sql_strict'"
                 )
-            if sql_statements and prompt_text:
+            if not sql_statements and not sql_strict_statements:
                 raise ValueError(
-                    f"Task '{task_name}' must not specify both 'sql' and 'prompt'"
+                    f"Task '{task_name}' must specify exactly one of 'sql' or 'sql_strict'"
                 )
-            if sql_strict_statements and prompt_text:
+            if sql_statements and not (t.get("repair_context") or "").strip():
                 raise ValueError(
-                    f"Task '{task_name}' must not specify both 'sql_strict' and 'prompt'"
+                    f"Task '{task_name}' with 'sql' must specify non-empty repair_context"
                 )
-            if not sql_statements and not sql_strict_statements and not prompt_text:
+            if t.get("repair_on_warn") and sql_strict_statements:
                 raise ValueError(
-                    f"Task '{task_name}' must specify exactly one of 'sql', 'sql_strict', or 'prompt'"
+                    f"Task '{task_name}' uses repair_on_warn with 'sql_strict'"
                 )
 
             tasks.append(Task(**t))
@@ -148,6 +143,24 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
             raise ValueError(
                 f"Each task must be a dict or Task, got {type(t).__name__}"
             )
+
+    for t in tasks:
+        sql_statements = (t.sql or "").strip()
+        sql_strict_statements = (t.sql_strict or "").strip()
+        if sql_statements and sql_strict_statements:
+            raise ValueError(
+                f"Task '{t.name}' must not specify both 'sql' and 'sql_strict'"
+            )
+        if not sql_statements and not sql_strict_statements:
+            raise ValueError(
+                f"Task '{t.name}' must specify exactly one of 'sql' or 'sql_strict'"
+            )
+        if sql_statements and not (t.repair_context or "").strip():
+            raise ValueError(
+                f"Task '{t.name}' with 'sql' must specify non-empty repair_context"
+            )
+        if t.repair_on_warn and sql_strict_statements:
+            raise ValueError(f"Task '{t.name}' uses repair_on_warn with 'sql_strict'")
 
     return {
         "inputs": inputs,

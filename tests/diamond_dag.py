@@ -119,11 +119,22 @@ INPUTS = {
 
 prep = {
     "name": "prep",
-    "prompt": (
+    "repair_context": (
         "Split the transactions table into two views based on the 'type' column:\n"
         "- 'prepared_sales': rows where type='sale', with columns: id, date, product, amount, region\n"
         "- 'prepared_costs': rows where type='cost', with columns: id, date, product, category, amount, region\n"
     ),
+    "sql": """
+        CREATE OR REPLACE VIEW prepared_sales AS
+        SELECT id, date, product, amount, region
+        FROM transactions
+        WHERE type = 'sale';
+
+        CREATE OR REPLACE VIEW prepared_costs AS
+        SELECT id, date, product, category, amount, region
+        FROM transactions
+        WHERE type = 'cost'
+        """,
     "inputs": ["transactions"],
     "outputs": ["prepared_sales", "prepared_costs"],
     "output_columns": {
@@ -134,13 +145,21 @@ prep = {
 
 sales = {
     "name": "sales",
-    "prompt": (
+    "repair_context": (
         "Summarize sales by product. Create a view 'sales_summary' with columns:\n"
         "- product: product name\n"
         "- total_sales: sum of amount\n"
         "- num_transactions: count of transactions\n"
-        "Join with the products table to include the SKU.\n"
     ),
+    "sql": """
+        CREATE OR REPLACE VIEW sales_summary AS
+        SELECT
+            s.product,
+            SUM(s.amount) AS total_sales,
+            COUNT(*) AS num_transactions
+        FROM prepared_sales s
+        GROUP BY s.product
+        """,
     "inputs": ["prepared_sales", "products"],
     "outputs": ["sales_summary"],
     "output_columns": {
@@ -150,13 +169,23 @@ sales = {
 
 costs = {
     "name": "costs",
-    "prompt": (
+    "repair_context": (
         "Summarize costs by product. Create a view 'costs_summary' with columns:\n"
         "- product: product name\n"
         "- total_costs: sum of amount\n"
         "- materials_cost: sum where category='materials'\n"
         "- labor_cost: sum where category='labor'\n"
     ),
+    "sql": """
+        CREATE OR REPLACE VIEW costs_summary AS
+        SELECT
+            product,
+            SUM(amount) AS total_costs,
+            SUM(CASE WHEN category = 'materials' THEN amount ELSE 0 END) AS materials_cost,
+            SUM(CASE WHEN category = 'labor' THEN amount ELSE 0 END) AS labor_cost
+        FROM prepared_costs
+        GROUP BY product
+        """,
     "inputs": ["prepared_costs"],
     "outputs": ["costs_summary"],
     "output_columns": {
@@ -166,7 +195,7 @@ costs = {
 
 report = {
     "name": "report",
-    "prompt": (
+    "repair_context": (
         "Create a profit report combining sales and costs. Create a view 'profit_report' with columns:\n"
         "- product: product name\n"
         "- total_sales: from sales_summary\n"
@@ -175,6 +204,17 @@ report = {
         "- margin_pct: round(profit / total_sales * 100, 1)\n"
         "Use LEFT JOIN so products with sales but no costs still appear.\n"
     ),
+    "sql": """
+        CREATE OR REPLACE VIEW profit_report AS
+        SELECT
+            s.product,
+            s.total_sales,
+            c.total_costs,
+            s.total_sales - c.total_costs AS profit,
+            ROUND((s.total_sales - c.total_costs) / s.total_sales * 100, 1) AS margin_pct
+        FROM sales_summary s
+        LEFT JOIN costs_summary c ON c.product = s.product
+        """,
     "inputs": ["sales_summary", "costs_summary"],
     "outputs": ["profit_report"],
     "output_columns": {
