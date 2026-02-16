@@ -524,9 +524,9 @@ def _build_task_user_message(
         task: The task spec.
         schema_info: Formatted schema for declared inputs.
         existing_views: If set, list of (view_name, row_count) for views
-            already in this task's namespace (rerun/review mode).
+            already in this task's namespace.
         validation_errors: If set, the errors from validating the existing
-            views against fresh data (rerun/review mode).
+            views against fresh data.
     """
     parts = []
 

@@ -6,7 +6,6 @@ from .agent import run_task_agent
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
 from .workspace import Workspace, WorkspaceResult
 from .ingest import ingest_table, coerce_to_dataframe, get_schema_info_for_tables
-from .spec import load_spec
 
 __all__ = [
     # Agent loop
@@ -29,6 +28,4 @@ __all__ = [
     "ingest_table",
     "coerce_to_dataframe",
     "get_schema_info_for_tables",
-    # Spec loader
-    "load_spec",
 ]

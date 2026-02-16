@@ -12,7 +12,6 @@ Task prompts must be strings.
 import importlib
 import importlib.util
 import sys
-import tempfile
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -103,65 +102,14 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
     }
 
 
-def load_spec(spec_path: Path) -> dict[str, Any]:
-    """Load a workspace spec from a Python file.
-
-    Returns dict with 'inputs', 'tasks', 'exports',
-    'input_columns', 'input_validate_sql', 'spec_source' keys.
-
-    Raises ValueError if the spec is invalid.
-    """
-    spec_source = spec_path.read_text()
-    module = _load_module(spec_path)
-    result = _parse_module(module)
-    result["spec_source"] = spec_source
-    return result
-
-
 def load_spec_from_module(module_path: str) -> dict[str, Any]:
     """Load a workspace spec from a module path.
 
     Returns dict with 'inputs', 'tasks', 'exports',
-    'input_columns', 'input_validate_sql', 'spec_source' keys.
+    'input_columns', 'input_validate_sql' keys.
 
     Raises ValueError if the spec is invalid.
     """
     module = importlib.import_module(module_path)
     result = _parse_module(module)
-    spec_source = None
-    module_file = getattr(module, "__file__", None)
-    if module_file:
-        try:
-            spec_source = Path(module_file).read_text()
-        except OSError:
-            spec_source = None
-    result["spec_source"] = spec_source
-    return result
-
-
-def load_spec_from_source(source: str) -> dict[str, Any]:
-    """Load a workspace spec from embedded Python source code.
-
-    Used for spec-free reruns: the source was stored in the .db file
-    at the original run. A temporary file is created to execute the module.
-
-    Args:
-        source: Raw Python source code of the spec file.
-
-    Returns dict with 'inputs', 'tasks', 'exports',
-    'input_columns', 'input_validate_sql', 'spec_source' keys.
-
-    Raises ValueError if the source is invalid.
-    """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
-        tmp.write(source)
-        tmp_path = Path(tmp.name)
-
-    try:
-        module = _load_module(tmp_path)
-        result = _parse_module(module)
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-    result["spec_source"] = source
     return result

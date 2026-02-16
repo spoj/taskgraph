@@ -475,48 +475,21 @@ If any task in a layer fails, all downstream layers are skipped. Earlier tasks i
 
 ---
 
-## Reruns
+## Starting From An Existing DB
 
-The `.db` file stores the spec module reference, resolved prompts, data, views, and metadata. Reruns use the recorded spec module (and can enforce the original git commit when you don't override `--spec`). Taskgraph will warn (but not fail) if your repo is dirty.
+Use `--from-db` to start from an existing workspace `.db` (it is copied to the output path), then re-run every task.
 
-### Spec-free rerun (same data)
-
-```bash
-taskgraph rerun previous.db -o new.db
-```
-
-Uses the recorded spec module and existing data. Validates existing views — if they still pass, the agent is not invoked. Useful for verifying a previous run or forcing re-validation.
-
-### Spec override rerun (new data)
+### Reuse ingested data (default)
 
 ```bash
-taskgraph rerun jan.db -o feb.db --spec my_app.specs.feb
+taskgraph run --spec my_app.specs.main --from-db previous.db -o new.db
 ```
 
-Uses a new spec module (must be structurally compatible — same input names/columns, task names/inputs/outputs). Re-ingests data from the new spec's loaders. Existing views are tested against the new data — the agent is only invoked for tasks that fail validation.
-
-This is the month-to-month workflow:
-1. `taskgraph run --spec my_app.specs.jan -o jan.db`
-2. Edit your spec module: change data paths, tweak prompts
-3. Commit changes in git
-4. `taskgraph rerun jan.db -o feb.db --spec my_app.specs.feb`
-
-### Rerun modes
-
-- `--mode validate` (default): Skip tasks whose validation passes. Agent only runs for failures.
-- `--mode review`: Always invoke the agent, even for passing tasks. Agent sees existing views and can revise them.
-
-### Structural compatibility
-
-The fingerprint includes: input names + declared columns, task names + inputs + outputs + output_columns. These must match between the source `.db` and the new spec. Things that **can** change freely: prompt text, `validate_sql`, export functions, data values.
-
-### Force re-ingestion
+### Re-ingest data
 
 ```bash
-taskgraph rerun previous.db -o new.db --reingest
+taskgraph run --spec my_app.specs.main --from-db previous.db -o new.db --reingest
 ```
-
-Re-runs the spec's input callables even without `--spec`. Useful if the underlying data files changed but the spec hasn't.
 
 ---
 
@@ -582,12 +555,11 @@ SELECT key, value FROM _workspace_meta
 Keys (v2):
 - `meta_version`
 - `created_at_utc`
-- `structural_fingerprint`
 - `task_prompts`
 - `llm_model`, `llm_reasoning_effort`, `llm_max_iterations`
 - `inputs_row_counts`, `inputs_schema`
-- `run` (JSON: run vs rerun context)
-- `spec` (JSON: module/git info, optional embedded source)
+  - `run` (JSON: run context; may include source_db when starting from an existing db)
+- `spec` (JSON: module/git info)
 
 ### Adding provenance columns
 
@@ -686,27 +658,11 @@ taskgraph run -o OUTPUT_DB [options]
 |------|-------------|
 | `-o, --output PATH` | Output `.db` file path (required) |
 | `-s, --spec MODULE` | Spec module path (default: `[tool.taskgraph].spec` from `pyproject.toml`; if unset: `specs.main` when present) |
+| `--from-db PATH` | Start from an existing workspace `.db` |
+| `--reingest` | Re-run input callables for fresh data when using `--from-db` |
 | `-m, --model MODEL` | LLM model (default: `openai/gpt-5.2`) |
 | `--reasoning-effort low\|medium\|high` | Reasoning effort level |
 | `--max-iterations N` | Max agent iterations per task (default: 200) |
-| `-q, --quiet` | Suppress verbose output |
-| `-f, --force` | Overwrite output file without prompting |
-
-### `taskgraph rerun`
-
-```
-taskgraph rerun DB_FILE -o OUTPUT_DB [options]
-```
-
-| Flag | Description |
-|------|-------------|
-| `-o, --output PATH` | Output `.db` file path (required) |
-| `-s, --spec MODULE` | Override spec module (must be structurally compatible) |
-| `--mode validate\|review` | `validate`: skip passing tasks; `review`: always invoke agent |
-| `--reingest` | Force re-ingestion of input data |
-| `-m, --model MODEL` | LLM model |
-| `--reasoning-effort low\|medium\|high` | Reasoning effort level |
-| `--max-iterations N` | Max agent iterations per task |
 | `-q, --quiet` | Suppress verbose output |
 | `-f, --force` | Overwrite output file without prompting |
 
@@ -718,14 +674,6 @@ taskgraph show
 ```
 
 Displays spec structure: inputs, DAG layers, per-task details, validation summary, exports.
-
-### `taskgraph extract-spec`
-
-```
-taskgraph extract-spec DB_FILE OUT_FILE
-```
-
-Extracts embedded spec source from a `.db` file.
 
 ## Appendix: Debugging a Workspace
 

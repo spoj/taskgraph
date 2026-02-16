@@ -49,18 +49,18 @@ When `--spec` is not provided, Taskgraph looks for:
 - `[tool.taskgraph].spec` in `pyproject.toml`, otherwise
 - `specs.main` (only if `specs/main.py` exists)
 
-## Rerun (Validate + Fix Only Failures)
+## Start From An Existing DB
 
-`rerun` starts from an existing `.db` file and only invokes the LLM for tasks that fail validation.
+Use `--from-db` to start from an existing workspace `.db` (it is copied to the output path), then re-run every task.
 
 ```bash
-uv run taskgraph rerun previous.db -o new.db
+uv run taskgraph run --spec my_app.specs.main --from-db previous.db -o new.db
 
-# Re-ingest inputs even if you didn't change the spec
-uv run taskgraph rerun previous.db -o new.db --reingest
+# Re-ingest inputs (fresh data)
+uv run taskgraph run --spec my_app.specs.main --from-db previous.db -o new.db --reingest
 
 # Month-to-month workflow: swap spec module (fresh ingest)
-uv run taskgraph rerun jan.db -o feb.db --spec my_app.specs.feb
+uv run taskgraph run --spec my_app.specs.feb --from-db jan.db -o feb.db --reingest
 ```
 
 ## Docs

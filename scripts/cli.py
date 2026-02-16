@@ -9,8 +9,8 @@ Usage:
     # Run an explicit spec module
     taskgraph run --spec my_app.specs.main -o output.db
 
-    # Validate + fix only failing tasks from a prior run
-    taskgraph rerun previous.db -o output.db
+    # Start from a previous .db file
+    taskgraph run --spec my_app.specs.main --from-db previous.db -o output.db
 """
 
 import asyncio
@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path.cwd()))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.api import OpenRouterClient
-from src.spec import load_spec_from_module, load_spec_from_source, resolve_module_path
+from src.spec import load_spec_from_module, resolve_module_path
 from src.spec_repo import get_spec_repo_info
 from src.workspace import Workspace, read_workspace_meta
 from src.task import resolve_dag, validate_task_graph
@@ -180,6 +180,12 @@ __pycache__/
     help="Spec module path (default: [tool.taskgraph].spec from pyproject.toml)",
 )
 @click.option(
+    "--from-db",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Start from an existing workspace .db (copies it, then reruns tasks).",
+)
+@click.option(
     "--output",
     "-o",
     type=click.Path(path_type=Path),
@@ -198,6 +204,11 @@ __pycache__/
     type=int,
     help="Maximum agent iterations per task (default: 200)",
 )
+@click.option(
+    "--reingest",
+    is_flag=True,
+    help="Re-run input callables for fresh data when using --from-db.",
+)
 @click.option("--quiet", "-q", is_flag=True, help="Suppress verbose output")
 @click.option(
     "--force",
@@ -213,9 +224,11 @@ __pycache__/
 )
 def run(
     spec: str | None,
+    from_db: Path | None,
     output: Path,
     model: str,
     max_iterations: int,
+    reingest: bool,
     quiet: bool,
     force: bool,
     reasoning_effort: str | None,
@@ -266,7 +279,6 @@ def run(
         exports=loaded["exports"],
         input_columns=loaded["input_columns"],
         input_validate_sql=loaded["input_validate_sql"],
-        spec_source=loaded.get("spec_source"),
         spec_module=spec,
         spec_git_commit=repo_info.commit,
         spec_git_root=str(repo_info.root),
@@ -283,10 +295,18 @@ def run(
 
     async def _run():
         async with OpenRouterClient(reasoning_effort=reasoning_effort) as client:
-            return await workspace.run(
+            if from_db is None:
+                return await workspace.run(
+                    client=client,
+                    model=model,
+                    max_iterations=max_iterations,
+                )
+            return await workspace.rerun(
+                source_db=from_db,
                 client=client,
                 model=model,
                 max_iterations=max_iterations,
+                reingest=reingest,
             )
 
     result = asyncio.run(_run())
@@ -296,243 +316,6 @@ def run(
     log.info("SQL trace: SELECT * FROM _trace")
 
     sys.exit(0 if result.success else 1)
-
-
-@main.command()
-@click.argument("db_file", type=click.Path(exists=True, path_type=Path))
-@click.option(
-    "--output",
-    "-o",
-    type=click.Path(path_type=Path),
-    required=True,
-    help="Output database path",
-)
-@click.option(
-    "--spec",
-    "-s",
-    default=None,
-    help="Override spec module path (must be structurally compatible).",
-)
-@click.option(
-    "--model",
-    "-m",
-    default="openai/gpt-5.2",
-    help="Model to use (default: openai/gpt-5.2)",
-)
-@click.option(
-    "--max-iterations",
-    default=200,
-    type=int,
-    help="Maximum agent iterations per task (default: 200)",
-)
-@click.option("--quiet", "-q", is_flag=True, help="Suppress verbose output")
-@click.option(
-    "--force",
-    "-f",
-    is_flag=True,
-    help="Overwrite output file without prompting",
-)
-@click.option(
-    "--reasoning-effort",
-    type=click.Choice(["low", "medium", "high"]),
-    default=None,
-    help="Reasoning effort level (default: low)",
-)
-@click.option(
-    "--mode",
-    type=click.Choice(["validate", "review"]),
-    default="validate",
-    help="'validate' skips tasks that pass; 'review' always invokes agents (default: validate).",
-)
-@click.option(
-    "--reingest",
-    is_flag=True,
-    help="Re-run input callables for fresh data. Default when --spec is provided; "
-    "without --spec, data is reused from the db automatically.",
-)
-def rerun(
-    db_file: Path,
-    output: Path,
-    spec: str | None,
-    model: str,
-    max_iterations: int,
-    quiet: bool,
-    force: bool,
-    reasoning_effort: str | None,
-    mode: str,
-    reingest: bool,
-):
-    """Rerun a workspace from a previous .db file.
-
-    DB_FILE: A previous workspace .db file.
-
-    \b
-    By default, the recorded spec module is used and existing data is
-    reused from the db. Use --spec to override with a new spec module
-    (must be structurally compatible — same input names, task names,
-    outputs), which also re-ingests fresh data from the new spec's
-    input callables.
-
-    \b
-    Use --reingest to force re-ingestion even without --spec.
-
-    \b
-    Example:
-        taskgraph rerun previous.db -o new.db
-        taskgraph rerun previous.db -o new.db --mode review
-        taskgraph rerun jan.db -o feb.db --spec my_app.specs.feb
-        taskgraph rerun previous.db -o new.db --reingest
-    """
-    # Configure logging
-    level = logging.WARNING if quiet else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-
-    # Determine ingestion behavior:
-    # --spec provided -> reingest by default (new data paths)
-    # no --spec       -> skip ingest by default (.db is self-contained)
-    # --reingest      -> always reingest (explicit override)
-    skip_ingest = not reingest and spec is None
-
-    conn = duckdb.connect(str(db_file), read_only=True)
-    meta = read_workspace_meta(conn)
-    conn.close()
-
-    if not meta:
-        raise click.ClickException(
-            f"{db_file} has no workspace metadata — not a Taskgraph workspace."
-        )
-
-    spec_meta = _meta_json(meta, "spec")
-    embedded_source = spec_meta.get("source")
-
-    if spec:
-        spec_module = spec
-        log.info("Spec override: %s", spec_module)
-    else:
-        spec_module = spec_meta.get("module")
-
-    using_embedded_source = spec is None and bool(embedded_source)
-    if spec is None and not using_embedded_source and not spec_module:
-        raise click.ClickException(
-            f"{db_file} has no embedded spec source or spec module reference. Use --spec."
-        )
-
-    repo_info = None
-    if using_embedded_source:
-        try:
-            loaded = load_spec_from_source(str(embedded_source))
-        except Exception as e:
-            raise click.ClickException(str(e))
-    else:
-        try:
-            assert spec_module is not None
-            spec_path = resolve_module_path(spec_module)
-            repo_info = get_spec_repo_info(spec_path)
-        except ValueError as e:
-            raise click.ClickException(str(e))
-
-        if repo_info.dirty:
-            click.echo(
-                f"WARNING: spec repo is dirty ({repo_info.root}); rerun is not strictly reproducible.",
-                err=True,
-            )
-
-        if spec is None:
-            expected_commit = spec_meta.get("git_commit")
-            if expected_commit and repo_info.commit != expected_commit:
-                raise click.ClickException(
-                    "Spec commit mismatch: expected "
-                    f"{expected_commit}, found {repo_info.commit}."
-                )
-
-        try:
-            loaded = load_spec_from_module(spec_module)
-        except Exception as e:
-            raise click.ClickException(str(e))
-
-    # Overwrite check
-    if output.exists():
-        if not force:
-            click.confirm(
-                f"{output} already exists and will be overwritten. Continue?",
-                abort=True,
-            )
-
-    workspace = Workspace(
-        db_path=output,
-        inputs=loaded["inputs"],
-        tasks=loaded["tasks"],
-        exports=loaded["exports"],
-        input_columns=loaded["input_columns"],
-        input_validate_sql=loaded["input_validate_sql"],
-        spec_source=loaded.get("spec_source"),
-        spec_module=spec_module,
-        spec_git_commit=repo_info.commit if repo_info else spec_meta.get("git_commit"),
-        spec_git_root=str(repo_info.root) if repo_info else spec_meta.get("git_root"),
-        spec_git_dirty=repo_info.dirty if repo_info else spec_meta.get("git_dirty"),
-    )
-
-    log.info("Rerun: %s", db_file)
-    log.info("Output: %s", output)
-    log.info("Model: %s", model)
-    log.info("Mode: %s", mode)
-    log.info("Spec: %s", spec_module)
-    if repo_info:
-        log.info("Spec commit: %s", repo_info.commit)
-    elif spec_meta.get("git_commit"):
-        log.info("Spec commit: %s", spec_meta.get("git_commit"))
-    log.info(
-        "Ingestion: %s",
-        "skipped (using existing data)" if skip_ingest else "fresh",
-    )
-    log.info("Tasks: %d\n", len(loaded["tasks"]))
-
-    _require_openrouter_api_key()
-
-    async def _run():
-        async with OpenRouterClient(reasoning_effort=reasoning_effort) as client:
-            return await workspace.rerun(
-                source_db=db_file,
-                client=client,
-                model=model,
-                max_iterations=max_iterations,
-                mode=mode,
-                skip_ingest=skip_ingest,
-            )
-
-    result = asyncio.run(_run())
-
-    log.info("\nSaved to: %s", output)
-
-    sys.exit(0 if result.success else 1)
-
-
-@main.command("extract-spec")
-@click.argument("db_file", type=click.Path(exists=True, path_type=Path))
-@click.argument("out_file", type=click.Path(path_type=Path))
-def extract_spec_cmd(db_file: Path, out_file: Path):
-    """Extract the embedded spec source from a workspace .db file."""
-    conn = duckdb.connect(str(db_file), read_only=True)
-    meta = read_workspace_meta(conn)
-    conn.close()
-
-    if not meta:
-        raise click.ClickException(
-            f"{db_file} has no workspace metadata — not a Taskgraph workspace."
-        )
-
-    spec_json = meta.get("spec")
-    spec_meta = json.loads(spec_json) if spec_json else {}
-    spec_source = spec_meta.get("source")
-    if not spec_source:
-        raise click.ClickException(f"{db_file} has no embedded spec source.")
-
-    out_file.write_text(spec_source)
-    click.echo(f"Extracted: {out_file}")
 
 
 @main.command()
@@ -591,12 +374,11 @@ def show(target: Path | None, spec: str | None):
             for name in sorted(counts.keys()):
                 click.echo(f"  {name}: {counts[name]} rows")
 
-        fp = _meta_json(meta, "structural_fingerprint")
-        tasks = fp.get("tasks") or []
-        if tasks:
-            click.echo(f"\nTasks ({len(tasks)}):")
-            for t in tasks:
-                click.echo(f"  {t.get('name')}")
+        prompts = _meta_json(meta, "task_prompts")
+        if prompts:
+            click.echo(f"\nTasks ({len(prompts)}):")
+            for name in sorted(prompts.keys()):
+                click.echo(f"  {name}")
 
         if exports:
             attempted = exports.get("attempted")

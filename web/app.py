@@ -164,7 +164,6 @@ async def _execute_run(
             exports=exports,
             input_columns=spec.get("input_columns", {}),
             input_validate_sql=spec.get("input_validate_sql", {}),
-            spec_source=spec.get("spec_source"),
             spec_module=spec_module,
             spec_git_commit=repo_info.commit,
             spec_git_root=str(repo_info.root),

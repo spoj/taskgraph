@@ -33,13 +33,7 @@ from src.agent import (
 from src.agent_loop import run_agent_loop, AgentResult, DEFAULT_MAX_TOKENS
 from src.ingest import coerce_to_dataframe, ingest_table
 from src.task import Task, resolve_dag, validate_task_graph
-from src.workspace import (
-    Workspace,
-    _build_workspace_fingerprint,
-    persist_workspace_meta,
-    read_workspace_meta,
-    check_fingerprint_compatibility,
-)
+from src.workspace import Workspace, persist_workspace_meta, read_workspace_meta
 
 
 # ---------------------------------------------------------------------------
@@ -2134,70 +2128,14 @@ class TestResultSizeCap:
         assert MAX_RESULT_CHARS == 30_000
 
 
-# ===========================================================================
-# Workspace fingerprint and metadata
-# ===========================================================================
-
-
-class TestWorkspaceFingerprint:
-    """Tests for _build_workspace_fingerprint."""
-
-    def test_basic_fingerprint(self):
-        """Fingerprint captures input names, task structure."""
-        fp = _build_workspace_fingerprint(
-            inputs={"left": None, "right": None},
-            tasks=[
-                _make_task(
-                    name="match",
-                    inputs=["left", "right"],
-                    outputs=["output"],
-                    output_columns={"output": ["a", "b"]},
-                )
-            ],
-            input_columns={"left": ["id", "amount"]},
-        )
-        assert sorted(fp["inputs"].keys()) == ["left", "right"]
-        assert fp["inputs"]["left"]["columns"] == ["amount", "id"]  # sorted
-        assert fp["inputs"]["right"]["columns"] == []
-        assert len(fp["tasks"]) == 1
-        assert fp["tasks"][0]["name"] == "match"
-        assert fp["tasks"][0]["outputs"] == ["output"]
-
-    def test_excludes_prompts(self):
-        """Fingerprint does NOT include prompt text."""
-        fp = _build_workspace_fingerprint(
-            inputs={"data": None},
-            tasks=[_make_task(name="t", prompt="do the thing", outputs=["out"])],
-            input_columns={},
-        )
-        task_dict = fp["tasks"][0]
-        assert "prompt" not in task_dict
-
-    def test_deterministic_ordering(self):
-        """Same spec in different order produces identical fingerprint."""
-        tasks = [
-            _make_task(name="b", inputs=["data"], outputs=["b_out"]),
-            _make_task(name="a", inputs=["data"], outputs=["a_out"]),
-        ]
-        fp1 = _build_workspace_fingerprint(
-            inputs={"data": None}, tasks=tasks, input_columns={}
-        )
-        fp2 = _build_workspace_fingerprint(
-            inputs={"data": None}, tasks=list(reversed(tasks)), input_columns={}
-        )
-        assert json.dumps(fp1, sort_keys=True) == json.dumps(fp2, sort_keys=True)
-
-
 class TestWorkspaceMeta:
     """Tests for persist_workspace_meta / read_workspace_meta."""
 
     def test_roundtrip(self, conn):
         """Write and read workspace metadata."""
-        fp = {"inputs": {}, "tasks": []}
         tasks = [_make_task(name="t", prompt="test prompt", outputs=["out"])]
         persist_workspace_meta(
             conn,
-            fp,
             model="gpt-5",
             tasks=tasks,
             input_row_counts={"data": 100},
@@ -2206,7 +2144,6 @@ class TestWorkspaceMeta:
         assert meta["llm_model"] == "gpt-5"
         assert meta["meta_version"] == "2"
         assert "created_at_utc" in meta
-        assert "structural_fingerprint" in meta
         assert "task_prompts" in meta
         assert "run" in meta
 
@@ -2219,28 +2156,22 @@ class TestWorkspaceMeta:
         assert counts["data"] == 100
 
     def test_rerun_fields(self, conn):
-        """Source db and rerun mode are stored when provided."""
-        fp = {"inputs": {}, "tasks": []}
+        """Source db is stored when provided."""
         persist_workspace_meta(
             conn,
-            fp,
             model="m",
             tasks=[],
             source_db="/tmp/prev.db",
-            rerun_mode="review",
         )
         meta = read_workspace_meta(conn)
         run = json.loads(meta["run"])
         assert run["mode"] == "rerun"
         assert run["source_db"] == "/tmp/prev.db"
-        assert run["rerun_mode"] == "review"
 
     def test_no_rerun_fields_when_fresh(self, conn):
         """Rerun fields are absent for fresh runs."""
-        fp = {"inputs": {}, "tasks": []}
         persist_workspace_meta(
             conn,
-            fp,
             model="m",
             tasks=[],
         )
@@ -2248,20 +2179,16 @@ class TestWorkspaceMeta:
         run = json.loads(meta["run"])
         assert run["mode"] == "run"
         assert "source_db" not in run
-        assert "rerun_mode" not in run
 
     def test_overwrites_on_rewrite(self, conn):
         """Second call replaces all metadata."""
-        fp = {"inputs": {}, "tasks": []}
         persist_workspace_meta(
             conn,
-            fp,
             model="m1",
             tasks=[],
         )
         persist_workspace_meta(
             conn,
-            fp,
             model="m2",
             tasks=[],
         )
@@ -2278,10 +2205,8 @@ class TestWorkspaceMeta:
         """Full prompts are stored without truncation."""
         long_prompt = "x" * 1000
         tasks = [_make_task(name="t", prompt=long_prompt, outputs=["out"])]
-        fp = {"inputs": {}, "tasks": []}
         persist_workspace_meta(
             conn,
-            fp,
             model="m",
             tasks=tasks,
         )
@@ -2290,170 +2215,9 @@ class TestWorkspaceMeta:
         assert prompts["t"] == long_prompt
         assert len(prompts["t"]) == 1000
 
-    def test_spec_source_stored(self, conn):
-        """Spec source is stored when provided."""
-        fp = {"inputs": {}, "tasks": []}
-        source = 'INPUTS = {"t": []}\nTASKS = []\n'
-        persist_workspace_meta(
-            conn,
-            fp,
-            model="m",
-            tasks=[],
-            spec_source=source,
-        )
-        meta = read_workspace_meta(conn)
-        spec = json.loads(meta["spec"])
-        assert spec["source"] == source
 
-    def test_spec_source_absent_when_not_provided(self, conn):
-        """spec_source is absent when not provided."""
-        fp = {"inputs": {}, "tasks": []}
-        persist_workspace_meta(
-            conn,
-            fp,
-            model="m",
-            tasks=[],
-        )
-        meta = read_workspace_meta(conn)
-        assert "spec" not in meta
-
-
-# ===========================================================================
-# Fingerprint compatibility
-# ===========================================================================
-
-
-class TestFingerprintCompatibility:
-    """Tests for check_fingerprint_compatibility."""
-
-    def _make_db_with_fingerprint(self, fingerprint):
-        """Helper: create an in-memory db with workspace metadata."""
-        c = duckdb.connect(":memory:")
-        persist_workspace_meta(
-            c,
-            fingerprint,
-            model="m",
-            tasks=[],
-        )
-        return c
-
-    def test_identical_fingerprints_compatible(self):
-        """Same fingerprint passes compatibility check."""
-        fp = _build_workspace_fingerprint(
-            inputs={"data": None},
-            tasks=[_make_task(name="t", inputs=["data"], outputs=["out"])],
-            input_columns={},
-        )
-        conn = self._make_db_with_fingerprint(fp)
-        errors = check_fingerprint_compatibility(conn, fp)
-        assert errors == []
-        conn.close()
-
-    def test_missing_input_detected(self):
-        """New input not in source db is flagged."""
-        stored_fp = _build_workspace_fingerprint(
-            inputs={"left": None},
-            tasks=[_make_task(name="t", inputs=["left"], outputs=["out"])],
-            input_columns={},
-        )
-        current_fp = _build_workspace_fingerprint(
-            inputs={"left": None, "right": None},
-            tasks=[_make_task(name="t", inputs=["left", "right"], outputs=["out"])],
-            input_columns={},
-        )
-        conn = self._make_db_with_fingerprint(stored_fp)
-        errors = check_fingerprint_compatibility(conn, current_fp)
-        assert any("right" in e and "not in source" in e for e in errors)
-        conn.close()
-
-    def test_extra_source_input_detected(self):
-        """Extra input in source db not in spec is flagged."""
-        stored_fp = _build_workspace_fingerprint(
-            inputs={"left": None, "right": None},
-            tasks=[_make_task(name="t", inputs=["left"], outputs=["out"])],
-            input_columns={},
-        )
-        current_fp = _build_workspace_fingerprint(
-            inputs={"left": None},
-            tasks=[_make_task(name="t", inputs=["left"], outputs=["out"])],
-            input_columns={},
-        )
-        conn = self._make_db_with_fingerprint(stored_fp)
-        errors = check_fingerprint_compatibility(conn, current_fp)
-        assert any("right" in e and "extra" in e.lower() for e in errors)
-        conn.close()
-
-    def test_missing_task_detected(self):
-        """New task not in source db is flagged."""
-        stored_fp = _build_workspace_fingerprint(
-            inputs={"data": None},
-            tasks=[_make_task(name="a", inputs=["data"], outputs=["a_out"])],
-            input_columns={},
-        )
-        current_fp = _build_workspace_fingerprint(
-            inputs={"data": None},
-            tasks=[
-                _make_task(name="a", inputs=["data"], outputs=["a_out"]),
-                _make_task(name="b", inputs=["data"], outputs=["b_out"]),
-            ],
-            input_columns={},
-        )
-        conn = self._make_db_with_fingerprint(stored_fp)
-        errors = check_fingerprint_compatibility(conn, current_fp)
-        assert any("'b'" in e and "not in source" in e for e in errors)
-        conn.close()
-
-    def test_task_output_mismatch(self):
-        """Different outputs on same task are flagged."""
-        stored_fp = _build_workspace_fingerprint(
-            inputs={"data": None},
-            tasks=[_make_task(name="t", inputs=["data"], outputs=["out_a"])],
-            input_columns={},
-        )
-        current_fp = _build_workspace_fingerprint(
-            inputs={"data": None},
-            tasks=[_make_task(name="t", inputs=["data"], outputs=["out_b"])],
-            input_columns={},
-        )
-        conn = self._make_db_with_fingerprint(stored_fp)
-        errors = check_fingerprint_compatibility(conn, current_fp)
-        assert any("outputs differ" in e for e in errors)
-        conn.close()
-
-    def test_no_meta_table(self):
-        """Database without _workspace_meta is flagged."""
-        conn = duckdb.connect(":memory:")
-        errors = check_fingerprint_compatibility(conn, {"inputs": {}, "tasks": []})
-        assert any("no _workspace_meta" in e.lower() for e in errors)
-        conn.close()
-
-    def test_no_fingerprint_key(self):
-        """Database with _workspace_meta but no fingerprint is flagged."""
-        conn = duckdb.connect(":memory:")
-        conn.execute(
-            "CREATE TABLE _workspace_meta (key VARCHAR PRIMARY KEY, value VARCHAR)"
-        )
-        conn.execute("INSERT INTO _workspace_meta VALUES ('model', 'test')")
-        errors = check_fingerprint_compatibility(conn, {"inputs": {}, "tasks": []})
-        assert any("no structural_fingerprint" in e.lower() for e in errors)
-        conn.close()
-
-    def test_prompt_change_compatible(self):
-        """Different prompts don't break compatibility (excluded from fingerprint)."""
-        tasks_v1 = [_make_task(name="t", prompt="v1", inputs=["data"], outputs=["out"])]
-        tasks_v2 = [
-            _make_task(name="t", prompt="v2 improved", inputs=["data"], outputs=["out"])
-        ]
-        fp1 = _build_workspace_fingerprint(
-            inputs={"data": None}, tasks=tasks_v1, input_columns={}
-        )
-        fp2 = _build_workspace_fingerprint(
-            inputs={"data": None}, tasks=tasks_v2, input_columns={}
-        )
-        # Fingerprints should be identical despite prompt change
-        assert json.dumps(fp1, sort_keys=True) == json.dumps(fp2, sort_keys=True)
-
-
+# Spec source embedding removed.
+# (Fingerprint compatibility checks removed — rerun is intentionally simple.)
 # ===========================================================================
 # Get task views helper
 # ===========================================================================
@@ -2585,12 +2349,8 @@ class TestRerun:
                 output_columns={"output": ["x", "y"]},
             )
         ]
-        fp = _build_workspace_fingerprint(
-            inputs={"data": None}, tasks=tasks, input_columns={}
-        )
         persist_workspace_meta(
             conn,
-            fp,
             model="test",
             tasks=tasks,
             input_row_counts={"data": 2},
@@ -2599,8 +2359,8 @@ class TestRerun:
         conn.close()
         return db_path, tasks
 
-    def test_validate_mode_skips_valid(self, tmp_path):
-        """Validate mode skips task when views pass validation."""
+    def test_rerun_reuses_source_views(self, tmp_path, monkeypatch):
+        """Rerun copies db and can succeed without LLM changes."""
         source_path, tasks = self._create_source_db(tmp_path)
         output_path = tmp_path / "output.db"
 
@@ -2610,6 +2370,23 @@ class TestRerun:
             tasks=tasks,
         )
 
+        async def _dummy_run_task_agent(**kwargs):
+            return AgentResult(
+                success=True,
+                final_message="dummy",
+                iterations=1,
+                messages=[],
+                usage={
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+                tool_calls_count=0,
+            )
+
+        monkeypatch.setattr("src.workspace.run_task_agent", _dummy_run_task_agent)
+
         async def _run():
             from src.api import OpenRouterClient
 
@@ -2617,15 +2394,10 @@ class TestRerun:
                 return await ws.rerun(
                     source_db=source_path,
                     client=client,
-                    mode="validate",
                 )
 
         result = asyncio.run(_run())
         assert result.success is True
-        # Should have 0 iterations (skipped)
-        task_result = result.task_results["t"]
-        assert task_result.iterations == 0
-        assert task_result.tool_calls_count == 0
 
         # Verify the output is correct
         conn = duckdb.connect(str(output_path), read_only=True)
@@ -2636,38 +2408,7 @@ class TestRerun:
         meta = read_workspace_meta(conn)
         run = json.loads(meta["run"])
         assert run["source_db"] == str(source_path)
-        assert run["rerun_mode"] == "validate"
         conn.close()
-
-    def test_incompatible_source_raises(self, tmp_path):
-        """Incompatible source db raises ValueError."""
-        source_path, _ = self._create_source_db(tmp_path)
-        output_path = tmp_path / "output.db"
-
-        # Different task structure
-        ws = Workspace(
-            db_path=str(output_path),
-            inputs={"data": [{"x": 1}], "extra": [{"y": 1}]},
-            tasks=[
-                _make_task(
-                    name="different",
-                    inputs=["data", "extra"],
-                    outputs=["result"],
-                )
-            ],
-        )
-
-        async def _run():
-            from src.api import OpenRouterClient
-
-            async with OpenRouterClient() as client:
-                return await ws.rerun(
-                    source_db=source_path,
-                    client=client,
-                )
-
-        with pytest.raises(ValueError, match="not compatible"):
-            asyncio.run(_run())
 
     def test_missing_source_raises(self, tmp_path):
         """Non-existent source db raises ValueError."""
@@ -2689,30 +2430,7 @@ class TestRerun:
         with pytest.raises(ValueError, match="not found"):
             asyncio.run(_run())
 
-    def test_invalid_mode_raises(self, tmp_path):
-        """Invalid mode raises ValueError."""
-        source_path, tasks = self._create_source_db(tmp_path)
-
-        ws = Workspace(
-            db_path=str(tmp_path / "out.db"),
-            inputs={"data": [{"x": 1}]},
-            tasks=tasks,
-        )
-
-        async def _run():
-            from src.api import OpenRouterClient
-
-            async with OpenRouterClient() as client:
-                return await ws.rerun(
-                    source_db=source_path,
-                    client=client,
-                    mode="invalid",
-                )
-
-        with pytest.raises(ValueError, match="Invalid mode"):
-            asyncio.run(_run())
-
-    def test_data_refresh_propagates(self, tmp_path):
+    def test_data_refresh_propagates(self, tmp_path, monkeypatch):
         """Re-ingested data propagates through views."""
         source_path, tasks = self._create_source_db(tmp_path)
         output_path = tmp_path / "output.db"
@@ -2724,6 +2442,23 @@ class TestRerun:
             tasks=tasks,
         )
 
+        async def _dummy_run_task_agent(**kwargs):
+            return AgentResult(
+                success=True,
+                final_message="dummy",
+                iterations=1,
+                messages=[],
+                usage={
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+                tool_calls_count=0,
+            )
+
+        monkeypatch.setattr("src.workspace.run_task_agent", _dummy_run_task_agent)
+
         async def _run():
             from src.api import OpenRouterClient
 
@@ -2731,7 +2466,7 @@ class TestRerun:
                 return await ws.rerun(
                     source_db=source_path,
                     client=client,
-                    mode="validate",
+                    reingest=True,
                 )
 
         result = asyncio.run(_run())
@@ -2744,8 +2479,8 @@ class TestRerun:
         assert len(rows) == 3  # Was 2 in source
         conn.close()
 
-    def test_skip_ingest_uses_existing_data(self, tmp_path):
-        """skip_ingest=True uses existing data from source db."""
+    def test_reuse_data_ignores_new_inputs(self, tmp_path, monkeypatch):
+        """Default rerun reuses existing data from the source db."""
         source_path, tasks = self._create_source_db(tmp_path)
         output_path = tmp_path / "output.db"
 
@@ -2755,6 +2490,23 @@ class TestRerun:
             tasks=tasks,
         )
 
+        async def _dummy_run_task_agent(**kwargs):
+            return AgentResult(
+                success=True,
+                final_message="dummy",
+                iterations=1,
+                messages=[],
+                usage={
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+                tool_calls_count=0,
+            )
+
+        monkeypatch.setattr("src.workspace.run_task_agent", _dummy_run_task_agent)
+
         async def _run():
             from src.api import OpenRouterClient
 
@@ -2762,8 +2514,6 @@ class TestRerun:
                 return await ws.rerun(
                     source_db=source_path,
                     client=client,
-                    mode="validate",
-                    skip_ingest=True,
                 )
 
         result = asyncio.run(_run())
@@ -2776,56 +2526,7 @@ class TestRerun:
         conn.close()
 
 
-# ===========================================================================
-# Spec source embedding and reconstruction
-# ===========================================================================
-
-
-class TestSpecSourceEmbedding:
-    """Tests for spec source storage and load_spec_from_source."""
-
-    def test_load_spec_from_source_roundtrip(self, tmp_path):
-        """Spec loaded from source produces equivalent tasks."""
-        from src.spec import load_spec_from_module, load_spec_from_source
-
-        module_path = _write_spec_module(
-            tmp_path,
-            'INPUTS = {"data": [{"x": 1}]}\n'
-            'TASKS = [{"name": "t1", "prompt": "do it", '
-            '"inputs": ["data"], "outputs": ["out"]}]\n',
-        )
-
-        original = load_spec_from_module(module_path)
-        reconstructed = load_spec_from_source(original["spec_source"])
-
-        assert len(reconstructed["tasks"]) == 1
-        assert reconstructed["tasks"][0].name == "t1"
-        assert reconstructed["tasks"][0].prompt == "do it"
-
-    def test_load_spec_from_source_preserves_prompts(self, tmp_path):
-        """Prompts are preserved through source roundtrip."""
-        from src.spec import load_spec_from_source
-
-        source = (
-            'INPUTS = {"data": [{"x": 1}]}\n'
-            'TASKS = [{"name": "t1", "prompt": "original prompt", '
-            '"inputs": ["data"], "outputs": ["out"]}]\n'
-        )
-        result = load_spec_from_source(source)
-
-        assert result["tasks"][0].prompt == "original prompt"
-
-    def test_spec_source_in_load_spec(self, tmp_path):
-        """load_spec includes spec_source in return value."""
-        from src.spec import load_spec_from_module
-
-        content = 'INPUTS = {"t": []}\nTASKS = [{"name": "t", "prompt": "p", "inputs": ["t"], "outputs": ["o"]}]\n'
-        module_path = _write_spec_module(tmp_path, content)
-
-        result = load_spec_from_module(module_path)
-        assert result["spec_source"] == content
-
-
+# Spec source embedding removed.
 # ===========================================================================
 # End-to-end rerun workflow
 # ===========================================================================
@@ -2979,17 +2680,11 @@ EXPORTS = {"report.csv": export_report}
             JOIN targets t ON s.region = t.region
         """)
 
-        # Persist metadata (as workspace.run would)
-        fp = _build_workspace_fingerprint(
-            spec["inputs"], spec["tasks"], spec["input_columns"]
-        )
         persist_workspace_meta(
             conn,
-            fp,
             model="test-model",
             tasks=spec["tasks"],
             input_row_counts={"sales": 3, "targets": 2},
-            spec_source=spec["spec_source"],
             spec_module=spec_module,
         )
 
@@ -2999,17 +2694,13 @@ EXPORTS = {"report.csv": export_report}
     # -- tests --
 
     def test_jan_db_is_self_contained(self, tmp_path):
-        """jan.db stores spec source, prompts, and fingerprint."""
+        """jan.db stores prompts and spec module reference."""
         db_path, spec_module = self._simulate_jan_run(tmp_path)
 
         conn = duckdb.connect(str(db_path), read_only=True)
         meta = read_workspace_meta(conn)
 
         spec = json.loads(meta["spec"])
-
-        # Spec source is the full Python file
-        assert "def load_sales" in spec["source"]
-        assert "EXPORTS" in spec["source"]
         assert spec["module"] == spec_module
 
         # Prompts stored per task
@@ -3017,12 +2708,6 @@ EXPORTS = {"report.csv": export_report}
         assert "summarize" in prompts
         assert "compare" in prompts
         assert "Summarize sales by region" in prompts["summarize"]
-
-        # Fingerprint has structural info
-        fp = json.loads(meta["structural_fingerprint"])
-        assert "sales" in fp["inputs"]
-        assert "targets" in fp["inputs"]
-        assert len(fp["tasks"]) == 2
 
         # Data is present
         sales = conn.execute("SELECT COUNT(*) FROM sales").fetchone()
@@ -3038,90 +2723,7 @@ EXPORTS = {"report.csv": export_report}
 
         conn.close()
 
-    def test_extract_spec_roundtrip(self, tmp_path):
-        """Extracted spec can be loaded and produces equivalent structure."""
-        from src.spec import load_spec_from_source
-
-        db_path, _ = self._simulate_jan_run(tmp_path)
-
-        # Extract spec
-        conn = duckdb.connect(str(db_path), read_only=True)
-        meta = read_workspace_meta(conn)
-        conn.close()
-
-        spec_meta = json.loads(meta["spec"])
-
-        # Load extracted spec
-        spec = load_spec_from_source(spec_meta["source"])
-        assert len(spec["tasks"]) == 2
-        assert spec["tasks"][0].name == "summarize"
-        assert spec["input_columns"]["sales"] == ["id", "month", "amount", "region"]
-        assert callable(spec["inputs"]["sales"])
-
-        # Input callable works
-        data = spec["inputs"]["sales"]()
-        assert len(data) == 3
-        assert data[0]["month"] == "jan"
-
-    def test_spec_free_rerun(self, tmp_path):
-        """Rerun from embedded spec_source re-ingests and validates."""
-        from src.spec import load_spec_from_source
-
-        db_path, _ = self._simulate_jan_run(tmp_path)
-        output_path = tmp_path / "jan_v2.db"
-
-        # Reconstruct spec from db (as CLI rerun does)
-        conn = duckdb.connect(str(db_path), read_only=True)
-        meta = read_workspace_meta(conn)
-        conn.close()
-
-        spec_meta = json.loads(meta["spec"])
-
-        spec = load_spec_from_source(spec_meta["source"])
-
-        ws = Workspace(
-            db_path=str(output_path),
-            inputs=spec["inputs"],
-            tasks=spec["tasks"],
-            exports=spec["exports"],
-            input_columns=spec["input_columns"],
-            input_validate_sql=spec["input_validate_sql"],
-            spec_source=spec["spec_source"],
-        )
-
-        async def _run():
-            from src.api import OpenRouterClient
-
-            async with OpenRouterClient() as client:
-                return await ws.rerun(
-                    source_db=db_path,
-                    client=client,
-                    mode="validate",
-                )
-
-        result = asyncio.run(_run())
-        assert result.success is True
-
-        # Both tasks should be skipped (same data, views still valid)
-        for task_name in ("summarize", "compare"):
-            tr = result.task_results[task_name]
-            assert tr.iterations == 0, f"Expected {task_name} to be skipped"
-
-        # Results should be identical to jan
-        conn = duckdb.connect(str(output_path), read_only=True)
-        rows = conn.execute("SELECT * FROM comparison ORDER BY region").fetchall()
-        assert rows[0] == ("east", 250, 200, 50)
-        assert rows[1] == ("west", 200, 250, -50)
-
-        # Metadata chain
-        meta2 = read_workspace_meta(conn)
-        run2 = json.loads(meta2["run"])
-        assert run2["source_db"] == str(db_path)
-        assert run2["rerun_mode"] == "validate"
-        assert "spec" in meta2
-        conn.close()
-
-    def test_jan_to_feb_with_spec_override(self, tmp_path):
+    def test_jan_to_feb_with_spec_override(self, tmp_path, monkeypatch):
         """Full month-to-month workflow: jan.db + feb_spec -> feb.db.
 
         Feb spec has different data (4 rows vs 3) and tweaked prompts.
@@ -3143,8 +2745,25 @@ EXPORTS = {"report.csv": export_report}
             exports=feb_spec["exports"],
             input_columns=feb_spec["input_columns"],
             input_validate_sql=feb_spec["input_validate_sql"],
-            spec_source=feb_spec["spec_source"],
+            spec_module=feb_module,
         )
+
+        async def _dummy_run_task_agent(**kwargs):
+            return AgentResult(
+                success=True,
+                final_message="dummy",
+                iterations=1,
+                messages=[],
+                usage={
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+                tool_calls_count=0,
+            )
+
+        monkeypatch.setattr("src.workspace.run_task_agent", _dummy_run_task_agent)
 
         async def _run():
             from src.api import OpenRouterClient
@@ -3153,18 +2772,11 @@ EXPORTS = {"report.csv": export_report}
                 return await ws.rerun(
                     source_db=db_path,
                     client=client,
-                    mode="validate",
+                    reingest=True,
                 )
 
         result = asyncio.run(_run())
         assert result.success is True
-
-        # Both tasks should STILL be skipped — views auto-update via
-        # late-binding (DuckDB views reference tables, not snapshots),
-        # and the output_columns validation passes
-        for task_name in ("summarize", "compare"):
-            tr = result.task_results[task_name]
-            assert tr.iterations == 0, f"Expected {task_name} to be skipped"
 
         # Verify Feb data propagated through the views
         conn = duckdb.connect(str(output_path), read_only=True)
@@ -3187,63 +2799,18 @@ EXPORTS = {"report.csv": export_report}
         meta = read_workspace_meta(conn)
         run = json.loads(meta["run"])
         assert run["source_db"] == str(db_path)
-        assert run["rerun_mode"] == "validate"
         # Feb prompts stored (not Jan's)
         prompts = json.loads(meta["task_prompts"])
         assert "Include row count" in prompts["summarize"]
         assert "pct_of_target" in prompts["compare"]
-        # Spec source is Feb's
         spec_meta = json.loads(meta["spec"])
-        assert "def load_sales" in spec_meta["source"]
-        assert '"feb"' in spec_meta["source"]
+        assert "module" in spec_meta
 
         conn.close()
 
-    def test_skip_ingest_preserves_jan_data(self, tmp_path):
-        """--skip-ingest uses Jan data even when Feb spec is loaded."""
-        from src.spec import load_spec_from_module
-
-        db_path, _ = self._simulate_jan_run(tmp_path)
-
-        feb_module = _write_spec_module(tmp_path, self.FEB_SPEC)
-        feb_spec = load_spec_from_module(feb_module)
-
-        output_path = tmp_path / "feb_skip.db"
-        ws = Workspace(
-            db_path=str(output_path),
-            inputs=feb_spec["inputs"],
-            tasks=feb_spec["tasks"],
-            spec_source=feb_spec["spec_source"],
-        )
-
-        async def _run():
-            from src.api import OpenRouterClient
-
-            async with OpenRouterClient() as client:
-                return await ws.rerun(
-                    source_db=db_path,
-                    client=client,
-                    mode="validate",
-                    skip_ingest=True,
-                )
-
-        result = asyncio.run(_run())
-        assert result.success is True
-
-        # Data should be Jan's (3 rows), not Feb's (4 rows)
-        conn = duckdb.connect(str(output_path), read_only=True)
-        sales_count = conn.execute("SELECT COUNT(*) FROM sales").fetchone()
-        assert sales_count[0] == 3  # type: ignore[index]
-
-        # Results should be Jan's calculations
-        rows = conn.execute("SELECT * FROM comparison ORDER BY region").fetchall()
-        assert rows[0] == ("east", 250, 200, 50)
-        assert rows[1] == ("west", 200, 250, -50)
-        conn.close()
-
-    def test_rerun_chain_preserves_metadata_lineage(self, tmp_path):
+    def test_rerun_chain_preserves_metadata_lineage(self, tmp_path, monkeypatch):
         """Chained reruns: jan -> feb -> mar preserve source_db chain."""
-        from src.spec import load_spec_from_source
+        from src.spec import load_spec_from_module
 
         jan_path, _ = self._simulate_jan_run(tmp_path)
 
@@ -3254,14 +2821,31 @@ EXPORTS = {"report.csv": export_report}
         conn.close()
 
         spec_meta = json.loads(meta["spec"])
-        spec = load_spec_from_source(spec_meta["source"])
+        spec = load_spec_from_module(spec_meta["module"])
 
         ws = Workspace(
             db_path=str(feb_path),
             inputs=spec["inputs"],
             tasks=spec["tasks"],
-            spec_source=spec["spec_source"],
+            spec_module=spec_meta["module"],
         )
+
+        async def _dummy_run_task_agent(**kwargs):
+            return AgentResult(
+                success=True,
+                final_message="dummy",
+                iterations=1,
+                messages=[],
+                usage={
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+                tool_calls_count=0,
+            )
+
+        monkeypatch.setattr("src.workspace.run_task_agent", _dummy_run_task_agent)
 
         async def _run_feb():
             from src.api import OpenRouterClient
@@ -3270,7 +2854,6 @@ EXPORTS = {"report.csv": export_report}
                 return await ws.rerun(
                     source_db=jan_path,
                     client=client,
-                    mode="validate",
                 )
 
         asyncio.run(_run_feb())
@@ -3282,13 +2865,13 @@ EXPORTS = {"report.csv": export_report}
         conn.close()
 
         spec_meta_feb = json.loads(meta_feb["spec"])
-        spec_feb = load_spec_from_source(spec_meta_feb["source"])
+        spec_feb = load_spec_from_module(spec_meta_feb["module"])
 
         ws2 = Workspace(
             db_path=str(mar_path),
             inputs=spec_feb["inputs"],
             tasks=spec_feb["tasks"],
-            spec_source=spec_feb["spec_source"],
+            spec_module=spec_meta_feb["module"],
         )
 
         async def _run_mar():
@@ -3298,7 +2881,6 @@ EXPORTS = {"report.csv": export_report}
                 return await ws2.rerun(
                     source_db=feb_path,
                     client=client,
-                    mode="validate",
                 )
 
         asyncio.run(_run_mar())
@@ -3316,42 +2898,7 @@ EXPORTS = {"report.csv": export_report}
         assert mar_run["source_db"] == str(feb_path)
         conn.close()
 
-    def test_incompatible_spec_override_rejected(self, tmp_path):
-        """Rerun with structurally incompatible spec raises ValueError."""
-        from src.spec import load_spec_from_module
-
-        db_path, _ = self._simulate_jan_run(tmp_path)
-
-        # Different structure: extra input, different task
-        bad_spec_module = _write_spec_module(
-            tmp_path,
-            'INPUTS = {"sales": [{"id": 1}], "extra_table": [{"z": 1}]}\n'
-            'TASKS = [{"name": "different_task", "prompt": "nope", '
-            '"inputs": ["sales", "extra_table"], "outputs": ["result"]}]\n',
-        )
-        bad_spec = load_spec_from_module(bad_spec_module)
-
-        output_path = tmp_path / "bad.db"
-        ws = Workspace(
-            db_path=str(output_path),
-            inputs=bad_spec["inputs"],
-            tasks=bad_spec["tasks"],
-            spec_source=bad_spec["spec_source"],
-        )
-
-        async def _run():
-            from src.api import OpenRouterClient
-
-            async with OpenRouterClient() as client:
-                return await ws.rerun(
-                    source_db=db_path,
-                    client=client,
-                )
-
-        with pytest.raises(ValueError, match="not compatible"):
-            asyncio.run(_run())
-
-    def test_export_runs_after_rerun(self, tmp_path):
+    def test_export_runs_after_rerun(self, tmp_path, monkeypatch):
         """Exports from the spec execute correctly after rerun."""
         from src.spec import load_spec_from_module
 
@@ -3368,8 +2915,24 @@ EXPORTS = {"report.csv": export_report}
             exports=feb_spec["exports"],
             input_columns=feb_spec["input_columns"],
             input_validate_sql=feb_spec["input_validate_sql"],
-            spec_source=feb_spec["spec_source"],
         )
+
+        async def _dummy_run_task_agent(**kwargs):
+            return AgentResult(
+                success=True,
+                final_message="dummy",
+                iterations=1,
+                messages=[],
+                usage={
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+                tool_calls_count=0,
+            )
+
+        monkeypatch.setattr("src.workspace.run_task_agent", _dummy_run_task_agent)
 
         async def _run():
             from src.api import OpenRouterClient
@@ -3378,7 +2941,7 @@ EXPORTS = {"report.csv": export_report}
                 return await ws.rerun(
                     source_db=db_path,
                     client=client,
-                    mode="validate",
+                    reingest=True,
                 )
 
         result = asyncio.run(_run())
@@ -3405,7 +2968,7 @@ EXPORTS = {"report.csv": export_report}
         assert int(west["total"]) == 150
         assert int(west["gap"]) == -100
 
-    def test_prompt_evolution_across_reruns(self, tmp_path):
+    def test_prompt_evolution_across_reruns(self, tmp_path, monkeypatch):
         """Prompts can evolve between reruns while keeping same structure."""
         from src.spec import load_spec_from_module
 
@@ -3427,8 +2990,24 @@ EXPORTS = {"report.csv": export_report}
             db_path=str(output_path),
             inputs=feb_spec["inputs"],
             tasks=feb_spec["tasks"],
-            spec_source=feb_spec["spec_source"],
         )
+
+        async def _dummy_run_task_agent(**kwargs):
+            return AgentResult(
+                success=True,
+                final_message="dummy",
+                iterations=1,
+                messages=[],
+                usage={
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+                tool_calls_count=0,
+            )
+
+        monkeypatch.setattr("src.workspace.run_task_agent", _dummy_run_task_agent)
 
         async def _run():
             from src.api import OpenRouterClient
@@ -3437,7 +3016,7 @@ EXPORTS = {"report.csv": export_report}
                 return await ws.rerun(
                     source_db=db_path,
                     client=client,
-                    mode="validate",
+                    reingest=True,
                 )
 
         asyncio.run(_run())
