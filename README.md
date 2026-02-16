@@ -30,8 +30,8 @@ uv sync
 # Scaffold a default spec at specs/main.py (module: specs.main)
 uv run taskgraph init
 
-# Run it
-uv run taskgraph run -o output.db
+# Run it (output name is auto-generated if -o is omitted)
+uv run taskgraph run
 
 # Inspect results
 duckdb output.db "SELECT * FROM duckdb_views() WHERE internal = false"
@@ -40,7 +40,7 @@ duckdb output.db "SELECT * FROM duckdb_views() WHERE internal = false"
 If you already have a spec module in your package:
 
 ```bash
-uv run taskgraph run --spec my_app.specs.main -o output.db
+uv run taskgraph run --spec my_app.specs.main
 ```
 
 ## Spec Discovery

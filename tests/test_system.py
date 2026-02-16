@@ -3030,3 +3030,14 @@ EXPORTS = {"report.csv": export_report}
         assert "pct_of_target" in feb_prompts["compare"]
         # And they're different from Jan
         assert feb_prompts["summarize"] != jan_prompts["summarize"]
+
+
+def test_default_output_db_path_is_stable():
+    from datetime import datetime, timezone
+
+    from scripts.cli import _default_output_db_path
+
+    p = _default_output_db_path(
+        "my_app.specs.main", now=datetime(2026, 2, 16, 12, 34, 56, tzinfo=timezone.utc)
+    )
+    assert str(p) == "runs/my_app-specs-main_20260216_123456.db"

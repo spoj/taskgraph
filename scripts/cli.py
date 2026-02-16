@@ -4,13 +4,13 @@ Usage:
     taskgraph init
 
     # Run the default spec (pyproject [tool.taskgraph].spec, else specs.main)
-    taskgraph run -o output.db
+    taskgraph run
 
     # Run an explicit spec module
-    taskgraph run --spec my_app.specs.main -o output.db
+    taskgraph run --spec my_app.specs.main
 
     # Start from a previous .db file
-    taskgraph run --spec my_app.specs.main --from-db previous.db -o output.db
+    taskgraph run --spec my_app.specs.main --from-db previous.db
 """
 
 import asyncio
@@ -22,6 +22,7 @@ import sys
 import click
 import tomllib
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any
 from dotenv import load_dotenv, find_dotenv
 
@@ -105,6 +106,27 @@ def _default_spec_module() -> str:
     )
 
 
+def _slug_for_filename(text: str) -> str:
+    """Convert an arbitrary string to a safe filename slug."""
+    out: list[str] = []
+    for ch in text:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            out.append(ch)
+        else:
+            out.append("_")
+    slug = "".join(out).strip("._-")
+    return slug or "spec"
+
+
+def _default_output_db_path(spec_module: str, now: datetime | None = None) -> Path:
+    """Generate a default output .db path from spec + timestamp."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    spec_slug = _slug_for_filename(spec_module.replace(".", "-"))
+    return Path("runs") / f"{spec_slug}_{ts}.db"
+
+
 @main.command()
 @click.option(
     "--force",
@@ -181,7 +203,7 @@ __pycache__/
     click.echo("Default spec module (implicit): specs.main")
     click.echo("Next:")
     click.echo("  uv sync")
-    click.echo("  taskgraph run -o output.db")
+    click.echo("  taskgraph run")
 
 
 @main.command()
@@ -201,8 +223,9 @@ __pycache__/
     "--output",
     "-o",
     type=click.Path(path_type=Path),
-    required=True,
-    help="Output database path",
+    required=False,
+    default=None,
+    help="Output database path (default: runs/<spec>_<timestamp>.db)",
 )
 @click.option(
     "--model",
@@ -237,7 +260,7 @@ __pycache__/
 def run(
     spec: str | None,
     from_db: Path | None,
-    output: Path,
+    output: Path | None,
     model: str,
     max_iterations: int,
     reingest: bool,
@@ -256,6 +279,14 @@ def run(
 
     if spec is None:
         spec = _default_spec_module()
+
+    if output is None:
+        output = _default_output_db_path(spec)
+        output.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        output = Path(output)
+        if output.suffix != ".db":
+            output = output.with_suffix(".db")
 
     # Resolve and validate spec module
     try:

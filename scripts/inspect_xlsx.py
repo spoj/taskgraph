@@ -17,8 +17,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import openpyxl
-from openpyxl.utils import column_index_from_string, get_column_letter
+try:
+    import openpyxl
+    from openpyxl.utils import column_index_from_string, get_column_letter
+except ModuleNotFoundError as e:
+    raise SystemExit(
+        "openpyxl is required for inspect_xlsx.py. Install it with: uv add openpyxl"
+    ) from e
 
 
 def _col(s: str) -> int:

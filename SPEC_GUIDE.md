@@ -46,7 +46,7 @@ spec = "my_app.specs.main"
 4) Run a workspace:
 
 ```bash
-uv run taskgraph run -o output.db
+uv run taskgraph run
 ```
 
 5) Ensure your LLM credential is set:
@@ -71,7 +71,7 @@ pyproject.toml
 Run with:
 
 ```bash
-uv run taskgraph run --spec my_app.specs.main -o output.db
+uv run taskgraph run --spec my_app.specs.main
 ```
 
 2) In a repo-local `specs/` directory (what `taskgraph init` scaffolds)
@@ -85,7 +85,7 @@ pyproject.toml
 Run with:
 
 ```bash
-uv run taskgraph run -o output.db
+uv run taskgraph run
 ```
 
 ## Spec Discovery
@@ -137,7 +137,7 @@ TASKS = [
 Run it:
 
 ```bash
-uv run taskgraph run --spec my_app.specs.main -o output.db
+uv run taskgraph run --spec my_app.specs.main
 ```
 
 ---
@@ -698,7 +698,7 @@ taskgraph run -o OUTPUT_DB [options]
 
 | Flag | Description |
 |------|-------------|
-| `-o, --output PATH` | Output `.db` file path (required) |
+| `-o, --output PATH` | Output `.db` file path (optional; default: `runs/<spec>_<timestamp>.db`) |
 | `-s, --spec MODULE` | Spec module path (default: `[tool.taskgraph].spec` from `pyproject.toml`; if unset: `specs.main` when present) |
 | `--from-db PATH` | Start from an existing workspace `.db` |
 | `--reingest` | Re-run input callables for fresh data when using `--from-db` |
