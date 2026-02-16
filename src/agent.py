@@ -45,92 +45,47 @@ MAX_RESULT_CHARS = 30_000
 
 # --- System prompt ---
 
-SYSTEM_PROMPT = """You are a SQL repair agent working on a failed task within a shared DuckDB workspace.
-Your job is to fix the SQL by creating or replacing the required output views/macros.
+SYSTEM_PROMPT = """You are a SQL repair agent. A task's SQL failed and you must fix it.
+You work in a DuckDB database. You can read anything, but can only write views and macros
+within the task's namespace (specified per task).
 
-DuckDB SQL dialect notes:
-- Quoting: double-quote identifiers ("col"), not backticks. Many keywords are
-  reserved (left, right, match, group, order, etc.) — always use AS for column
-  aliases and quote identifiers that collide with keywords.
-- Types: VARCHAR (not TEXT), DOUBLE (not REAL), BOOLEAN (not INTEGER 0/1)
-- TRY_CAST(expr AS type) — returns NULL on cast failure instead of error.
-  TRY(expr) — wraps any expression, returns NULL on error. Prefer these for
-  dirty data over CAST() which aborts the query.
-- QUALIFY clause: filter window function results directly, e.g.
-    SELECT * FROM t QUALIFY row_number() OVER (PARTITION BY x ORDER BY y) = 1
-- GROUP BY ALL — auto-groups by all non-aggregate columns. Prefer this over
-  listing columns explicitly to avoid errors.
-- UNION BY NAME — union tables by column name, not position. Safer than UNION ALL
-  when column order may differ.
-- SUMMARIZE table_name — instant data profiling: min, max, null count, unique
-  count, avg for every column. Use this to explore tables before writing logic.
-- List / array: [1,2,3], list_value(), list_agg(), unnest(), list_sort(),
-  list_distinct(), list_filter(lst, x -> cond), list_transform(lst, x -> expr)
-  List comprehensions: [x * 2 FOR x IN my_list IF x > 0]
-- Fuzzy matching: jaro_winkler_similarity(), levenshtein(), jaccard(),
-  damerau_levenshtein() — use these for approximate string matching on names,
-  references, descriptions.
-- SELECT * EXCLUDE (col), SELECT * REPLACE (expr AS col)
-- arg_min(val, ordering), arg_max(val, ordering) — value at min/max of another
-- count(*) FILTER (WHERE cond) — filtered aggregates
-- greatest(), least() — row-level min/max across columns
-- ASOF JOIN — nearest-match on ordered column (e.g. date lookups)
-- Catalog introspection:
-  SELECT view_name, sql FROM duckdb_views() WHERE internal = false — list views and their SQL
-  SELECT table_name FROM duckdb_tables() — list tables
-  SELECT function_name, macro_definition FROM duckdb_functions() WHERE function_type = 'macro' — list macros
-
-SQL CONSTRAINTS:
-- Only SELECT, SUMMARIZE, CREATE/DROP VIEW, CREATE/DROP MACRO allowed (no tables, no inserts)
-- You can SELECT from any table or view in the database
-- You can only CREATE/DROP views and macros with the allowed names listed below
-- CREATE MACRO name(args) AS expr — reusable scalar SQL expression
-- CREATE MACRO name(args) AS TABLE (SELECT ...) — reusable table-producing function
-  Use macros for repeated patterns (e.g. normalization, scoring). They persist in the
-  database and can be called from views. Same namespace rules as views.
-
-REPAIR GUIDANCE:
-- You will be given the original SQL and the failure details.
-- Fix outputs using CREATE OR REPLACE VIEW/MACRO; do not create tables.
-
-EFFICIENCY - BATCH YOUR TOOL CALLS:
-- ALWAYS call run_sql multiple times in parallel when queries are independent
-- Exploration: run multiple SELECTs together
-- Minimize total rounds of interaction. Prefer fewer, larger batches.
-
-VIEWS ARE LATE-BINDING:
-  DuckDB views store SQL text, not data. CREATE OR REPLACE VIEW on any view
-  automatically propagates to everything that depends on it. This means you
-  can build a chain of views (e.g. v1 → v2 → output) and later tweak v1
-  without touching v2 or output — they pick up the change instantly.
-  Use DROP VIEW only to permanently remove a view you no longer need.
-
-  Tip: this makes it cheap to scaffold your output early, wire up diagnostic
-  views on top (e.g. output → diag_counts, diag_mismatches), and then
-  iterate on the upstream logic while monitoring the diagnostics.
+CONSTRAINTS:
+- Allowed statements: SELECT, SUMMARIZE, CREATE/DROP VIEW, CREATE/DROP MACRO
+- No tables, no inserts, no updates, no deletes
+- Use CREATE OR REPLACE VIEW to fix outputs
+- CREATE MACRO name(args) AS expr — reusable scalar expression
+- CREATE MACRO name(args) AS TABLE (SELECT ...) — reusable table function
+- Batch independent run_sql calls in parallel to minimize rounds
 
 VALIDATION:
-- Validation runs AUTOMATICALLY when you stop (no tool calls in your response).
-- If validation fails, you will receive the specific error and can fix it.
+- Runs automatically when you stop (no tool calls in your response).
+- If validation fails, you receive the error and can keep fixing.
+- Some tasks require validation views (named '{task}__validation' or '{task}__validation_*').
+  These must have columns: status VARCHAR ('pass'|'warn'|'fail'), message VARCHAR.
+  Any 'fail' row fails the task. No fail rows = pass.
 
-VALIDATION VIEWS (IMPORTANT):
-- Some tasks require creating one or more validation views as part of REQUIRED OUTPUTS.
-- Validation view naming convention:
-  - '{task}__validation' and '{task}__validation_*'
-- Validation view schema contract (minimum):
-  - status: VARCHAR — one of 'pass', 'warn', 'fail' (case-insensitive)
-  - message: VARCHAR — short human-readable explanation
-- Harness enforcement:
-  - If any row in any validation view has status='fail', the task fails.
-  - If there are no fail rows, the task passes.
-  - 'warn' rows are allowed and do not fail the task by default.
-- Tip: Prefer emitting one row per issue with status='fail'. If there are no issues,
-  emit a single 'pass' row with message='ok'.
+CATALOG INTROSPECTION:
+  SELECT view_name, sql FROM duckdb_views() WHERE internal = false
+  SELECT table_name FROM duckdb_tables()
+  SELECT function_name, macro_definition FROM duckdb_functions() WHERE function_type = 'macro'
 
-WORKFLOW:
-  1. Discover available tables via SQL
-  2. Create your required output view(s) using intermediate views as needed
-  3. Stop and report when done (validation runs automatically)
+DUCKDB DIALECT REFERENCE:
+- Identifiers: double-quote ("col"), not backticks. Quote reserved words
+  (left, right, match, group, order, etc.). Always use AS for column aliases.
+- Types: VARCHAR (not TEXT), DOUBLE (not REAL), BOOLEAN (not INTEGER 0/1)
+- TRY_CAST(expr AS type) returns NULL on failure. TRY(expr) wraps any expression.
+- QUALIFY — filter window results: SELECT * FROM t QUALIFY row_number() OVER (...) = 1
+- GROUP BY ALL — auto-groups by all non-aggregate columns
+- UNION BY NAME — union by column name, not position
+- SUMMARIZE table_name — instant profiling: min, max, nulls, uniques, avg per column
+- Lists: [1,2,3], list_agg(), unnest(), list_filter(lst, x -> cond),
+  list_transform(lst, x -> expr), [x * 2 FOR x IN list IF x > 0]
+- Fuzzy matching: jaro_winkler_similarity(), levenshtein(), jaccard()
+- SELECT * EXCLUDE (col), SELECT * REPLACE (expr AS col)
+- arg_min(val, ordering), arg_max(val, ordering)
+- count(*) FILTER (WHERE cond), greatest(), least()
+- ASOF JOIN — nearest-match on ordered column
+- Views are late-binding (store SQL text, not data). CREATE OR REPLACE propagates instantly.
 """
 
 
@@ -559,44 +514,30 @@ def build_sql_repair_prompt(task: Task, issue: str) -> str:
     val_outputs = validation_outputs(task)
     validation_lines: list[str] = []
     if val_outputs:
-        validation_lines.append("VALIDATION VIEWS:")
-        validation_lines.append(
-            "Outputs matching '{task}__validation' or '{task}__validation_*' are enforced. "
-            "They must have columns: status, message (status in pass|warn|fail)."
-        )
+        validation_lines.append("VALIDATION VIEWS (must create):")
         for v in val_outputs:
-            validation_lines.append(f"- {v}")
+            validation_lines.append(f"  - {v}")
         validation_lines.append("")
-
-    view_naming_lines = [
-        "VIEW NAMING:",
-        f"- For intermediate work, use prefix '{task.name}_' (e.g. {task.name}_step1)",
-        f"- You may only CREATE/DROP views named: {', '.join(task.outputs)} or {task.name}_*",
-        "",
-    ]
 
     parts = [
         f"TASK: {task.name}",
-        "You will help repair a failed SQL task.",
-        "Fix the SQL and repair the views.",
         "",
         "ISSUE:",
         issue_text or "(no issue details)",
         "",
-        "REQUIRED OUTPUTS (with required columns if specified):",
+        "REQUIRED OUTPUTS:",
         *required_outputs,
         "",
         "REPAIR CONTEXT:",
         task.repair_context or "(no repair context provided)",
         "",
-        "ORIGINAL SQL (before repair):",
+        "ORIGINAL SQL:",
         "```sql",
         sql_block or "-- (no statements provided)",
         "```",
         "",
         *validation_lines,
-        *view_naming_lines,
-        "Use SQL on duckdb_tables and duckdb_views to discover tables and views.",
+        f"ALLOWED VIEWS: {', '.join(task.outputs)} or {task.name}_*",
     ]
     return "\n".join(parts)
 
@@ -614,7 +555,7 @@ def _summarize_validation_issue(issue: str) -> str:
         targets = ", ".join(f"`{v}`" for v in ordered)
         return f"Validation warnings in {targets}; refer to view for details."
 
-    error_views = re.findall(r"Validation failed via '([^']+)'", issue_text)
+    error_views = re.findall(r"Fail rows in '([^']+)'", issue_text)
     if error_views:
         seen: set[str] = set()
         ordered = [v for v in error_views if not (v in seen or seen.add(v))]

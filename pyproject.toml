@@ -31,7 +31,7 @@ packages = ["src", "scripts"]
 
 [tool.pyright]
 include = ["src", "scripts"]
-exclude = ["**/__pycache__", "results", "sample", "web", "tests"]
+exclude = ["**/__pycache__", "tests"]
 
 # Reasonably tight defaults without forcing full strict-mode typing.
 typeCheckingMode = "standard"

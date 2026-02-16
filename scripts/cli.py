@@ -8,9 +8,6 @@ Usage:
 
     # Run an explicit spec module
     taskgraph run --spec my_app.specs.main
-
-    # Start a fresh run
-    taskgraph run --spec my_app.specs.main
 """
 
 import asyncio

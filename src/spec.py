@@ -1,4 +1,4 @@
-"""Workspace spec loader — shared between CLI and web interface.
+"""Workspace spec loader.
 
 A spec is a Python module defining INPUTS, TASKS, and optional EXPORTS.
 

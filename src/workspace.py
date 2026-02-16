@@ -4,11 +4,6 @@ A workspace is a single DuckDB database containing:
 - Ingested input tables (from user-provided functions or data)
 - Per-task output views (created by agents)
 - Metadata and trace tables
- - Optional spec source (for audit)
-
-  The .db file stores repair contexts and all data.
-  Spec source may be stored for audit, using the spec module reference
-  captured in workspace metadata.
 
 Tasks are scheduled greedily: each task starts as soon as all its
 dependencies complete (not layer-by-layer). A failed task only blocks
@@ -23,10 +18,6 @@ Usage:
         exports={"report.xlsx": write_report},
     )
 
-    # Fresh run from spec
-    results = await workspace.run(client, model="openai/gpt-5.2")
-
-    # Fresh run from spec
     results = await workspace.run(client, model="openai/gpt-5.2")
 """
 

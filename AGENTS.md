@@ -54,14 +54,12 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 
 ## Key Design Decisions
 
-- **Workspace = single .db** — all data, views, metadata, trace in one file (DuckDB format)
- - **Workspace .db** — inputs + views + metadata in one DuckDB file.
+- **Workspace = single .db** — all data, views, metadata, trace in one file (DuckDB format).
 - **Agents only write SQL views and macros** — no tables, no inserts. Views auditable via `duckdb_views() WHERE internal = false`.
 - **Namespace enforcement** — DuckDB `extract_statements` for statement type classification + regex for name extraction; each task can only CREATE/DROP views and macros with its declared outputs or `{name}_*` prefixed names
 - **DAG is static** — declared upfront, deps resolved from output->input edges. Each task starts as soon as all its dependencies complete (greedy scheduling, not layer-by-layer). Layers still computed for display via `resolve_dag()`.
 - **Failure isolation** — a failed task only blocks its downstream dependents, not the entire layer. Unrelated branches continue.
 - **Result size cap** — SELECT results exceeding 30k chars (~20k tokens) are rejected with an error nudging the agent to use LIMIT. Configurable via `max_result_chars` on `execute_sql()`.
-- (removed) Workspace fingerprint / compatibility gating.
 - **SQL trace** in _trace table with task column for per-task filtering
 - **Per-task metadata** in _task_meta table (composite PK: task + key)
 - **Display**: `.` per SQL tool call, newline per tool round
@@ -85,7 +83,6 @@ Shorthand commands via [just](https://github.com/casey/just). All `recon` comman
 |---------|-----------|
 | `just run <args>` | `uv run taskgraph run <args>` |
 | `just show <args>` | `uv run taskgraph show <args>` |
-| `just extract-spec <args>` | (removed) |
 | `just inspect-xlsx <file> [sheet] [range]` | `uv run python scripts/inspect_xlsx.py <file> [sheet] [range]` |
 | `just test [args]` | `uv run pytest tests/ [args]` |
 | `just test-k <pattern>` | `uv run pytest tests/ -k "<pattern>" -v` |

@@ -5,7 +5,7 @@ from .api import OpenRouterClient, create_model_callable
 from .agent import run_task_agent
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
 from .workspace import Workspace, WorkspaceResult
-from .ingest import ingest_table, coerce_to_dataframe, get_schema_info_for_tables
+from .ingest import ingest_table, coerce_to_dataframe
 
 __all__ = [
     # Agent loop
@@ -27,5 +27,4 @@ __all__ = [
     # Ingestion
     "ingest_table",
     "coerce_to_dataframe",
-    "get_schema_info_for_tables",
 ]

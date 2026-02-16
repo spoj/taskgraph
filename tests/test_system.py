@@ -26,7 +26,7 @@ from src.agent import (
     execute_sql,
     is_sql_allowed,
     init_trace_table,
-    _build_task_user_message,
+    build_sql_repair_prompt,
     _json_default,
     DEFAULT_QUERY_TIMEOUT_S,
     MAX_RESULT_CHARS,
@@ -54,7 +54,7 @@ TASKS = [
         "name": "t",
         "inputs": [],
         "outputs": ["v"],
-        "sql_strict": ["CREATE VIEW v AS SELECT 1 AS x"],
+        "sql_strict": "CREATE VIEW v AS SELECT 1 AS x",
     }
 ]
 """
@@ -1840,68 +1840,6 @@ class TestAgentLoopOnIteration:
 
 
 # ===========================================================================
-# 13. Schema Info (get_schema_info_for_tables)
-# ===========================================================================
-
-
-class TestGetSchemaInfo:
-    """Tests for get_schema_info_for_tables: schema formatting for LLM prompts."""
-
-    def test_normal_table(self, conn):
-        """Formats schema and sample data for a normal table."""
-        from src.ingest import get_schema_info_for_tables
-
-        ingest_table(
-            conn, [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}], "people"
-        )
-        info = get_schema_info_for_tables(conn, ["people"])
-
-        assert "Table: people" in info
-        assert "name" in info
-        assert "age" in info
-        assert "Row count: 2" in info
-        assert "_row_id" not in info
-
-    def test_missing_table(self, conn):
-        """Missing table shows (not found)."""
-        from src.ingest import get_schema_info_for_tables
-
-        info = get_schema_info_for_tables(conn, ["nonexistent"])
-        assert "nonexistent" in info
-        assert "(not found)" in info
-
-    def test_empty_table(self, conn):
-        """Empty table shows row count 0."""
-        from src.ingest import get_schema_info_for_tables
-
-        # Use dict-of-lists with empty lists to get a table with columns but no rows
-        ingest_table(conn, {"val": []}, "empty")
-        info = get_schema_info_for_tables(conn, ["empty"])
-        assert "Row count: 0" in info
-
-    def test_multiple_tables(self, conn):
-        """Multiple tables all appear in output."""
-        from src.ingest import get_schema_info_for_tables
-
-        ingest_table(conn, [{"x": 1}], "t1")
-        ingest_table(conn, [{"y": 2}], "t2")
-        info = get_schema_info_for_tables(conn, ["t1", "t2"])
-
-        assert "Table: t1" in info
-        assert "Table: t2" in info
-
-    def test_excludes_row_id_from_columns(self, conn):
-        """_row_id column is excluded from the displayed columns."""
-        from src.ingest import get_schema_info_for_tables
-
-        ingest_table(conn, [{"val": 42}], "t")
-        info = get_schema_info_for_tables(conn, ["t"])
-
-        assert "val" in info
-        assert "_row_id" not in info
-
-
-# ===========================================================================
 # 14. Persist Task Meta
 # ===========================================================================
 
@@ -2261,27 +2199,88 @@ class TestWorkspaceMeta:
         assert len(contexts["t"]) == 1000
 
 
-# Spec source embedding removed.
-# (Fingerprint compatibility checks removed.)
-# ===========================================================================
-# Get task views helper
-# ===========================================================================
 # ===========================================================================
 # Agent repair context
 # ===========================================================================
 
 
 class TestAgentRepairContext:
-    """Tests for _build_task_user_message with repair context."""
+    """Tests for build_sql_repair_prompt — the user message sent to the repair agent."""
 
-    def test_basic_context_no_review(self):
-        """Without review context, message has standard structure."""
-        task = _make_task(name="match", inputs=["data"], outputs=["output"])
-        msg = _build_task_user_message(task, "Table: data\n  Columns: x (INT)")
+    def test_basic_structure(self):
+        """Repair prompt has TASK, ISSUE, REQUIRED OUTPUTS, REPAIR CONTEXT, ORIGINAL SQL, ALLOWED VIEWS."""
+        task = _make_task(
+            name="match",
+            inputs=["data"],
+            outputs=["output"],
+            sql="CREATE OR REPLACE VIEW output AS SELECT * FROM data",
+        )
+        msg = build_sql_repair_prompt(task, "some error happened")
         assert "TASK: match" in msg
-        assert "REQUIRED OUTPUTS: output" in msg
-        assert "EXISTING VIEWS" not in msg
-        assert "VALIDATION FAILURES" not in msg
+        assert "ISSUE:" in msg
+        assert "some error happened" in msg
+        assert "REQUIRED OUTPUTS:" in msg
+        assert "- output" in msg
+        assert "REPAIR CONTEXT:" in msg
+        assert "ORIGINAL SQL:" in msg
+        assert "CREATE OR REPLACE VIEW output AS SELECT * FROM data" in msg
+        assert "ALLOWED VIEWS: output or match_*" in msg
+
+    def test_validation_issue_summarized(self):
+        """Validation fail rows are summarized to view references."""
+        task = _make_task(
+            name="t",
+            outputs=["t__validation"],
+            sql="CREATE OR REPLACE VIEW t__validation AS SELECT 'fail' AS status, 'bad' AS message",
+        )
+        issue = "- Fail rows in 't__validation' (1):\n  bad"
+        msg = build_sql_repair_prompt(task, issue)
+        assert "Validation errors in `t__validation`" in msg
+        assert "refer to view for details" in msg
+
+    def test_warning_issue_summarized(self):
+        """Validation warnings are summarized to view references."""
+        task = _make_task(
+            name="t",
+            outputs=["t__validation"],
+            sql="CREATE OR REPLACE VIEW t__validation AS SELECT 'warn' AS status, 'hmm' AS message",
+        )
+        issue = "Warnings:\n- Warnings via 't__validation' (1 row(s)):\n  hmm"
+        msg = build_sql_repair_prompt(task, issue)
+        assert "Validation warnings in `t__validation`" in msg
+        assert "refer to view for details" in msg
+
+    def test_non_validation_issue_passed_verbatim(self):
+        """Non-validation issues (SQL errors, etc.) are passed through verbatim."""
+        task = _make_task(
+            name="t",
+            outputs=["out"],
+            sql="CREATE OR REPLACE VIEW out AS SELECT bad_col FROM missing_table",
+        )
+        msg = build_sql_repair_prompt(task, "Table 'missing_table' does not exist")
+        assert "Table 'missing_table' does not exist" in msg
+
+    def test_output_columns_shown(self):
+        """Required columns are listed next to their output views."""
+        task = _make_task(
+            name="t",
+            outputs=["result"],
+            output_columns={"result": ["id", "score"]},
+            sql="CREATE OR REPLACE VIEW result AS SELECT 1 AS id, 0.5 AS score",
+        )
+        msg = build_sql_repair_prompt(task, "some issue")
+        assert "- result: id, score" in msg
+
+    def test_validation_views_listed(self):
+        """Validation views are listed in a separate section."""
+        task = _make_task(
+            name="t",
+            outputs=["out", "t__validation"],
+            sql="CREATE OR REPLACE VIEW out AS SELECT 1 AS x",
+        )
+        msg = build_sql_repair_prompt(task, "some issue")
+        assert "VALIDATION VIEWS (must create):" in msg
+        assert "t__validation" in msg
 
 
 def test_default_output_db_path_is_stable():

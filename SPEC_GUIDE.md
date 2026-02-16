@@ -290,10 +290,14 @@ The agent receives:
 
 1. A system prompt describing DuckDB SQL syntax, constraints, and workflow guidance.
 2. A user message containing:
-   - The task name and your repair_context text
-   - Schema info for each input table: column names with types, row count, 3 sample rows (`_row_id` excluded from display)
-   - Required output view names
+   - The task name and the issue (error message or validation failure summary)
+   - Your `repair_context` text
+   - The original SQL that failed
+   - Required output view names (with expected columns, if declared)
+   - Validation view definitions (if any)
    - Naming rules: the agent can create views/macros named either as declared outputs or prefixed with `{task_name}_` (e.g., task `match` can create `match_step1`, `match_candidates`, etc.)
+   
+   The agent discovers available tables and schemas by querying the DuckDB catalog directly (instructions are in the system prompt).
 
 ### What the agent can do
 
@@ -512,7 +516,7 @@ This produces two layers:
 
 ### Layer failure
 
-If any task in a layer fails, all downstream layers are skipped. Earlier tasks in the same layer are not affected (they run concurrently and may succeed).
+A failed task only blocks its direct downstream dependents — tasks that consume its outputs. Unrelated tasks in later layers continue to run. Tasks in the same layer are not affected (they run concurrently and may succeed).
 
 ---
 

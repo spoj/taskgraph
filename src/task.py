@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 
 _VALIDATION_VIEW_REQUIRED_COLS = ["status", "message"]
 _VALIDATION_STATUS_ALLOWED = {"pass", "warn", "fail"}
+_MAX_INLINE_MESSAGES = 20  # Cap messages shown inline in validation/warning output
 
 
 def validation_view_prefix(task_name: str) -> str:
@@ -261,12 +262,19 @@ class Task:
                 else:
                     msgs = [str(msg) for _status, msg in rows]
 
-                header = f"Warnings via '{view_name}':"
+                count = len(msgs)
+                header = f"Warnings via '{view_name}' ({count} row(s))"
                 if evidence_views:
-                    header += f" evidence_view={', '.join(sorted(evidence_views))}"
-                warnings.extend([header] + msgs)
+                    header += f" [evidence: {', '.join(sorted(evidence_views))}]"
+
+                sample = msgs[:_MAX_INLINE_MESSAGES]
+                detail = "\n".join(f"  {m}" for m in sample)
+                if count > _MAX_INLINE_MESSAGES:
+                    detail += f"\n  ... and {count - _MAX_INLINE_MESSAGES} more"
+
+                warnings.append(f"{header}:\n{detail}")
                 if remaining is not None:
-                    remaining -= len(msgs)
+                    remaining -= count
 
         return warnings
 
@@ -350,10 +358,17 @@ class Task:
             else:
                 msgs = [str(msg) for _status, msg in rows]
 
-            header = f"Validation failed via '{view_name}':"
+            count = len(msgs)
+            header = f"Fail rows in '{view_name}' ({count})"
             if evidence_views:
-                header += f" evidence_view={', '.join(sorted(evidence_views))}"
-            return ([header] + msgs, False)
+                header += f" [evidence: {', '.join(sorted(evidence_views))}]"
+
+            sample = msgs[:_MAX_INLINE_MESSAGES]
+            detail = "\n".join(f"  {m}" for m in sample)
+            if count > _MAX_INLINE_MESSAGES:
+                detail += f"\n  ... and {count - _MAX_INLINE_MESSAGES} more"
+
+            return ([f"{header}:\n{detail}"], False)
 
         return ([], False)
 
