@@ -154,6 +154,17 @@ TASKS = [
 """
         )
 
+    # Copy spec writer guide into the project root for convenience.
+    guide_dst = root / "SPEC_GUIDE.md"
+    if (not guide_dst.exists()) or force:
+        guide_src = Path(__file__).parent.parent / "SPEC_GUIDE.md"
+        try:
+            guide_dst.write_text(guide_src.read_text())
+        except OSError:
+            # If the guide isn't available (e.g., installed without source docs),
+            # silently skip.
+            pass
+
     if not gitignore_path.exists():
         gitignore_path.write_text(
             """.venv/
@@ -165,6 +176,8 @@ __pycache__/
         click.echo(".gitignore already exists; skipping.")
 
     click.echo("Initialized Taskgraph spec: specs/main.py")
+    if guide_dst.exists():
+        click.echo("Wrote spec guide: SPEC_GUIDE.md")
     click.echo("Default spec module (implicit): specs.main")
     click.echo("Next:")
     click.echo("  uv sync")

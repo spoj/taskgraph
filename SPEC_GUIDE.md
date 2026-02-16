@@ -11,6 +11,48 @@ Specs are imported as modules (e.g. `my_app.specs.main`). Taskgraph does not loa
 
 ## Recommended Layout
 
+## Project Setup (uv)
+
+If you're starting a new app repo, this is a good default setup.
+
+1) Initialize a Python project:
+
+```bash
+uv init my_app
+cd my_app
+```
+
+2) Add Taskgraph and any common spec dependencies:
+
+```bash
+uv add taskgraph
+uv add polars openpyxl
+```
+
+3) Create a spec module and point Taskgraph at it:
+
+```bash
+mkdir -p my_app/specs
+touch my_app/specs/__init__.py
+```
+
+Add this to `pyproject.toml`:
+
+```toml
+[tool.taskgraph]
+spec = "my_app.specs.main"
+```
+
+4) Run a workspace:
+
+```bash
+uv run taskgraph run -o output.db
+```
+
+5) Ensure your LLM credential is set:
+
+Taskgraph uses OpenRouter; set `OPENROUTER_API_KEY` in your environment (or in a `.env` loaded by your app).
+
 Two common patterns:
 
 1) In an application package
