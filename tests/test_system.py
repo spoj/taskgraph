@@ -1,7 +1,7 @@
 """Unit tests for Taskgraph system internals.
 
 Tests the internal machinery in isolation (no LLM calls needed):
-- Task validation: output existence, output_columns, validate_sql
+- Task validation: output existence, output_columns, validation views
 - Namespace enforcement: allowed/blocked CREATE VIEW, SELECT passthrough
 - DAG resolution: topo-sort layers, cycle detection, duplicate outputs
 - Token circuit breaker: budget exceeded stops agent
@@ -34,6 +34,7 @@ from src.agent_loop import run_agent_loop, AgentResult, DEFAULT_MAX_TOKENS
 from src.ingest import coerce_to_dataframe, ingest_table
 from src.task import Task, resolve_dag, validate_task_graph
 from src.workspace import Workspace, persist_workspace_meta, read_workspace_meta
+from src.agent import run_sql_only_task
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +76,7 @@ def _write_spec_module(tmp_path: Path, source: str) -> str:
 
 
 class TestTaskValidation:
-    """Tests for Task.validate() — output existence, output_columns, validate_sql."""
+    """Tests for Task.validate() — output existence, output_columns, validation views."""
 
     def test_missing_output_view(self, conn):
         """validate() returns error when a declared output view doesn't exist."""
@@ -158,89 +159,105 @@ class TestTaskValidation:
         assert len(errors) == 1
         assert "not created" in errors[0].lower()
 
-    def test_validate_sql_pass(self, conn):
-        """validate_sql passes when query returns zero rows."""
-        conn.execute("CREATE VIEW items AS SELECT 1 AS id, 'a' AS cat")
-        task = _make_task(
-            outputs=["items"],
-            validate_sql=["SELECT id FROM items WHERE cat IS NULL"],
+    def test_validation_view_pass(self, conn):
+        """Validation view passes when it contains no fail rows."""
+        conn.execute(
+            "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
         )
+        task = _make_task(name="t", outputs=["t__validation"])
         errors = task.validate(conn)
         assert errors == []
 
-    def test_validate_sql_fail(self, conn):
-        """validate_sql fails when query returns rows."""
+    def test_validation_view_fail(self, conn):
+        """Validation view fails when it contains any fail row."""
         conn.execute(
-            "CREATE VIEW items AS SELECT 1 AS id, NULL AS cat UNION ALL SELECT 2, 'a'"
+            "CREATE VIEW t__validation AS SELECT 'fail' AS status, 'bad' AS message"
         )
-        task = _make_task(
-            outputs=["items"],
-            validate_sql=[
-                "SELECT 'missing cat for id=' || CAST(id AS VARCHAR) FROM items WHERE cat IS NULL"
-            ],
-        )
+        task = _make_task(name="t", outputs=["t__validation"])
         errors = task.validate(conn)
-        assert len(errors) == 1
-        assert "missing cat for id=1" in errors[0]
+        assert errors
+        assert "bad" in "\n".join(errors)
 
-    def test_validate_sql_short_circuits(self, conn):
-        """validate_sql stops at first failing query."""
-        conn.execute("CREATE VIEW items AS SELECT 1 AS id")
-        task = _make_task(
-            outputs=["items"],
-            validate_sql=[
-                "SELECT 'error1' WHERE 1=1",  # returns a row -> fail
-                "SELECT 'error2' WHERE 1=1",  # should never run
-            ],
+    def test_multiple_validation_views_enforced(self, conn):
+        conn.execute(
+            "CREATE VIEW t__validation_a AS SELECT 'pass' AS status, 'ok' AS message"
         )
-        errors = task.validate(conn)
-        assert errors == ["error1"]
-
-    def test_validate_sql_error_handling(self, conn):
-        """validate_sql catches SQL errors gracefully."""
-        conn.execute("CREATE VIEW items AS SELECT 1 AS id")
-        task = _make_task(
-            outputs=["items"],
-            validate_sql=["SELECT * FROM nonexistent_table"],
+        conn.execute(
+            "CREATE VIEW t__validation_b AS SELECT 'fail' AS status, 'nope' AS message"
         )
+        task = _make_task(name="t", outputs=["t__validation_a", "t__validation_b"])
         errors = task.validate(conn)
-        assert len(errors) == 1
-        assert "error" in errors[0].lower()
+        assert errors
+        # Should mention the failing message
+        assert "nope" in "\n".join(errors)
 
     def test_validation_order_view_before_columns(self, conn):
         """Step 1 (view existence) runs before step 2 (column check)."""
         task = _make_task(
             outputs=["missing"],
             output_columns={"missing": ["col1"]},
-            validate_sql=["SELECT 'should not run'"],
         )
         errors = task.validate(conn)
         assert len(errors) == 1
         assert "not created" in errors[0].lower()
 
-    def test_validation_order_columns_before_sql(self, conn):
-        """Step 2 (column check) runs before step 3 (validate_sql)."""
+
+# ==========================================================================
+# 1b. SQL-only and validation-only tasks
+# ==========================================================================
+
+
+class TestSqlOnlyTasks:
+    def test_sql_only_task_executes_and_validates(self, conn):
+        task = _make_task(
+            name="sql_task",
+            inputs=[],
+            outputs=["out_view", "sql_task__validation"],
+            sql=[
+                "CREATE VIEW out_view AS SELECT 1 AS x",
+                "CREATE VIEW sql_task__validation AS SELECT 'pass' AS status, 'ok' AS message",
+            ],
+        )
+
+        result = asyncio.run(run_sql_only_task(conn=conn, task=task))
+        assert result.success is True
+
+    def test_sql_only_task_disallows_select(self, conn):
+        task = _make_task(
+            name="sql_task",
+            outputs=["out_view"],
+            sql=["SELECT 1"],
+        )
+        result = asyncio.run(run_sql_only_task(conn=conn, task=task))
+        assert result.success is False
+        assert "only allow" in result.final_message.lower()
+
+    def test_sql_only_task_requires_sql(self, conn):
+        task = _make_task(name="sql_task", outputs=["sql_task__validation"], sql=[])
+        result = asyncio.run(run_sql_only_task(conn=conn, task=task))
+        assert result.success is False
+
+    def test_validation_view_is_enforced(self, conn):
+        # Any view that matches validation naming conventions should be enforced
+        conn.execute(
+            "CREATE VIEW mytask__validation AS "
+            "SELECT 'fail' AS status, 'bad things' AS message"
+        )
+        task = _make_task(name="mytask", outputs=["mytask__validation"])
+        errors = task.validate(conn)
+        assert errors
+        assert "bad things" in "\n".join(errors)
+
+    def test_validation_order_columns_before_validation_view(self, conn):
+        """Column check runs before validation view enforcement."""
         conn.execute("CREATE VIEW v AS SELECT 1 AS wrong_col")
         task = _make_task(
             outputs=["v"],
             output_columns={"v": ["expected_col"]},
-            validate_sql=["SELECT 'should not run'"],
         )
         errors = task.validate(conn)
         assert len(errors) == 1
         assert "expected_col" in errors[0]
-
-    def test_validate_sql_multicolumn_format(self, conn):
-        """Multi-column validate_sql results are formatted as col=val pairs."""
-        conn.execute("CREATE VIEW items AS SELECT 1 AS id, 'bad' AS status")
-        task = _make_task(
-            outputs=["items"],
-            validate_sql=["SELECT id, status FROM items WHERE status = 'bad'"],
-        )
-        errors = task.validate(conn)
-        assert len(errors) == 1
-        assert "id=1" in errors[0]
-        assert "status=bad" in errors[0]
 
 
 # ===========================================================================
@@ -1566,8 +1583,8 @@ class TestLoadSpec:
             "region",
         ]
 
-        # validate_demo.py
-        result = load_spec_from_module("tests.validate_demo")
+        # validation_view_demo.py
+        result = load_spec_from_module("tests.validation_view_demo")
         assert len(result["tasks"]) == 1
         assert "expenses" in result["inputs"]
 

@@ -105,6 +105,20 @@ VALIDATION:
 - Validation runs AUTOMATICALLY when you stop (no tool calls in your response).
 - If validation fails, you will receive the specific error and can fix it.
 
+VALIDATION VIEWS (IMPORTANT):
+- Some tasks require creating one or more validation views as part of REQUIRED OUTPUTS.
+- Validation view naming convention:
+  - '{task}__validation' and '{task}__validation_*'
+- Validation view schema contract (minimum):
+  - status: VARCHAR — one of 'pass', 'warn', 'fail' (case-insensitive)
+  - message: VARCHAR — short human-readable explanation
+- Harness enforcement:
+  - If any row in any validation view has status='fail', the task fails.
+  - If there are no fail rows, the task passes.
+  - 'warn' rows are allowed and do not fail the task by default.
+- Tip: Prefer emitting one row per issue with status='fail'. If there are no issues,
+  emit a single 'pass' row with message='ok'.
+
 WORKFLOW:
   1. Explore the available input tables for your task
   2. Create your required output view(s) using intermediate views as needed
@@ -543,6 +557,22 @@ def _build_task_user_message(
     parts.append(f"You must create these views: {', '.join(task.outputs)}")
     parts.append("")
 
+    # Validation view UX hint
+    val_outputs = [
+        o
+        for o in task.outputs
+        if o == f"{task.name}__validation" or o.startswith(f"{task.name}__validation_")
+    ]
+    if val_outputs:
+        parts.append("VALIDATION VIEWS:")
+        parts.append(
+            "Outputs matching '{task}__validation' or '{task}__validation_*' are enforced. "
+            "They must have columns: status, message (status in pass|warn|fail)."
+        )
+        for v in val_outputs:
+            parts.append(f"  - {v}")
+        parts.append("")
+
     parts.append("VIEW NAMING:")
     parts.append(
         f"- For intermediate work, use prefix '{task.name}_' "
@@ -653,7 +683,7 @@ async def run_task_agent(
 
         return json.dumps({"success": False, "error": f"Unknown tool: {name}"})
 
-    # Validation: check declared outputs exist + validate_sql checks
+    # Validation: check declared outputs exist, schemas, and validation view
     def validation_fn() -> tuple[bool, str]:
         errors = task.validate(conn)
         if errors:
@@ -707,3 +737,163 @@ async def run_task_agent(
     log.info("[%s] Validation: %s (%.1fs)", task.name, status, elapsed_s)
 
     return result
+
+
+# --- SQL-only task executor ---
+
+
+def _is_sql_only_statement_allowed(query: str) -> tuple[bool, str]:
+    """Restrict SQL-only tasks to CREATE/DROP VIEW|MACRO statements.
+
+    SQL-only tasks are intended to be fully deterministic and side-effect free
+    beyond defining views/macros. We explicitly disallow SELECT/EXPLAIN even
+    though the agent tool allows them.
+    """
+    try:
+        statements = _get_parser_conn().extract_statements(query)
+    except duckdb.ParserException as e:
+        return False, f"SQL parse error: {e}"
+    except Exception as e:
+        return False, f"SQL parse error: {e}"
+
+    if not statements:
+        return False, "Empty query"
+    if len(statements) > 1:
+        return False, "Only one statement allowed at a time"
+
+    stmt = statements[0]
+    st = stmt.type
+    StatementType = cast(Any, duckdb.StatementType)
+
+    if st not in {StatementType.CREATE, StatementType.DROP}:
+        return False, "SQL-only tasks only allow CREATE/DROP VIEW|MACRO statements"
+    return True, ""
+
+
+async def run_sql_only_task(
+    conn: duckdb.DuckDBPyConnection,
+    task: Task,
+) -> AgentResult:
+    """Execute a deterministic SQL-only task.
+
+    The task provides a list of SQL statements (task.sql). Each statement is
+    executed with the same namespace enforcement as agent tasks.
+    """
+    init_trace_table(conn)
+
+    start_time = time.time()
+
+    if not task.sql:
+        return AgentResult(
+            success=False,
+            final_message="SQL-only task has no SQL statements",
+            iterations=0,
+            messages=[],
+            tool_calls_count=0,
+        )
+
+    allowed_views = set(task.outputs)
+    namespace = task.name
+
+    for q in task.sql:
+        ok, err = _is_sql_only_statement_allowed(q)
+        if not ok:
+            persist_task_meta(
+                conn,
+                task.name,
+                {
+                    "model": "sql",
+                    "outputs": task.outputs,
+                    "iterations": 0,
+                    "tool_calls": 0,
+                    "elapsed_s": round(time.time() - start_time, 1),
+                    "validation": "FAILED",
+                    "error": err,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                },
+            )
+            return AgentResult(
+                success=False,
+                final_message=err,
+                iterations=0,
+                messages=[],
+                tool_calls_count=0,
+            )
+
+        result = execute_sql(
+            conn,
+            q,
+            allowed_views=allowed_views,
+            namespace=namespace,
+            task_name=task.name,
+        )
+        if not result.get("success", False):
+            err_msg = str(result.get("error") or "SQL execution failed")
+            persist_task_meta(
+                conn,
+                task.name,
+                {
+                    "model": "sql",
+                    "outputs": task.outputs,
+                    "iterations": 0,
+                    "tool_calls": 0,
+                    "elapsed_s": round(time.time() - start_time, 1),
+                    "validation": "FAILED",
+                    "error": err_msg,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                },
+            )
+            return AgentResult(
+                success=False,
+                final_message=err_msg,
+                iterations=0,
+                messages=[],
+                tool_calls_count=0,
+            )
+
+    errors = task.validate(conn)
+    elapsed_s = time.time() - start_time
+    if errors:
+        msg = "\n".join(f"- {e}" for e in errors)
+        persist_task_meta(
+            conn,
+            task.name,
+            {
+                "model": "sql",
+                "outputs": task.outputs,
+                "iterations": 0,
+                "tool_calls": 0,
+                "elapsed_s": round(elapsed_s, 1),
+                "validation": "FAILED",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            },
+        )
+        return AgentResult(
+            success=False,
+            final_message=msg,
+            iterations=0,
+            messages=[],
+            tool_calls_count=0,
+        )
+
+    persist_task_meta(
+        conn,
+        task.name,
+        {
+            "model": "sql",
+            "outputs": task.outputs,
+            "iterations": 0,
+            "tool_calls": 0,
+            "elapsed_s": round(elapsed_s, 1),
+            "validation": "PASSED",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        },
+    )
+
+    return AgentResult(
+        success=True,
+        final_message="OK",
+        iterations=0,
+        messages=[],
+        tool_calls_count=0,
+    )

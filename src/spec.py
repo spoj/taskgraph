@@ -80,10 +80,56 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
         if isinstance(t, dict):
             t = dict(t)  # shallow copy to avoid mutating the original
             task_name = t.get("name", "")
+            task_type = t.get("task_type") or t.get("type")
+
             if "prompt" in t and not isinstance(t["prompt"], str):
                 raise ValueError(
                     f"Task '{task_name}' prompt must be a string, "
                     f"got {type(t['prompt']).__name__}"
+                )
+
+            # Deterministic SQL (optional). If present, the harness will
+            # execute it directly (no LLM). Accept str or list[str].
+            if "sql" in t:
+                sql = t.get("sql", [])
+                if isinstance(sql, str):
+                    sql = [sql]
+                if not isinstance(sql, list) or not all(
+                    isinstance(s, str) for s in sql
+                ):
+                    raise ValueError(
+                        f"Task '{task_name}' sql must be a string or list[str]"
+                    )
+                stripped: list[str] = []
+                for s in sql:
+                    s2 = s.strip()
+                    if not s2:
+                        raise ValueError(
+                            f"Task '{task_name}' sql contains an empty statement"
+                        )
+                    stripped.append(s2)
+                t["sql"] = stripped
+
+            # prompt is optional to specify in the dict, but tasks must provide
+            # exactly one of: sql or prompt (non-empty).
+            t.setdefault("prompt", "")
+
+            sql_statements = t.get("sql") or []
+            prompt_text = (t.get("prompt") or "").strip()
+
+            if sql_statements and prompt_text:
+                raise ValueError(
+                    f"Task '{task_name}' must not specify both 'sql' and 'prompt'"
+                )
+            if not sql_statements and not prompt_text:
+                raise ValueError(
+                    f"Task '{task_name}' must specify exactly one of 'sql' or 'prompt'"
+                )
+
+            # Back-compat: if task declares type=sql but provides no sql, fail.
+            if task_type == "sql" and not sql_statements:
+                raise ValueError(
+                    f"Task '{task_name}' declares type=sql but has no sql statements"
                 )
             tasks.append(Task(**t))
         elif isinstance(t, Task):

@@ -43,7 +43,7 @@ _runs: dict[str, dict[str, Any]] = {}
 BUILTIN_SPECS = {
     "diamond_dag": "tests.diamond_dag",
     "single_task": "tests.single_task",
-    "validate_demo": "tests.validate_demo",
+    "validation_view_demo": "tests.validation_view_demo",
     "linear_chain": "tests.linear_chain",
 }
 

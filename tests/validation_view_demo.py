@@ -1,10 +1,10 @@
-"""Validation SQL demo workspace.
+"""Validation view demo workspace.
 
-Demonstrates validate_sql with a categorize-and-balance-check pattern.
-The agent must categorize rows and ensure they sum to an expected total.
+Demonstrates validation views with a categorize-and-balance-check pattern.
+The agent must categorize rows and produce a validation view.
 
 Usage:
-    taskgraph run --spec tests.validate_demo -o output.db
+    taskgraph run --spec tests.validation_view_demo -o output.db
 """
 
 # --- Inputs ---
@@ -108,28 +108,20 @@ TASKS = [
             "- 'Technology' for hosting, certificates (vendor: CloudHost Inc)\n"
             "- 'Travel' for flights, hotels, parking (vendor: TravelCo)\n"
             "- 'Professional' for legal, consulting (vendor: LegalEase LLP)\n\n"
-            "Create two views:\n"
+            "Create three views:\n"
             "1. 'categorized' — all input columns plus a 'category' column\n"
             "2. 'category_summary' — one row per category with: category, item_count,\n"
             "   total_amount. Include a final row with category='TOTAL' summing everything.\n"
+            "3. 'categorize__validation' — rows with columns: status, message.\n"
+            "   Add a row with status='fail' if any expense row is missing from categorized,\n"
+            "   or if the categorized total differs from expected_total by > 0.01.\n"
         ),
         "inputs": ["expenses", "expected_total"],
-        "outputs": ["categorized", "category_summary"],
+        "outputs": ["categorized", "category_summary", "categorize__validation"],
         "output_columns": {
             "categorized": ["category"],
             "category_summary": ["category", "item_count", "total_amount"],
+            "categorize__validation": ["status", "message"],
         },
-        "validate_sql": [
-            # Every row must be categorized
-            "SELECT 'uncategorized row _row_id=' || e._row_id "
-            "FROM expenses e LEFT JOIN categorized c ON e._row_id = c._row_id "
-            "WHERE c._row_id IS NULL",
-            # Categorized total must match the expected total
-            "SELECT 'total mismatch: categorized=' || CAST(c.total AS TEXT) "
-            "  || ' expected=' || CAST(t.total AS TEXT) "
-            "FROM (SELECT SUM(amount) AS total FROM categorized) c, "
-            "     expected_total t "
-            "WHERE ABS(c.total - t.total) > 0.01",
-        ],
     },
 ]

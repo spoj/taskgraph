@@ -87,7 +87,8 @@ taskgraph run --spec my_app.specs.feb -o feb.db --from-db jan.db --reingest
 
 - **Token circuit breaker** (`agent_loop.py`): `DEFAULT_MAX_TOKENS = 20_000_000` (20M). Checked after each LLM call (prompt + completion combined). Returns `AgentResult(success=False)` if exceeded. Configurable via `max_tokens` param on `run_agent_loop()`.
 - **Per-query timeout** (`agent.py`): `DEFAULT_QUERY_TIMEOUT_S = 30`. Uses `threading.Timer` + `conn.interrupt()`. Catches `duckdb.InterruptException`, connection stays usable. Configurable via `query_timeout_s` param on `execute_sql()`.
-- **Output schema validation** (`task.py`): `output_columns: dict[str, list[str]]` on `Task`. Runs after view existence check, before `validate_sql`. Queries `information_schema.columns` and checks required columns are present. Error message includes actual columns for debugging.
+- **Output schema validation** (`task.py`): `output_columns: dict[str, list[str]]` on `Task`. Runs after view existence check, before validation view enforcement. Queries `information_schema.columns` and checks required columns are present.
+- **Task validation views** (`task.py`): tasks can declare one or more outputs named `{task}__validation` / `{task}__validation_*` with columns `status`, `message`. Any row with status='fail' fails the task.
 - **Input validation** (`workspace.py`): `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]` on `Workspace`. Runs after ingestion, before tasks. Column check short-circuits before SQL checks. Callable errors caught with context. Empty tables logged as warnings.
 
 ## Justfile

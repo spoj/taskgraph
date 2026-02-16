@@ -17,9 +17,9 @@ Example:
         Task(
             name="match",
             inputs=["rows_clean", "reference"],
-            outputs=["matches", "match_summary"],
+            outputs=["matches", "match_summary", "match__validation"],
             prompt="Match normalized rows against a reference table...",
-            validate_sql=["SELECT ... FROM ... WHERE mismatch_count > 0"],
+            # Create a view named 'match__validation' with status/message rows.
         ),
     ]
 
@@ -35,6 +35,23 @@ import duckdb
 from dataclasses import dataclass, field
 
 
+_VALIDATION_VIEW_REQUIRED_COLS = ["status", "message"]
+_VALIDATION_STATUS_ALLOWED = {"pass", "warn", "fail"}
+
+
+def validation_view_prefix(task_name: str) -> str:
+    return f"{task_name}__validation"
+
+
+def is_validation_view_for_task(view_name: str, task_name: str) -> bool:
+    """Return True if view_name is a validation view for task_name.
+
+    Convention: '{task_name}__validation' and '{task_name}__validation_*'
+    """
+    prefix = validation_view_prefix(task_name)
+    return view_name == prefix or view_name.startswith(prefix + "_")
+
+
 @dataclass
 class Task:
     """A single unit of work in a workspace.
@@ -44,19 +61,30 @@ class Task:
         prompt: Task-specific instructions for the agent.
         inputs: Table/view names this task reads from. These must exist before the task runs.
         outputs: View names this task must produce. Other tasks can depend on these.
-        validate_sql: SQL queries that must each return zero rows. Evaluated sequentially,
-            short-circuits on first query that returns rows. Each returned row becomes an
-            error message (single-column value, or col=val pairs for multi-column).
+        Validation views: a task may declare one or more outputs named
+            '{name}__validation' and/or '{name}__validation_*'. If present, they are
+            enforced after the task runs. Any row with lower(status)='fail' causes the
+            task to fail.
         output_columns: Optional schema check. Maps view_name -> list of required column
             names. Validation fails if a view is missing any declared column.
     """
 
     name: str
-    prompt: str
+    prompt: str = ""
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
-    validate_sql: list[str] = field(default_factory=list)
     output_columns: dict[str, list[str]] = field(default_factory=dict)
+
+    # Deterministic SQL statements (views/macros only). If provided, the
+    # workspace harness executes these statements directly (no LLM).
+    sql: list[str] = field(default_factory=list)
+
+    def run_mode(self) -> str:
+        """Return execution mode: 'sql' or 'agent'.
+
+        Spec parsing enforces exactly one of (sql, prompt) is provided.
+        """
+        return "sql" if self.sql else "agent"
 
     def validate(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
         """Run validation. Returns error messages (empty = pass).
@@ -64,7 +92,7 @@ class Task:
         Checks run in order, short-circuiting on first failure:
         1. All declared output views exist.
         2. Output views have required columns (if output_columns specified).
-        3. Each validate_sql query returns zero rows.
+        3. If validation views are declared in outputs, enforce them.
         """
         # 1. Check all declared outputs exist
         existing_views = {
@@ -103,22 +131,126 @@ class Task:
                         f"Actual columns: {', '.join(sorted(actual_cols))}"
                     ]
 
-        # 3. Run SQL checks sequentially, short-circuit on first failure
-        for sql in self.validate_sql:
-            try:
-                cursor = conn.execute(sql)
-                rows = cursor.fetchall()
-            except duckdb.Error as e:
-                return [f"Validation query error: {e}"]
-            if rows:
-                cols = [d[0] for d in cursor.description]
-                errors = []
-                for row in rows:
-                    if len(cols) == 1:
-                        errors.append(str(row[0]))
-                    else:
-                        errors.append(", ".join(f"{c}={v}" for c, v in zip(cols, row)))
-                return errors
+        # 3. Enforce validation view(s) if declared
+        validation_errors = self._validate_validation_views(conn)
+        if validation_errors:
+            return validation_errors
+
+        return []
+
+    def _validation_view_outputs(self) -> list[str]:
+        """Return declared validation view outputs for this task."""
+        return sorted(
+            [o for o in self.outputs if is_validation_view_for_task(o, self.name)]
+        )
+
+    def _validate_validation_views(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
+        """Enforce declared validation view outputs.
+
+        Each validation view must have columns:
+        - status: pass|warn|fail (case-insensitive)
+        - message: human-readable string
+
+        Any row with lower(status)='fail' fails the task.
+        """
+        views = self._validation_view_outputs()
+        if not views:
+            return []
+
+        all_errors: list[str] = []
+        total_msgs = 0
+        max_msgs = 50
+
+        for view_name in views:
+            errs = self._validate_one_validation_view(
+                conn, view_name, max_msgs - total_msgs
+            )
+            if errs:
+                # If the first element is a header, keep it; otherwise add one.
+                if not errs[0].startswith("Validation failed via '"):
+                    all_errors.append(f"Validation failed via '{view_name}':")
+                all_errors.extend(errs)
+                # Count only message lines (skip header)
+                total_msgs = min(max_msgs, total_msgs + max(0, len(errs) - 1))
+                if total_msgs >= max_msgs:
+                    break
+
+        return all_errors
+
+    def _validate_one_validation_view(
+        self, conn: duckdb.DuckDBPyConnection, view_name: str, remaining: int
+    ) -> list[str]:
+        if remaining <= 0:
+            remaining = 1
+
+        try:
+            cols = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+                    [view_name],
+                ).fetchall()
+            ]
+        except duckdb.Error as e:
+            return [f"Validation view schema check error for '{view_name}': {e}"]
+
+        actual = {c.lower() for c in cols}
+        missing = [c for c in _VALIDATION_VIEW_REQUIRED_COLS if c not in actual]
+        if missing:
+            return [
+                f"Validation view '{view_name}' is missing required column(s): "
+                f"{', '.join(missing)}. Actual columns: {', '.join(cols)}"
+            ]
+
+        # Enforce status domain
+        try:
+            bad = conn.execute(
+                f'SELECT DISTINCT lower(status) AS status FROM "{view_name}" '
+                "WHERE status IS NOT NULL AND lower(status) NOT IN ('pass','warn','fail') "
+                "LIMIT 50"
+            ).fetchall()
+        except duckdb.Error as e:
+            return [f"Validation view query error for '{view_name}': {e}"]
+
+        if bad:
+            bad_vals = ", ".join(sorted({str(r[0]) for r in bad}))
+            allowed = ", ".join(sorted(_VALIDATION_STATUS_ALLOWED))
+            return [
+                f"Validation view '{view_name}' has invalid status value(s): {bad_vals}. "
+                f"Allowed: {allowed}"
+            ]
+
+        has_evidence_view = "evidence_view" in actual
+
+        try:
+            if has_evidence_view:
+                rows = conn.execute(
+                    f'SELECT status, message, evidence_view FROM "{view_name}" '
+                    f"WHERE lower(status) = 'fail' LIMIT {remaining}"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f'SELECT status, message FROM "{view_name}" '
+                    f"WHERE lower(status) = 'fail' LIMIT {remaining}"
+                ).fetchall()
+        except duckdb.Error as e:
+            return [f"Validation view query error for '{view_name}': {e}"]
+
+        if rows:
+            msgs: list[str] = []
+            evidence_views: set[str] = set()
+            if has_evidence_view:
+                for _status, msg, ev in rows:
+                    msgs.append(str(msg))
+                    if ev:
+                        evidence_views.add(str(ev))
+            else:
+                msgs = [str(msg) for _status, msg in rows]
+
+            header = f"Validation failed via '{view_name}':"
+            if evidence_views:
+                header += f" evidence_view={', '.join(sorted(evidence_views))}"
+            return [header] + msgs
 
         return []
 

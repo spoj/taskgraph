@@ -490,6 +490,9 @@ def show(target: Path | None, spec: str | None):
             else:
                 prefix = "    "
 
+            kind = "sql" if getattr(t, "sql", None) else "prompt"
+            click.echo(f"{prefix}type: {kind}")
+
             # Inputs — mark external (base table) vs task-produced
             if t.inputs:
                 parts = []
@@ -522,9 +525,13 @@ def show(target: Path | None, spec: str | None):
         if t.output_columns:
             n_schemas = len(t.output_columns)
             parts.append(f"{n_schemas} output schema{'s' if n_schemas > 1 else ''}")
-        if t.validate_sql:
-            n_sql = len(t.validate_sql)
-            parts.append(f"{n_sql} SQL check{'s' if n_sql > 1 else ''}")
+        n_val = sum(
+            1
+            for o in t.outputs
+            if o == f"{t.name}__validation" or o.startswith(f"{t.name}__validation_")
+        )
+        if n_val:
+            parts.append(f"{n_val} validation view{'s' if n_val > 1 else ''}")
         if parts:
             has_validation = True
             val_lines.append(f"  {t.name}: {', '.join(parts)}")

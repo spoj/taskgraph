@@ -210,7 +210,11 @@ def load_data():
 
 ## TASKS
 
-A list of task definitions. Each task becomes an independent LLM agent that writes SQL views against the database.
+A list of task definitions. Each task is executed either:
+- by an LLM agent (`prompt`), or
+- deterministically (`sql` statements)
+
+Each task declares `inputs` and `outputs` (views). Validation is expressed by producing one or more views named `{task_name}__validation` and/or `{task_name}__validation_*`.
 
 ```python
 TASKS = [
@@ -218,9 +222,21 @@ TASKS = [
         "name": "match",
         "prompt": "...",
         "inputs": ["invoices", "payments"],
-        "outputs": ["output"],
-        "output_columns": {"output": ["left_ids", "right_ids"]},
-        "validate_sql": ["..."],
+        "outputs": ["output", "match__validation"],
+        "output_columns": {
+            "output": ["left_ids", "right_ids"],
+            "match__validation": ["status", "message"],
+        },
+    },
+    {
+        "name": "recon",
+        "sql": [
+            "CREATE OR REPLACE VIEW recon AS SELECT ...",
+            "CREATE OR REPLACE VIEW recon__validation AS SELECT ...",
+        ],
+        "inputs": ["output"],
+        "outputs": ["recon", "recon__validation"],
+        "output_columns": {"recon__validation": ["status", "message"]},
     },
 ]
 ```
@@ -230,11 +246,11 @@ TASKS = [
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | `str` | Yes | Unique identifier. Also the namespace prefix for intermediate views. |
-| `prompt` | `str` | Yes | Instructions for the agent. |
-| `inputs` | `list[str]` | Yes | Tables and views this task can read. Can be ingested tables or outputs of other tasks. |
-| `outputs` | `list[str]` | Yes | Views the agent must create. Validation checks these exist. |
+| `prompt` | `str` | Exactly one of `prompt` or `sql` | LLM instructions. Runs as an agent that writes views/macros via `run_sql`. |
+| `sql` | `str` or `list[str]` | Exactly one of `prompt` or `sql` | Deterministic statements executed directly (views/macros only). |
+| `inputs` | `list[str]` | Yes | Tables/views this task reads. Can be ingested tables or outputs of other tasks. |
+| `outputs` | `list[str]` | Yes | Views the task must create. Validation checks these exist. |
 | `output_columns` | `dict[str, list[str]]` | No | Required columns per output view. Checks names only, not types. Extra columns are fine. |
-| `validate_sql` | `list[str]` | No | SQL queries that must return 0 rows after the agent finishes. See [Validation SQL](#validation-sql). |
 
 ### Naming and dependencies
 
@@ -319,85 +335,36 @@ If `output_columns` is specified, each listed column must be present in the view
 View 'output' is missing required column(s): left_ids. Actual columns: category, count
 ```
 
-### 3. Validation SQL
+### 3. Validation view
 
-Each query in `validate_sql` must return 0 rows. Queries run sequentially and short-circuit — the first query that returns rows stops validation.
+Task validation is expressed by producing one or more views named `{task_name}__validation` and/or `{task_name}__validation_*` and declaring them in `outputs`.
 
-**Returned rows become the error message.** Design your SELECT so each row is a human-readable diagnostic. The agent sees these errors and attempts to fix them.
+Contract:
+- The view must have columns `status` and `message`.
+- `status` must be one of: `pass`, `warn`, `fail` (case-insensitive).
+- If the view contains any row with `status='fail'`, the task fails.
 
-### Validation patterns that work well
-
-Aim for queries that tell the agent exactly what to fix:
+Recommended pattern:
 
 ```sql
--- Completeness: every invoice has a match
-SELECT 'unmatched invoice _row_id=' || CAST(i._row_id AS VARCHAR)
+-- One row per issue (fail) with a human-readable message
+CREATE OR REPLACE VIEW match__validation AS
+SELECT 'fail' AS status, 'unmatched invoice _row_id=' || CAST(i._row_id AS VARCHAR) AS message
 FROM invoices i
 LEFT JOIN matches m ON m.invoice_row_id = i._row_id
 WHERE m.invoice_row_id IS NULL
+
+UNION ALL
+SELECT 'pass' AS status, 'ok' AS message
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM invoices i
+    LEFT JOIN matches m ON m.invoice_row_id = i._row_id
+    WHERE m.invoice_row_id IS NULL
+);
 ```
 
-```sql
--- No duplicates: one payment used at most once
-SELECT 'payment _row_id=' || CAST(payment_row_id AS VARCHAR) || ' used ' || CAST(COUNT(*) AS VARCHAR) || ' times'
-FROM matches
-GROUP BY payment_row_id
-HAVING COUNT(*) > 1
-```
-
-Single-column result — each row's value is the error text:
-```sql
-SELECT 'invoice _row_id=' || CAST(i._row_id AS VARCHAR) || ' not matched'
-FROM invoices i
-WHERE i._row_id NOT IN (SELECT unnest(left_ids) FROM output WHERE left_ids IS NOT NULL)
-```
-
-Multi-column result — formatted as `col1=val1, col2=val2`:
-```sql
-SELECT category, ROUND(diff, 2) AS amount_diff
-FROM reconciliation
-WHERE ABS(diff) > 0.01
-```
-
-### Writing effective validation SQL
-
-**Order queries by importance.** Validation short-circuits, so put the most critical check first. If the output view is structurally wrong, checking amount reconciliation is pointless.
-
-**Make errors actionable.** Include enough context for the agent to fix the problem:
-```sql
--- Bad: agent doesn't know which rows or why
-SELECT COUNT(*) FROM output WHERE left_ids IS NULL
-
--- Good: agent can see which specific rows are unmatched
-SELECT 'unmatched left _row_id=' || CAST(_row_id AS VARCHAR)
-       || ' amount=' || CAST(amount AS VARCHAR)
-FROM invoices
-WHERE _row_id NOT IN (SELECT unnest(left_ids) FROM output WHERE left_ids IS NOT NULL)
-```
-
-**Use tolerances for numeric comparisons.** Floating-point arithmetic means exact equality rarely works:
-```sql
-SELECT category || ': diff=' || CAST(ROUND(detail_sum + summary_amt, 3) AS VARCHAR)
-FROM reconciliation
-WHERE ABS(detail_sum + summary_amt) > 0.01  -- tolerance
-```
-
-**Check completeness.** Common patterns:
-```sql
--- Every input row appears exactly once
-WITH used AS (
-    SELECT unnest(left_ids) AS id FROM output WHERE left_ids IS NOT NULL
-)
-SELECT 'missing _row_id=' || CAST(d._row_id AS VARCHAR)
-FROM detail d WHERE d._row_id NOT IN (SELECT id FROM used)
-
--- No duplicates
-WITH used AS (
-    SELECT unnest(left_ids) AS id FROM output WHERE left_ids IS NOT NULL
-)
-SELECT '_row_id=' || CAST(id AS VARCHAR) || ' appears ' || CAST(COUNT(*) AS VARCHAR) || ' times'
-FROM used GROUP BY id HAVING COUNT(*) > 1
-```
+You can optionally add helper columns (not required by the harness), such as `evidence_view` to point reviewers to a drill-down view.
 
 ---
 
@@ -638,7 +605,7 @@ Include (in plain English) all of the things you would put in a code review chec
 - tolerances for numeric comparisons
 - how to break ties
 
-Then enforce it with `output_columns` and `validate_sql`.
+Then enforce it with `output_columns` and `{task_name}__validation` views.
 
 ### Be specific about the matching criteria
 

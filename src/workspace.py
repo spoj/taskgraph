@@ -48,7 +48,7 @@ from typing import Any, Callable
 from .agent_loop import AgentResult
 from .api import OpenRouterClient
 from .ingest import ingest_table, get_schema_info_for_tables
-from .agent import run_task_agent
+from .agent import run_task_agent, run_sql_only_task
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
 
 log = logging.getLogger(__name__)
@@ -409,6 +409,32 @@ class Workspace:
                 log.error("  %s: FAILED (%s)", output_path, e)
         return errors
 
+    async def _execute_task(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        task: Task,
+        client: OpenRouterClient,
+        model: str,
+        max_iterations: int,
+        existing_views: list[tuple[str, int]] | None = None,
+        validation_errors: list[str] | None = None,
+    ) -> AgentResult:
+        """Execute a single task (SQL or LLM) and return its result."""
+        if task.run_mode() == "sql":
+            return await run_sql_only_task(conn=conn, task=task)
+
+        schema_info = get_schema_info_for_tables(conn, task.inputs)
+        return await run_task_agent(
+            conn=conn,
+            task=task,
+            schema_info=schema_info,
+            client=client,
+            model=model,
+            max_iterations=max_iterations,
+            existing_views=existing_views,
+            validation_errors=validation_errors,
+        )
+
     async def run(
         self,
         client: OpenRouterClient,
@@ -472,11 +498,9 @@ class Workspace:
 
         async def run_one(task: Task) -> tuple[str, AgentResult]:
             log.info("[%s] Starting", task.name)
-            schema_info = get_schema_info_for_tables(conn, task.inputs)
-            result = await run_task_agent(
+            result = await self._execute_task(
                 conn=conn,
                 task=task,
-                schema_info=schema_info,
                 client=client,
                 model=model,
                 max_iterations=max_iterations,
@@ -646,11 +670,9 @@ class Workspace:
                 log.info("[%s] Pre-run validation: %d issue(s)", task.name, len(errors))
 
             existing = self._get_task_views(conn, task)
-            schema_info = get_schema_info_for_tables(conn, task.inputs)
-            result = await run_task_agent(
+            result = await self._execute_task(
                 conn=conn,
                 task=task,
-                schema_info=schema_info,
                 client=client,
                 model=model,
                 max_iterations=max_iterations,
