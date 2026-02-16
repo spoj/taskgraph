@@ -35,6 +35,13 @@ from typing import Any, Callable
 
 from .agent_loop import AgentResult
 from .api import OpenRouterClient
+from .diff import (
+    snapshot_views,
+    diff_snapshots,
+    format_changes,
+    persist_changes,
+    ViewChange,
+)
 from .ingest import ingest_table
 from .agent import run_task_agent, run_sql_only_task
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
@@ -499,8 +506,12 @@ class Workspace:
                     + "\n".join(f"  - {e}" for e in input_errors)
                 )
 
+        # Accumulate per-task view changes for reporting
+        task_changes: list[tuple[str, list[ViewChange]]] = []
+
         async def run_one(task: Task) -> tuple[str, AgentResult]:
             log.info("[%s] Starting", task.name)
+            before = snapshot_views(conn)
             result = await self._execute_task(
                 conn=conn,
                 task=task,
@@ -508,6 +519,14 @@ class Workspace:
                 model=model,
                 max_iterations=max_iterations,
             )
+            after = snapshot_views(conn)
+            changes = diff_snapshots(before, after)
+            if changes:
+                persist_changes(conn, task.name, changes)
+                task_changes.append((task.name, changes))
+                change_summary = format_changes(task.name, changes)
+                if change_summary:
+                    log.info("%s", change_summary)
             return task.name, result
 
         task_results, all_success = await self._run_task_dag(self.tasks, run_one)

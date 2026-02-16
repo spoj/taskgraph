@@ -109,6 +109,27 @@ def _default_spec_module() -> str:
     )
 
 
+def _resolve_spec_arg(spec: str) -> str:
+    """Resolve a --spec argument that may be a file path or module path.
+
+    If spec looks like a file path (contains / or \\, or ends with .py),
+    convert to a dotted module path relative to CWD.
+    Otherwise return as-is (already a module path).
+    """
+    if "/" not in spec and "\\" not in spec and not spec.endswith(".py"):
+        return spec  # Already a module path
+
+    # Normalize backslashes to forward slashes before Path parsing
+    spec = spec.replace("\\", "/")
+    path = Path(spec)
+    if path.suffix == ".py":
+        path = path.with_suffix("")
+
+    # Strip leading './' and convert separators to dots
+    parts = [p for p in path.parts if p != "."]
+    return ".".join(parts)
+
+
 def _slug_for_filename(text: str) -> str:
     """Convert an arbitrary string to a safe filename slug."""
     out: list[str] = []
@@ -130,6 +151,21 @@ def _default_output_db_path(spec_module: str, now: datetime | None = None) -> Pa
     return Path("runs") / f"{spec_slug}_{ts}.db"
 
 
+def _project_name_slug(directory: Path) -> str:
+    """Derive a PEP 508 project name from a directory name."""
+    raw = directory.name.lower()
+    # Replace non-alphanumeric with hyphens, collapse runs, strip edges
+    out: list[str] = []
+    for ch in raw:
+        if ch.isalnum():
+            out.append(ch)
+        else:
+            if out and out[-1] != "-":
+                out.append("-")
+    slug = "".join(out).strip("-")
+    return slug or "my-project"
+
+
 @main.command()
 @click.option(
     "--force",
@@ -142,13 +178,30 @@ def init(force: bool):
     root = Path.cwd()
     pyproject_path = root / "pyproject.toml"
     gitignore_path = root / ".gitignore"
+    env_path = root / ".env"
 
-    if not pyproject_path.exists():
-        raise click.ClickException(
-            "pyproject.toml not found. Start with `uv init --app --vcs git`, "
-            "then `uv add taskgraph`, then run `taskgraph init` inside that project."
+    created: list[str] = []
+    skipped: list[str] = []
+
+    # --- pyproject.toml ---
+    if not pyproject_path.exists() or force:
+        project_name = _project_name_slug(root)
+        pyproject_path.write_text(
+            f"""[project]
+name = "{project_name}"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = ["taskgraph"]
+
+[tool.taskgraph]
+spec = "specs.main"
+"""
         )
+        created.append("pyproject.toml")
+    else:
+        skipped.append("pyproject.toml")
 
+    # --- specs/ directory and main.py ---
     specs_dir = root / "specs"
     specs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -157,9 +210,10 @@ def init(force: bool):
         specs_init_py.write_text("")
 
     spec_path = specs_dir / "main.py"
-    if (not spec_path.exists()) or force:
+    if not spec_path.exists() or force:
         spec_path.write_text(
-            """INPUTS = {
+            """\
+INPUTS = {
     "data": [
         {"x": 1},
         {"x": 2},
@@ -170,8 +224,9 @@ def init(force: bool):
 TASKS = [
     {
         "name": "double",
-        "intent": "Create a view 'output' with columns x and x2 (x*2).",
-        "sql": "CREATE VIEW output AS SELECT x, x * 2 AS x2 FROM data",
+        # sql_strict: deterministic SQL, no LLM needed.
+        # Switch to "sql" + "intent" for LLM-assisted repair.
+        "sql_strict": "CREATE VIEW output AS SELECT x, x * 2 AS x2 FROM data",
         "inputs": ["data"],
         "outputs": ["output"],
         "output_columns": {"output": ["x", "x2"]},
@@ -179,35 +234,58 @@ TASKS = [
 ]
 """
         )
+        created.append("specs/main.py")
+    else:
+        skipped.append("specs/main.py")
 
-    # Copy spec writer guide into the project root for convenience.
+    # --- SPEC_GUIDE.md ---
     guide_dst = root / "SPEC_GUIDE.md"
-    if (not guide_dst.exists()) or force:
+    if not guide_dst.exists() or force:
         guide_src = Path(__file__).parent.parent / "SPEC_GUIDE.md"
         try:
             guide_dst.write_text(guide_src.read_text())
+            created.append("SPEC_GUIDE.md")
         except OSError:
-            # If the guide isn't available (e.g., installed without source docs),
-            # silently skip.
-            pass
+            pass  # Source not available (installed without docs)
+    else:
+        skipped.append("SPEC_GUIDE.md")
 
-    if not gitignore_path.exists():
-        gitignore_path.write_text(
-            """.venv/
-__pycache__/
-*.db
+    # --- .env ---
+    if not env_path.exists() or force:
+        env_path.write_text(
+            """\
+# Get your key at https://openrouter.ai/keys
+# OPENROUTER_API_KEY=sk-or-...
 """
         )
-    elif not force:
-        click.echo(".gitignore already exists; skipping.")
+        created.append(".env")
+    else:
+        skipped.append(".env")
 
-    click.echo("Initialized Taskgraph spec: specs/main.py")
-    if guide_dst.exists():
-        click.echo("Wrote spec guide: SPEC_GUIDE.md")
-    click.echo("Default spec module (implicit): specs.main")
-    click.echo("Next:")
+    # --- .gitignore ---
+    gitignore_entries = [".venv/", "__pycache__/", "*.db", ".env"]
+    if not gitignore_path.exists() or force:
+        gitignore_path.write_text("\n".join(gitignore_entries) + "\n")
+        created.append(".gitignore")
+    else:
+        # Ensure .env is in existing .gitignore
+        existing = gitignore_path.read_text()
+        if ".env" not in existing:
+            with open(gitignore_path, "a") as f:
+                f.write(".env\n")
+        skipped.append(".gitignore")
+
+    # --- Output ---
+    if created:
+        for name in created:
+            click.echo(f"  created  {name}")
+    if skipped:
+        for name in skipped:
+            click.echo(f"  exists   {name}")
+
+    click.echo("\nNext:")
     click.echo("  uv sync")
-    click.echo("  taskgraph run")
+    click.echo("  tg run")
 
 
 @main.command()
@@ -270,6 +348,8 @@ def run(
 
     if spec is None:
         spec = _default_spec_module()
+    else:
+        spec = _resolve_spec_arg(spec)
 
     if output is None:
         output = _default_output_db_path(spec)
@@ -367,35 +447,94 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
             "SELECT view_name FROM duckdb_views() WHERE internal = false"
         ).fetchall()
         views = {row[0] for row in view_rows}
-        click.echo(f"\nViews: {len(views)}")
 
+        # --- Change report from _changes table ---
+        has_changes = False
+        try:
+            change_rows = conn.execute(
+                "SELECT task, view_name, kind, sql_before, sql_after, "
+                "cols_before, cols_after, rows_before, rows_after "
+                "FROM _changes ORDER BY task, view_name"
+            ).fetchall()
+            has_changes = bool(change_rows)
+        except duckdb.Error:
+            change_rows = []
+
+        if has_changes:
+            from src.diff import ViewChange, format_all_changes
+
+            # Group by task, preserving insertion order
+            task_changes: dict[str, list[ViewChange]] = {}
+            for row in change_rows:
+                (
+                    task_name,
+                    view_name,
+                    kind,
+                    sql_before,
+                    sql_after,
+                    cols_before_json,
+                    cols_after_json,
+                    rows_before,
+                    rows_after,
+                ) = row
+                cols_before = (
+                    [tuple(c) for c in json.loads(cols_before_json)]
+                    if cols_before_json
+                    else None
+                )
+                cols_after = (
+                    [tuple(c) for c in json.loads(cols_after_json)]
+                    if cols_after_json
+                    else None
+                )
+                change = ViewChange(
+                    view_name=view_name,
+                    kind=kind,
+                    sql_before=sql_before,
+                    sql_after=sql_after,
+                    cols_before=cols_before,
+                    cols_after=cols_after,
+                    rows_before=rows_before,
+                    rows_after=rows_after,
+                )
+                task_changes.setdefault(task_name, []).append(change)
+
+            formatted = format_all_changes(list(task_changes.items()))
+            if formatted:
+                click.echo(f"\n{formatted}")
+        else:
+            # Fallback: no _changes table, show basic view listing
+            click.echo(f"\nViews: {len(views)}")
+
+            for task in tasks:
+                if not task.outputs:
+                    continue
+
+                click.echo(f"\n  {task.name}:")
+                for output_name in task.outputs:
+                    if output_name in views:
+                        try:
+                            count = conn.execute(
+                                f'SELECT COUNT(*) FROM "{output_name}"'
+                            ).fetchone()
+                            count_s = str(count[0]) if count else "0"
+                            click.echo(f"    {output_name}: {count_s} rows")
+                        except duckdb.Error:
+                            click.echo(f"    {output_name}: error counting rows")
+                    else:
+                        click.echo(f"    {output_name}: MISSING")
+
+        # --- Warnings and errors (always shown) ---
         for task in tasks:
-            if not task.outputs:
-                continue
-
-            click.echo(f"\nTask {task.name}:")
-            for output_name in task.outputs:
-                if output_name in views:
-                    try:
-                        count = conn.execute(
-                            f'SELECT COUNT(*) FROM "{output_name}"'
-                        ).fetchone()
-                        count_s = str(count[0]) if count else "0"
-                        click.echo(f"  {output_name}: {count_s} rows")
-                    except duckdb.Error:
-                        click.echo(f"  {output_name}: error counting rows")
-                else:
-                    click.echo(f"  {output_name}: MISSING")
-
             warn_count, warn_msgs = _collect_warnings(conn, task, views)
             if warn_count:
-                click.echo(f"  warnings: {warn_count}")
+                click.echo(f"\n  {task.name} warnings: {warn_count}")
                 for msg in warn_msgs:
                     click.echo(f"    - {msg}")
 
             errors = task.validate(conn)
             if errors:
-                click.echo(f"  errors: {len(errors)}")
+                click.echo(f"\n  {task.name} errors: {len(errors)}")
                 for msg in errors:
                     click.echo(f"    - {msg}")
     finally:
@@ -518,6 +657,8 @@ def show(target: Path | None, spec: str | None):
 
     if spec is None:
         spec = _default_spec_module()
+    else:
+        spec = _resolve_spec_arg(spec)
 
     spec_module = spec
     try:

@@ -17,11 +17,12 @@ independent agent writing namespace-enforced SQL views.
 - `src/agent.py` — task agent: SQL execution, optional LLM repair, namespace enforcement
 - `src/agent_loop.py` — generic async agent loop with concurrent tool execution
 - `src/api.py` — OpenRouter client. Connection pooling, cache_control on last message, reasoning_effort
+- `src/diff.py` — View catalog diffing: before/after snapshots of `duckdb_views().sql`, structured change reporting (created/modified/dropped), persistence to `_changes` table
 - `src/task.py` — Task dataclass, DAG resolution (topo-sort via Kahn's algorithm), dependency graph, graph validation
-- `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling
+- `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling, per-task change tracking
 - `src/ingest.py` — Ingestion: DataFrame/list[dict]/dict[str,list] -> DuckDB with _row_id PK
 - `src/spec.py` — shared spec loader, spec module resolution
-- `scripts/cli.py` — CLI entry point: `taskgraph run`, `taskgraph show`
+- `scripts/cli.py` — CLI entry point: `tg init`, `tg run`, `tg show`
 
 ## Workspace Spec Contract
 
@@ -92,15 +93,31 @@ Shorthand commands via [just](https://github.com/casey/just). All `recon` comman
 
 ## CLI Commands
 
+### `taskgraph init`
+Initialize a Taskgraph spec in the current directory. Creates `pyproject.toml`, `specs/main.py`, `specs/__init__.py`, `SPEC_GUIDE.md`, `.env`, and `.gitignore`. Project name is derived from the directory name (slugified). Scaffold spec uses `sql_strict` so `tg run` works immediately without an API key.
+```
+tg init          # create scaffold (skip existing files)
+tg init --force  # overwrite existing files
+```
+
 ### `taskgraph run`
-Run a workspace spec: ingest inputs, resolve DAG, execute tasks, run exports.
+Run a workspace spec: ingest inputs, resolve DAG, execute tasks, run exports. The `--spec` argument accepts both module paths (`specs.main`) and file paths (`specs/main.py`, `./specs/main.py`); file paths are auto-resolved to module paths.
 ```
 just run --spec tests.single_task -o output.db
+just run --spec specs/main.py -o output.db          # file path auto-resolved
 just run --spec tests.diamond_dag -o output.db -m anthropic/claude-sonnet-4 --reasoning-effort medium
 ```
 
+After each task completes, view changes are reported inline:
+- `+ view_name  N cols, N rows` — created views
+- `~ view_name` with compact SQL diff — modified views
+- `- view_name` — dropped views
+
+Changes are also persisted to the `_changes` table in the output `.db` for later querying.
+
 ### `taskgraph show`
-Visualize a spec's structure: inputs with column specs, DAG layers with concurrent task grouping, per-task inputs/outputs, validation summary, graph errors, exports.
+Visualize a spec's structure: inputs with column specs, DAG layers with concurrent task grouping, per-task inputs/outputs, validation summary, graph errors, exports. Accepts file paths like `run`.
 ```
 just show --spec my_app.specs.main
+just show --spec specs/main.py
 ```
