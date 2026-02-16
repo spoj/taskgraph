@@ -516,24 +516,6 @@ If any task in a layer fails, all downstream layers are skipped. Earlier tasks i
 
 ---
 
-## Starting From An Existing DB
-
-Use `--from-db` to start from an existing workspace `.db` (it is copied to the output path), then re-run every task.
-
-### Reuse ingested data (default)
-
-```bash
-taskgraph run --spec my_app.specs.main --from-db previous.db -o new.db
-```
-
-### Re-ingest data
-
-```bash
-taskgraph run --spec my_app.specs.main --from-db previous.db -o new.db --reingest
-```
-
----
-
 ## Provenance and Lineage
 
 The `.db` is a queryable audit trail. After a run, you can open it and trace how any output was produced:
@@ -561,11 +543,7 @@ Views reference other views. The chain is the lineage:
 output → match_scored → match_candidates → match_legs → input_left, input_right
 ```
 
-Because views are late-binding, you can modify input data and re-query to see the effect:
-```sql
--- What happens if we change this invoice amount?
--- (read-only .db won't allow this, but in a rerun the agent would see updated data)
-```
+Because views are late-binding, you can modify input data and re-query to see the effect.
 
 ### SQL execution trace
 
@@ -599,7 +577,7 @@ Keys (v2):
 - `task_repair_contexts`
 - `llm_model`, `llm_reasoning_effort`, `llm_max_iterations`
 - `inputs_row_counts`, `inputs_schema`
-  - `run` (JSON: run context; may include source_db when starting from an existing db)
+- `run` (JSON: run context)
 - `spec` (JSON: module)
 
 ### Adding provenance columns
@@ -709,8 +687,6 @@ taskgraph run -o OUTPUT_DB [options]
 |------|-------------|
 | `-o, --output PATH` | Output `.db` file path (optional; default: `runs/<spec>_<timestamp>.db`) |
 | `-s, --spec MODULE` | Spec module path (default: `[tool.taskgraph].spec` from `pyproject.toml`; if unset: `specs.main` when present) |
-| `--from-db PATH` | Start from an existing workspace `.db` |
-| `--reingest` | Re-run input callables for fresh data when using `--from-db` |
 | `-m, --model MODEL` | LLM model (default: `openai/gpt-5.2`) |
 | `--reasoning-effort low\|medium\|high` | Reasoning effort level |
 | `--max-iterations N` | Max agent iterations per task (default: 200) |

@@ -9,8 +9,8 @@ Usage:
     # Run an explicit spec module
     taskgraph run --spec my_app.specs.main
 
-    # Start from a previous .db file
-    taskgraph run --spec my_app.specs.main --from-db previous.db
+    # Start a fresh run
+    taskgraph run --spec my_app.specs.main
 """
 
 import asyncio
@@ -220,12 +220,6 @@ __pycache__/
     help="Spec module path (default: [tool.taskgraph].spec from pyproject.toml)",
 )
 @click.option(
-    "--from-db",
-    type=click.Path(exists=True, path_type=Path),
-    default=None,
-    help="Start from an existing workspace .db (copies it, then reruns tasks).",
-)
-@click.option(
     "--output",
     "-o",
     type=click.Path(path_type=Path),
@@ -245,11 +239,6 @@ __pycache__/
     type=int,
     help="Maximum agent iterations per task (default: 200)",
 )
-@click.option(
-    "--reingest",
-    is_flag=True,
-    help="Re-run input callables for fresh data when using --from-db.",
-)
 @click.option("--quiet", "-q", is_flag=True, help="Suppress verbose output")
 @click.option(
     "--force",
@@ -265,11 +254,9 @@ __pycache__/
 )
 def run(
     spec: str | None,
-    from_db: Path | None,
     output: Path | None,
     model: str,
     max_iterations: int,
-    reingest: bool,
     quiet: bool,
     force: bool,
     reasoning_effort: str | None,
@@ -338,18 +325,10 @@ def run(
     async def _run():
         if needs_llm:
             async with OpenRouterClient(reasoning_effort=reasoning_effort) as client:
-                if from_db is None:
-                    return await workspace.run(
-                        client=client,
-                        model=model,
-                        max_iterations=max_iterations,
-                    )
-                return await workspace.rerun(
-                    source_db=from_db,
+                return await workspace.run(
                     client=client,
                     model=model,
                     max_iterations=max_iterations,
-                    reingest=reingest,
                 )
 
         # SQL-only workspace: don't require OPENROUTER_API_KEY and don't
@@ -361,18 +340,10 @@ def run(
                 self.reasoning_effort = reasoning_effort
 
         client = _ClientStub(reasoning_effort=reasoning_effort)
-        if from_db is None:
-            return await workspace.run(
-                client=client,  # type: ignore[arg-type]
-                model=model,
-                max_iterations=max_iterations,
-            )
-        return await workspace.rerun(
-            source_db=from_db,
+        return await workspace.run(
             client=client,  # type: ignore[arg-type]
             model=model,
             max_iterations=max_iterations,
-            reingest=reingest,
         )
 
     result = asyncio.run(_run())
@@ -517,8 +488,6 @@ def show(target: Path | None, spec: str | None):
         click.echo(f"Created: {meta.get('created_at_utc', '(unknown)')}")
         click.echo(f"Model: {meta.get('llm_model', '(unknown)')}")
         click.echo(f"Mode: {run.get('mode', '(unknown)')}")
-        if run.get("source_db"):
-            click.echo(f"Source: {run.get('source_db')}")
         if spec_m.get("module"):
             click.echo(f"Spec: {spec_m.get('module')}")
 

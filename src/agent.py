@@ -529,8 +529,6 @@ def execute_sql(
 def _build_task_user_message(
     task: Task,
     schema_info: str,
-    existing_views: list[tuple[str, int]] | None = None,
-    validation_errors: list[str] | None = None,
     prompt_override: str | None = None,
 ) -> str:
     """Build the user message for a task-scoped agent.
@@ -538,10 +536,6 @@ def _build_task_user_message(
     Args:
         task: The task spec.
         schema_info: Formatted schema for declared inputs.
-        existing_views: If set, list of (view_name, row_count) for views
-            already in this task's namespace.
-        validation_errors: If set, the errors from validating the existing
-            views against fresh data.
     """
     parts = []
 
@@ -581,29 +575,6 @@ def _build_task_user_message(
         f"{', '.join(task.outputs)} or {task.name}_*"
     )
     parts.append("")
-
-    # Review mode: existing views from previous run
-    if existing_views is not None:
-        parts.append("EXISTING VIEWS FROM PREVIOUS RUN:")
-        parts.append(
-            "This task was run previously and produced the views below. "
-            "Input data has been refreshed. Review the existing results "
-            "and adjust if needed — do not rebuild from scratch."
-        )
-        for view_name, row_count in existing_views:
-            parts.append(f"  - {view_name}: {row_count} rows")
-        parts.append("")
-        if validation_errors:
-            parts.append("VALIDATION FAILURES on existing views:")
-            for e in validation_errors:
-                parts.append(f"  - {e}")
-            parts.append("")
-            parts.append(
-                "Fix the validation errors by adjusting the views. "
-                "Start by inspecting the current results to understand "
-                "what changed in the input data."
-            )
-        parts.append("")
 
     parts.append("Please begin.")
     return "\n".join(parts)
@@ -653,8 +624,6 @@ async def run_task_agent(
     client: OpenRouterClient,
     model: str = "openai/gpt-5.2",
     max_iterations: int = 200,
-    existing_views: list[tuple[str, int]] | None = None,
-    validation_errors: list[str] | None = None,
     prompt_override: str | None = None,
 ) -> AgentResult:
     """Run the agent for a single Task within a shared workspace database.
@@ -670,10 +639,6 @@ async def run_task_agent(
         client: OpenRouterClient (must be in async context).
         model: Model identifier.
         max_iterations: Maximum agent iterations.
-        existing_views: For reruns — list of (view_name, row_count)
-            for views already in this task's namespace.
-        validation_errors: For reruns — errors from validating the
-            existing views against fresh input data.
         prompt_override: Optional replacement for task.repair_context.
     Returns:
         AgentResult with success status, final message, and usage stats.
@@ -690,8 +655,6 @@ async def run_task_agent(
     user_message = _build_task_user_message(
         task,
         schema_info,
-        existing_views=existing_views,
-        validation_errors=validation_errors,
         prompt_override=prompt_override,
     )
 

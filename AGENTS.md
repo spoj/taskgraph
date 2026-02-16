@@ -61,7 +61,6 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 - **DAG is static** — declared upfront, deps resolved from output->input edges. Each task starts as soon as all its dependencies complete (greedy scheduling, not layer-by-layer). Layers still computed for display via `resolve_dag()`.
 - **Failure isolation** — a failed task only blocks its downstream dependents, not the entire layer. Unrelated branches continue.
 - **Result size cap** — SELECT results exceeding 30k chars (~20k tokens) are rejected with an error nudging the agent to use LIMIT. Configurable via `max_result_chars` on `execute_sql()`.
- - **Start from existing DB** — `taskgraph run --spec ... --from-db prev.db -o new.db` copies a previous run's db and re-runs tasks; `--reingest` refreshes inputs.
 - (removed) Workspace fingerprint / compatibility gating.
 - **SQL trace** in _trace table with task column for per-task filtering
 - **Per-task metadata** in _task_meta table (composite PK: task + key)
@@ -69,19 +68,6 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 - **Concurrency**: asyncio cooperative — true parallelism only at LLM API call level, DuckDB access naturally serialized on single thread
 - **DuckDB ingestion** uses native DataFrame scan (`CREATE TABLE AS SELECT ... FROM df`) — no row-by-row executemany
 - **DuckDB views filter** — always use `internal = false` to exclude system catalog views
-
-## Start From An Existing DB
-
-```bash
-# January: fresh run
-taskgraph run --spec my_app.specs.jan -o jan.db
-
-# Edit spec module and commit changes
-git commit -am "feb spec"
-
-# February: start from Jan db, fresh ingest
-taskgraph run --spec my_app.specs.feb -o feb.db --from-db jan.db --reingest
-```
 
 ## Robustness Features
 
@@ -98,7 +84,6 @@ Shorthand commands via [just](https://github.com/casey/just). All `recon` comman
 | Command | Expands to |
 |---------|-----------|
 | `just run <args>` | `uv run taskgraph run <args>` |
-| `just rerun <args>` | (removed) |
 | `just show <args>` | `uv run taskgraph show <args>` |
 | `just extract-spec <args>` | (removed) |
 | `just inspect-xlsx <file> [sheet] [range]` | `uv run python scripts/inspect_xlsx.py <file> [sheet] [range]` |
@@ -114,12 +99,6 @@ Run a workspace spec: ingest inputs, resolve DAG, execute tasks, run exports.
 ```
 just run --spec tests.single_task -o output.db
 just run --spec tests.diamond_dag -o output.db -m anthropic/claude-sonnet-4 --reasoning-effort medium
-```
-
-### Start From An Existing DB
-```
-just run --spec my_app.specs.main --from-db previous.db -o new.db
-just run --spec my_app.specs.main --from-db previous.db -o new.db --reingest
 ```
 
 ### `taskgraph show`

@@ -49,20 +49,6 @@ When `--spec` is not provided, Taskgraph looks for:
 - `[tool.taskgraph].spec` in `pyproject.toml`, otherwise
 - `specs.main` (only if `specs/main.py` exists)
 
-## Start From An Existing DB
-
-Use `--from-db` to start from an existing workspace `.db` (it is copied to the output path), then re-run every task.
-
-```bash
-uv run taskgraph run --spec my_app.specs.main --from-db previous.db -o new.db
-
-# Re-ingest inputs (fresh data)
-uv run taskgraph run --spec my_app.specs.main --from-db previous.db -o new.db --reingest
-
-# Month-to-month workflow: swap spec module (fresh ingest)
-uv run taskgraph run --spec my_app.specs.feb --from-db jan.db -o feb.db --reingest
-```
-
 ## Docs
 
-- `SPEC_GUIDE.md` (spec writers): how to build spec packages, write good tasks, validation, exports, and reruns
+- `SPEC_GUIDE.md` (spec writers): how to build spec packages, write good tasks, validation, and exports

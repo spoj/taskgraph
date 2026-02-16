@@ -7,8 +7,8 @@ A workspace is a single DuckDB database containing:
  - Optional spec source (for audit)
 
   The .db file stores repair contexts and all data.
- Spec source may be stored for audit, but reruns are driven by the
- spec module reference captured in workspace metadata.
+  Spec source may be stored for audit, using the spec module reference
+  captured in workspace metadata.
 
 Tasks are scheduled greedily: each task starts as soon as all its
 dependencies complete (not layer-by-layer). A failed task only blocks
@@ -26,16 +26,13 @@ Usage:
     # Fresh run from spec
     results = await workspace.run(client, model="openai/gpt-5.2")
 
-    # Start from a previous .db (optional re-ingest)
-    results = await workspace.rerun(
-        source_db="previous.db", client=client, model="openai/gpt-5.2",
-    )
+    # Fresh run from spec
+    results = await workspace.run(client, model="openai/gpt-5.2")
 """
 
 import asyncio
 import json
 import logging
-import shutil
 import duckdb
 import time
 import sys
@@ -68,14 +65,13 @@ def persist_workspace_meta(
     reasoning_effort: str | None = None,
     max_iterations: int | None = None,
     input_row_counts: dict[str, int] | None = None,
-    source_db: str | None = None,
     spec_module: str | None = None,
 ) -> None:
     """Write workspace-level metadata to _workspace_meta.
 
     Contract: store enough information to make a workspace:
     - auditable (what was asked, what ran, when, with which runtime/model)
-    - rerunnable (spec identity)
+    - reproducible (spec identity)
     - debuggable (inputs overview + run parameters)
 
     Values are stored as strings. Most complex values are JSON.
@@ -134,11 +130,7 @@ def persist_workspace_meta(
         rows.append(("inputs_row_counts", json.dumps(input_row_counts, sort_keys=True)))
         rows.append(("inputs_schema", json.dumps(input_schemas, sort_keys=True)))
 
-    run_context: dict[str, Any] = {
-        "mode": "rerun" if source_db else "run",
-    }
-    if source_db:
-        run_context["source_db"] = source_db
+    run_context: dict[str, Any] = {"mode": "run"}
     rows.append(("run", json.dumps(run_context, sort_keys=True)))
 
     spec: dict[str, Any] = {}
@@ -416,8 +408,6 @@ class Workspace:
         client: OpenRouterClient,
         model: str,
         max_iterations: int,
-        existing_views: list[tuple[str, int]] | None = None,
-        validation_errors: list[str] | None = None,
     ) -> AgentResult:
         """Execute a single task (SQL or LLM) and return its result."""
         mode = task.run_mode()
@@ -444,8 +434,6 @@ class Workspace:
                             client=client,
                             model=model,
                             max_iterations=max_iterations,
-                            existing_views=existing_views,
-                            validation_errors=validation_errors,
                             prompt_override=repair_prompt,
                         )
                 return result
@@ -460,8 +448,6 @@ class Workspace:
                 client=client,
                 model=model,
                 max_iterations=max_iterations,
-                existing_views=existing_views,
-                validation_errors=validation_errors,
                 prompt_override=repair_prompt,
             )
 
@@ -569,184 +555,6 @@ class Workspace:
 
         status = "ALL PASSED" if all_success else "SOME FAILED"
         log.info("--- Workspace complete: %s (%.1fs) ---", status, elapsed_s)
-        for name, result in task_results.items():
-            s = "PASS" if result.success else "FAIL"
-            tokens = result.usage["prompt_tokens"] + result.usage["completion_tokens"]
-            log.info(
-                "  %s: %s (%d iters, %d tools, %d tokens)",
-                name,
-                s,
-                result.iterations,
-                result.tool_calls_count,
-                tokens,
-            )
-
-        return WorkspaceResult(
-            success=all_success and not export_errors,
-            task_results=task_results,
-            elapsed_s=elapsed_s,
-            dag_layers=dag_layer_names,
-            export_errors=export_errors,
-        )
-
-    @staticmethod
-    def _get_task_views(
-        conn: duckdb.DuckDBPyConnection, task: Task
-    ) -> list[tuple[str, int]]:
-        """Get existing views in a task's namespace with row counts.
-
-        Returns list of (view_name, row_count) for views matching the
-        task's declared outputs or namespace prefix.
-        """
-        all_views = [
-            row[0]
-            for row in conn.execute(
-                "SELECT view_name FROM duckdb_views() WHERE internal = false"
-            ).fetchall()
-        ]
-        task_views = [
-            v for v in all_views if v in task.outputs or v.startswith(f"{task.name}_")
-        ]
-        result = []
-        for v in sorted(task_views):
-            try:
-                row = conn.execute(f'SELECT COUNT(*) FROM "{v}"').fetchone()
-                if row is None:
-                    count = -1
-                else:
-                    count = int(row[0])
-            except duckdb.Error:
-                count = -1  # View exists but is broken
-            result.append((v, count))
-        return result
-
-    async def rerun(
-        self,
-        source_db: Path | str,
-        client: OpenRouterClient,
-        model: str = "openai/gpt-5.2",
-        max_iterations: int = 200,
-        reingest: bool = False,
-    ) -> WorkspaceResult:
-        """Rerun workspace using a previous .db as the starting point.
-
-        This is the "simple, predictable" rerun mode:
-        - Copy the source db to the output path
-        - Optionally re-ingest fresh input tables (reingest=True)
-        - ALWAYS invoke agents for every task (recreates/updates views)
-
-        Rerun does not attempt structural compatibility checks or
-        validation-based skipping.
-        """
-
-        start_time = time.time()
-        self._validate_config()
-
-        layers = resolve_dag(self.tasks)
-        dag_layer_names = [[t.name for t in layer] for layer in layers]
-
-        source_db = Path(source_db)
-        if not source_db.exists():
-            raise ValueError(f"Source db not found: {source_db}")
-
-        # Copy source to output path
-        db_path = Path(self.db_path)
-        if db_path.exists():
-            db_path.unlink()
-        shutil.copy2(source_db, db_path)
-        conn = duckdb.connect(str(db_path))
-
-        log.info("Source: %s", source_db)
-
-        if reingest:
-            log.info("Re-ingesting %d input(s)...", len(self.inputs))
-            input_row_counts = self._ingest_all(conn)
-        else:
-            log.info("Reusing existing input tables from source db")
-            input_row_counts = {}
-            for table_name in self.inputs:
-                try:
-                    row = conn.execute(
-                        f'SELECT COUNT(*) FROM "{table_name}"'
-                    ).fetchone()
-                    input_row_counts[table_name] = row[0] if row else 0
-                except duckdb.Error:
-                    input_row_counts[table_name] = 0
-
-        # Update workspace metadata for this run
-        persist_workspace_meta(
-            conn,
-            model,
-            tasks=self.tasks,
-            reasoning_effort=client.reasoning_effort,
-            max_iterations=max_iterations,
-            input_row_counts=input_row_counts,
-            source_db=str(source_db),
-            spec_module=self.spec_module,
-        )
-
-        # Validate inputs only when re-ingesting
-        if reingest and (self.input_columns or self.input_validate_sql):
-            log.info("Validating inputs...")
-            input_errors = self._validate_inputs(conn)
-            if input_errors:
-                conn.close()
-                raise ValueError(
-                    "Input validation failed:\n"
-                    + "\n".join(f"  - {e}" for e in input_errors)
-                )
-
-        async def run_one(task: Task) -> tuple[str, AgentResult]:
-            errors = task.validate(conn)
-            if errors:
-                log.info("[%s] Pre-run validation: %d issue(s)", task.name, len(errors))
-
-            existing = self._get_task_views(conn, task)
-            result = await self._execute_task(
-                conn=conn,
-                task=task,
-                client=client,
-                model=model,
-                max_iterations=max_iterations,
-                existing_views=existing,
-                validation_errors=errors if errors else None,
-            )
-            return task.name, result
-
-        task_results, all_success = await self._run_task_dag(self.tasks, run_one)
-
-        # Exports
-        export_errors: dict[str, str] = {}
-        if all_success and self.exports:
-            log.info("--- Exports (%d) ---", len(self.exports))
-            export_errors = self._run_exports(conn)
-
-        # Persist export results for later inspection
-        if self.exports:
-            results: dict[str, dict[str, Any]] = {}
-            for name in sorted(self.exports.keys()):
-                if name in export_errors:
-                    results[name] = {"ok": False, "error": export_errors[name]}
-                else:
-                    results[name] = {"ok": bool(all_success), "error": None}
-            exports_meta = {
-                "attempted": bool(all_success),
-                "results": results,
-            }
-            upsert_workspace_meta(
-                conn,
-                [("exports", json.dumps(exports_meta, sort_keys=True))],
-            )
-
-        conn.close()
-        elapsed_s = time.time() - start_time
-
-        status = "ALL PASSED" if all_success else "SOME FAILED"
-        log.info(
-            "--- Rerun complete: %s (%.1fs) ---",
-            status,
-            elapsed_s,
-        )
         for name, result in task_results.items():
             s = "PASS" if result.success else "FAIL"
             tokens = result.usage["prompt_tokens"] + result.usage["completion_tokens"]
