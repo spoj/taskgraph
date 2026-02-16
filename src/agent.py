@@ -45,7 +45,8 @@ MAX_RESULT_CHARS = 30_000
 
 # --- System prompt ---
 
-SYSTEM_PROMPT = """You are an agent working on a task within a shared DuckDB workspace.
+SYSTEM_PROMPT = """You are a SQL repair agent working on a failed task within a shared DuckDB workspace.
+Your job is to fix the SQL by creating or replacing the required output views/macros.
 
 DuckDB SQL dialect notes:
 - Quoting: double-quote identifiers ("col"), not backticks. Many keywords are
@@ -74,7 +75,10 @@ DuckDB SQL dialect notes:
 - count(*) FILTER (WHERE cond) — filtered aggregates
 - greatest(), least() — row-level min/max across columns
 - ASOF JOIN — nearest-match on ordered column (e.g. date lookups)
-- To list user views: SELECT * FROM duckdb_views() WHERE internal = false
+- Catalog introspection:
+  SELECT view_name, sql FROM duckdb_views() WHERE internal = false — list views and their SQL
+  SELECT table_name FROM duckdb_tables() — list tables
+  SELECT function_name, macro_definition FROM duckdb_functions() WHERE function_type = 'macro' — list macros
 
 SQL CONSTRAINTS:
 - Only SELECT, SUMMARIZE, CREATE/DROP VIEW, CREATE/DROP MACRO allowed (no tables, no inserts)
@@ -84,6 +88,10 @@ SQL CONSTRAINTS:
 - CREATE MACRO name(args) AS TABLE (SELECT ...) — reusable table-producing function
   Use macros for repeated patterns (e.g. normalization, scoring). They persist in the
   database and can be called from views. Same namespace rules as views.
+
+REPAIR GUIDANCE:
+- You will be given the original SQL and the failure details.
+- Fix outputs using CREATE OR REPLACE VIEW/MACRO; do not create tables.
 
 EFFICIENCY - BATCH YOUR TOOL CALLS:
 - ALWAYS call run_sql multiple times in parallel when queries are independent
@@ -120,7 +128,7 @@ VALIDATION VIEWS (IMPORTANT):
   emit a single 'pass' row with message='ok'.
 
 WORKFLOW:
-  1. Explore the available input tables for your task
+  1. Discover available tables via SQL
   2. Create your required output view(s) using intermediate views as needed
   3. Stop and report when done (validation runs automatically)
 """
@@ -523,63 +531,6 @@ def execute_sql(
             timer.cancel()
 
 
-# --- User message builder ---
-
-
-def _build_task_user_message(
-    task: Task,
-    schema_info: str,
-    prompt_override: str | None = None,
-) -> str:
-    """Build the user message for a task-scoped agent.
-
-    Args:
-        task: The task spec.
-        schema_info: Formatted schema for declared inputs.
-    """
-    parts = []
-
-    parts.append(f"TASK: {task.name}")
-    parts.append("")
-    prompt_text = task.repair_context if prompt_override is None else prompt_override
-    parts.append(prompt_text)
-    parts.append("")
-
-    parts.append("AVAILABLE TABLES:")
-    parts.append(schema_info)
-    parts.append("")
-
-    parts.append(f"REQUIRED OUTPUTS: {', '.join(task.outputs)}")
-    parts.append(f"You must create these views: {', '.join(task.outputs)}")
-    parts.append("")
-
-    # Validation view UX hint
-    val_outputs = validation_outputs(task)
-    if val_outputs:
-        parts.append("VALIDATION VIEWS:")
-        parts.append(
-            "Outputs matching '{task}__validation' or '{task}__validation_*' are enforced. "
-            "They must have columns: status, message (status in pass|warn|fail)."
-        )
-        for v in val_outputs:
-            parts.append(f"  - {v}")
-        parts.append("")
-
-    parts.append("VIEW NAMING:")
-    parts.append(
-        f"- For intermediate work, use prefix '{task.name}_' "
-        f"(e.g. {task.name}_step1, {task.name}_matched)"
-    )
-    parts.append(
-        f"- You may only CREATE/DROP views named: "
-        f"{', '.join(task.outputs)} or {task.name}_*"
-    )
-    parts.append("")
-
-    parts.append("Please begin.")
-    return "\n".join(parts)
-
-
 def build_sql_repair_prompt(task: Task, issue: str) -> str:
     """Build a prompt to repair a failed SQL task using the LLM."""
     statements = task.sql_statements()
@@ -590,28 +541,87 @@ def build_sql_repair_prompt(task: Task, issue: str) -> str:
         sql_block_lines.append("")
     sql_block = "\n".join(sql_block_lines).rstrip()
 
+    issue_text = _summarize_validation_issue(issue)
+
+    has_column_rules = bool(task.output_columns)
+    required_outputs: list[str] = []
+    for view_name in task.outputs:
+        cols = task.output_columns.get(view_name, [])
+        if cols:
+            required_outputs.append(f"- {view_name}: {', '.join(cols)}")
+        elif has_column_rules:
+            required_outputs.append(f"- {view_name}: (no required columns)")
+        else:
+            required_outputs.append(f"- {view_name}")
+    if not required_outputs:
+        required_outputs.append("(none)")
+
+    val_outputs = validation_outputs(task)
+    validation_lines: list[str] = []
+    if val_outputs:
+        validation_lines.append("VALIDATION VIEWS:")
+        validation_lines.append(
+            "Outputs matching '{task}__validation' or '{task}__validation_*' are enforced. "
+            "They must have columns: status, message (status in pass|warn|fail)."
+        )
+        for v in val_outputs:
+            validation_lines.append(f"- {v}")
+        validation_lines.append("")
+
+    view_naming_lines = [
+        "VIEW NAMING:",
+        f"- For intermediate work, use prefix '{task.name}_' (e.g. {task.name}_step1)",
+        f"- You may only CREATE/DROP views named: {', '.join(task.outputs)} or {task.name}_*",
+        "",
+    ]
+
     parts = [
-        "SQL REPAIR MODE",
+        f"TASK: {task.name}",
+        "You will help repair a failed SQL task.",
         "Fix the SQL and repair the views.",
         "",
-        "OBJECTIVE:",
+        "ISSUE:",
+        issue_text or "(no issue details)",
+        "",
+        "REQUIRED OUTPUTS (with required columns if specified):",
+        *required_outputs,
+        "",
+        "REPAIR CONTEXT:",
         task.repair_context or "(no repair context provided)",
         "",
-        "ORIGINAL SQL:",
+        "ORIGINAL SQL (before repair):",
         "```sql",
-        sql_block,
+        sql_block or "-- (no statements provided)",
         "```",
         "",
-        "ISSUE:",
-        issue or "(no issue details)",
-        "",
-        "INSTRUCTIONS:",
-        "- Use CREATE OR REPLACE VIEW/MACRO to fix outputs.",
-        "- Keep required output view names unchanged.",
-        "- Minimize changes; only add intermediate views with the task prefix.",
-        "- You may SELECT with LIMIT to inspect data if needed.",
+        *validation_lines,
+        *view_naming_lines,
+        "Use SQL on duckdb_tables and duckdb_views to discover tables and views.",
     ]
     return "\n".join(parts)
+
+
+def _summarize_validation_issue(issue: str) -> str:
+    """Summarize validation warnings/failures to view references."""
+    issue_text = (issue or "").strip()
+    if not issue_text:
+        return ""
+
+    warning_views = re.findall(r"Warnings via '([^']+)'", issue_text)
+    if issue_text.startswith("Warnings:") and warning_views:
+        seen: set[str] = set()
+        ordered = [v for v in warning_views if not (v in seen or seen.add(v))]
+        targets = ", ".join(f"`{v}`" for v in ordered)
+        return f"Validation warnings in {targets}; refer to view for details."
+
+    error_views = re.findall(r"Validation failed via '([^']+)'", issue_text)
+    if error_views:
+        seen: set[str] = set()
+        ordered = [v for v in error_views if not (v in seen or seen.add(v))]
+        targets = ", ".join(f"`{v}`" for v in ordered)
+        return f"Validation errors in {targets}; refer to view for details."
+
+    return issue_text
 
 
 # --- Agent entry point ---
@@ -620,11 +630,10 @@ def build_sql_repair_prompt(task: Task, issue: str) -> str:
 async def run_task_agent(
     conn: duckdb.DuckDBPyConnection,
     task: Task,
-    schema_info: str,
     client: OpenRouterClient,
     model: str = "openai/gpt-5.2",
     max_iterations: int = 200,
-    prompt_override: str | None = None,
+    issue: str = "",
 ) -> AgentResult:
     """Run the agent for a single Task within a shared workspace database.
 
@@ -635,11 +644,10 @@ async def run_task_agent(
     Args:
         conn: DuckDB connection (shared workspace database).
         task: Task specification.
-        schema_info: Formatted string describing available tables.
+        issue: Failure detail or warning summary for repair context.
         client: OpenRouterClient (must be in async context).
         model: Model identifier.
         max_iterations: Maximum agent iterations.
-        prompt_override: Optional replacement for task.repair_context.
     Returns:
         AgentResult with success status, final message, and usage stats.
     """
@@ -652,11 +660,7 @@ async def run_task_agent(
     namespace = task.name
 
     # Build messages
-    user_message = _build_task_user_message(
-        task,
-        schema_info,
-        prompt_override=prompt_override,
-    )
+    user_message = build_sql_repair_prompt(task, issue)
 
     initial_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},

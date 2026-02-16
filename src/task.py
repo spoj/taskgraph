@@ -186,41 +186,34 @@ class Task:
             return []
 
         errors: list[str] = []
-        total_msgs = 0
-        max_msgs = 50
 
         for view_name in views:
-            remaining = max_msgs - total_msgs
-            view_errors, msg_count, fatal = self._validate_one_validation_view(
-                conn, view_name, remaining
-            )
+            view_errors, fatal = self._validate_one_validation_view(conn, view_name)
             if fatal and view_errors:
                 return view_errors
 
             if view_errors:
                 errors.extend(view_errors)
-                total_msgs += msg_count
-                if total_msgs >= max_msgs:
-                    break
 
         return errors
 
     def validation_warnings(
-        self, conn: duckdb.DuckDBPyConnection, limit: int = 50
+        self, conn: duckdb.DuckDBPyConnection, limit: int | None = None
     ) -> list[str]:
         """Return warning messages from validation views.
 
         Assumes validation views exist and are well-formed.
+        Pass limit=None for no truncation.
         """
         views = validation_outputs(self)
         if not views:
             return []
 
         warnings: list[str] = []
-        remaining = max(1, limit)
+        remaining = None if limit is None else max(1, limit)
 
         for view_name in views:
-            if remaining <= 0:
+            if remaining is not None and remaining <= 0:
                 break
 
             try:
@@ -242,15 +235,18 @@ class Task:
 
             try:
                 if has_evidence_view:
-                    rows = conn.execute(
+                    query = (
                         f'SELECT status, message, evidence_view FROM "{view_name}" '
-                        f"WHERE lower(status) = 'warn' LIMIT {remaining}"
-                    ).fetchall()
+                        "WHERE lower(status) = 'warn'"
+                    )
                 else:
-                    rows = conn.execute(
+                    query = (
                         f'SELECT status, message FROM "{view_name}" '
-                        f"WHERE lower(status) = 'warn' LIMIT {remaining}"
-                    ).fetchall()
+                        "WHERE lower(status) = 'warn'"
+                    )
+                if remaining is not None:
+                    query += f" LIMIT {remaining}"
+                rows = conn.execute(query).fetchall()
             except duckdb.Error:
                 continue
 
@@ -269,22 +265,19 @@ class Task:
                 if evidence_views:
                     header += f" evidence_view={', '.join(sorted(evidence_views))}"
                 warnings.extend([header] + msgs)
-                remaining -= len(msgs)
+                if remaining is not None:
+                    remaining -= len(msgs)
 
         return warnings
 
     def _validate_one_validation_view(
-        self, conn: duckdb.DuckDBPyConnection, view_name: str, remaining: int
-    ) -> tuple[list[str], int, bool]:
+        self, conn: duckdb.DuckDBPyConnection, view_name: str
+    ) -> tuple[list[str], bool]:
         """Validate a single validation view.
 
-        Returns (errors, message_count, fatal).
+        Returns (errors, fatal).
         - fatal=True indicates a schema/query/contract problem that should stop immediately.
-        - message_count counts only fail messages (not headers).
         """
-        if remaining <= 0:
-            remaining = 1
-
         try:
             cols = [
                 row[0]
@@ -296,7 +289,6 @@ class Task:
         except duckdb.Error as e:
             return (
                 [f"Validation view schema check error for '{view_name}': {e}"],
-                0,
                 True,
             )
 
@@ -308,7 +300,6 @@ class Task:
                     f"Validation view '{view_name}' is missing required column(s): "
                     f"{', '.join(missing)}. Actual columns: {', '.join(cols)}"
                 ],
-                0,
                 True,
             )
 
@@ -316,11 +307,10 @@ class Task:
         try:
             bad = conn.execute(
                 f'SELECT DISTINCT lower(status) AS status FROM "{view_name}" '
-                "WHERE status IS NOT NULL AND lower(status) NOT IN ('pass','warn','fail') "
-                "LIMIT 50"
+                "WHERE status IS NOT NULL AND lower(status) NOT IN ('pass','warn','fail')"
             ).fetchall()
         except duckdb.Error as e:
-            return ([f"Validation view query error for '{view_name}': {e}"], 0, True)
+            return ([f"Validation view query error for '{view_name}': {e}"], True)
 
         if bad:
             bad_vals = ", ".join(sorted({str(r[0]) for r in bad}))
@@ -330,7 +320,6 @@ class Task:
                     f"Validation view '{view_name}' has invalid status value(s): {bad_vals}. "
                     f"Allowed: {allowed}"
                 ],
-                0,
                 True,
             )
 
@@ -340,15 +329,15 @@ class Task:
             if has_evidence_view:
                 rows = conn.execute(
                     f'SELECT status, message, evidence_view FROM "{view_name}" '
-                    f"WHERE lower(status) = 'fail' LIMIT {remaining}"
+                    "WHERE lower(status) = 'fail'"
                 ).fetchall()
             else:
                 rows = conn.execute(
                     f'SELECT status, message FROM "{view_name}" '
-                    f"WHERE lower(status) = 'fail' LIMIT {remaining}"
+                    "WHERE lower(status) = 'fail'"
                 ).fetchall()
         except duckdb.Error as e:
-            return ([f"Validation view query error for '{view_name}': {e}"], 0, True)
+            return ([f"Validation view query error for '{view_name}': {e}"], True)
 
         if rows:
             msgs: list[str] = []
@@ -364,9 +353,9 @@ class Task:
             header = f"Validation failed via '{view_name}':"
             if evidence_views:
                 header += f" evidence_view={', '.join(sorted(evidence_views))}"
-            return ([header] + msgs, len(msgs), False)
+            return ([header] + msgs, False)
 
-        return ([], 0, False)
+        return ([], False)
 
 
 def resolve_task_deps(tasks: list[Task]) -> dict[str, set[str]]:

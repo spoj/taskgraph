@@ -44,8 +44,8 @@ from typing import Any, Callable
 
 from .agent_loop import AgentResult
 from .api import OpenRouterClient
-from .ingest import ingest_table, get_schema_info_for_tables
-from .agent import build_sql_repair_prompt, run_task_agent, run_sql_only_task
+from .ingest import ingest_table
+from .agent import run_task_agent, run_sql_only_task
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
 
 log = logging.getLogger(__name__)
@@ -425,30 +425,24 @@ class Workspace:
                             task.name,
                         )
                         issue = "Warnings:\n" + "\n".join(f"- {w}" for w in warnings)
-                        schema_info = get_schema_info_for_tables(conn, task.inputs)
-                        repair_prompt = build_sql_repair_prompt(task, issue)
                         return await run_task_agent(
                             conn=conn,
                             task=task,
-                            schema_info=schema_info,
                             client=client,
                             model=model,
                             max_iterations=max_iterations,
-                            prompt_override=repair_prompt,
+                            issue=issue,
                         )
                 return result
 
             log.warning("[%s] SQL failed; attempting LLM repair", task.name)
-            schema_info = get_schema_info_for_tables(conn, task.inputs)
-            repair_prompt = build_sql_repair_prompt(task, result.final_message)
             return await run_task_agent(
                 conn=conn,
                 task=task,
-                schema_info=schema_info,
                 client=client,
                 model=model,
                 max_iterations=max_iterations,
-                prompt_override=repair_prompt,
+                issue=result.final_message,
             )
 
         raise RuntimeError(f"Unknown task mode: {mode}")
