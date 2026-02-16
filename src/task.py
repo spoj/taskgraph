@@ -52,6 +52,13 @@ def is_validation_view_for_task(view_name: str, task_name: str) -> bool:
     return view_name == prefix or view_name.startswith(prefix + "_")
 
 
+def validation_outputs(task: "Task") -> list[str]:
+    """Return declared validation views for a task (outputs only)."""
+    return sorted(
+        [o for o in task.outputs if is_validation_view_for_task(o, task.name)]
+    )
+
+
 @dataclass
 class Task:
     """A single unit of work in a workspace.
@@ -138,12 +145,6 @@ class Task:
 
         return []
 
-    def _validation_view_outputs(self) -> list[str]:
-        """Return declared validation view outputs for this task."""
-        return sorted(
-            [o for o in self.outputs if is_validation_view_for_task(o, self.name)]
-        )
-
     def _validate_validation_views(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
         """Enforce declared validation view outputs.
 
@@ -153,33 +154,39 @@ class Task:
 
         Any row with lower(status)='fail' fails the task.
         """
-        views = self._validation_view_outputs()
+        views = validation_outputs(self)
         if not views:
             return []
 
-        all_errors: list[str] = []
+        errors: list[str] = []
         total_msgs = 0
         max_msgs = 50
 
         for view_name in views:
-            errs = self._validate_one_validation_view(
-                conn, view_name, max_msgs - total_msgs
+            remaining = max_msgs - total_msgs
+            view_errors, msg_count, fatal = self._validate_one_validation_view(
+                conn, view_name, remaining
             )
-            if errs:
-                # If the first element is a header, keep it; otherwise add one.
-                if not errs[0].startswith("Validation failed via '"):
-                    all_errors.append(f"Validation failed via '{view_name}':")
-                all_errors.extend(errs)
-                # Count only message lines (skip header)
-                total_msgs = min(max_msgs, total_msgs + max(0, len(errs) - 1))
+            if fatal and view_errors:
+                return view_errors
+
+            if view_errors:
+                errors.extend(view_errors)
+                total_msgs += msg_count
                 if total_msgs >= max_msgs:
                     break
 
-        return all_errors
+        return errors
 
     def _validate_one_validation_view(
         self, conn: duckdb.DuckDBPyConnection, view_name: str, remaining: int
-    ) -> list[str]:
+    ) -> tuple[list[str], int, bool]:
+        """Validate a single validation view.
+
+        Returns (errors, message_count, fatal).
+        - fatal=True indicates a schema/query/contract problem that should stop immediately.
+        - message_count counts only fail messages (not headers).
+        """
         if remaining <= 0:
             remaining = 1
 
@@ -192,15 +199,23 @@ class Task:
                 ).fetchall()
             ]
         except duckdb.Error as e:
-            return [f"Validation view schema check error for '{view_name}': {e}"]
+            return (
+                [f"Validation view schema check error for '{view_name}': {e}"],
+                0,
+                True,
+            )
 
         actual = {c.lower() for c in cols}
         missing = [c for c in _VALIDATION_VIEW_REQUIRED_COLS if c not in actual]
         if missing:
-            return [
-                f"Validation view '{view_name}' is missing required column(s): "
-                f"{', '.join(missing)}. Actual columns: {', '.join(cols)}"
-            ]
+            return (
+                [
+                    f"Validation view '{view_name}' is missing required column(s): "
+                    f"{', '.join(missing)}. Actual columns: {', '.join(cols)}"
+                ],
+                0,
+                True,
+            )
 
         # Enforce status domain
         try:
@@ -210,15 +225,19 @@ class Task:
                 "LIMIT 50"
             ).fetchall()
         except duckdb.Error as e:
-            return [f"Validation view query error for '{view_name}': {e}"]
+            return ([f"Validation view query error for '{view_name}': {e}"], 0, True)
 
         if bad:
             bad_vals = ", ".join(sorted({str(r[0]) for r in bad}))
             allowed = ", ".join(sorted(_VALIDATION_STATUS_ALLOWED))
-            return [
-                f"Validation view '{view_name}' has invalid status value(s): {bad_vals}. "
-                f"Allowed: {allowed}"
-            ]
+            return (
+                [
+                    f"Validation view '{view_name}' has invalid status value(s): {bad_vals}. "
+                    f"Allowed: {allowed}"
+                ],
+                0,
+                True,
+            )
 
         has_evidence_view = "evidence_view" in actual
 
@@ -234,7 +253,7 @@ class Task:
                     f"WHERE lower(status) = 'fail' LIMIT {remaining}"
                 ).fetchall()
         except duckdb.Error as e:
-            return [f"Validation view query error for '{view_name}': {e}"]
+            return ([f"Validation view query error for '{view_name}': {e}"], 0, True)
 
         if rows:
             msgs: list[str] = []
@@ -250,9 +269,9 @@ class Task:
             header = f"Validation failed via '{view_name}':"
             if evidence_views:
                 header += f" evidence_view={', '.join(sorted(evidence_views))}"
-            return [header] + msgs
+            return ([header] + msgs, len(msgs), False)
 
-        return []
+        return ([], 0, False)
 
 
 def resolve_task_deps(tasks: list[Task]) -> dict[str, set[str]]:

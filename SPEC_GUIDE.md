@@ -285,6 +285,8 @@ The agent has a single tool: `run_sql`. It can execute:
 | `DROP MACRO` | Yes | Yes |
 | Everything else | **No** | — |
 
+Deterministic `sql` tasks are more restrictive: they may only execute `CREATE/DROP VIEW` and `CREATE/DROP MACRO` statements (no standalone `SELECT`).
+
 The agent can call `run_sql` multiple times in parallel within a single turn.
 
 ### DuckDB features available to the agent

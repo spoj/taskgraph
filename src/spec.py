@@ -80,7 +80,6 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
         if isinstance(t, dict):
             t = dict(t)  # shallow copy to avoid mutating the original
             task_name = t.get("name", "")
-            task_type = t.get("task_type") or t.get("type")
 
             if "prompt" in t and not isinstance(t["prompt"], str):
                 raise ValueError(
@@ -126,11 +125,6 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
                     f"Task '{task_name}' must specify exactly one of 'sql' or 'prompt'"
                 )
 
-            # Back-compat: if task declares type=sql but provides no sql, fail.
-            if task_type == "sql" and not sql_statements:
-                raise ValueError(
-                    f"Task '{task_name}' declares type=sql but has no sql statements"
-                )
             tasks.append(Task(**t))
         elif isinstance(t, Task):
             tasks.append(t)

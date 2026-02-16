@@ -1,21 +1,21 @@
 # Taskgraph
 
-Taskgraph runs LLM agents against your data, but instead of generating code files it writes auditable DuckDB SQL views into a single workspace database.
+Taskgraph runs tasks against your data (LLM-driven or deterministic SQL), but instead of generating code files it writes auditable DuckDB SQL views into a single workspace database.
 
 You define a "workspace spec" (a Python module) that declares:
 - `INPUTS`: how to load data into DuckDB tables
-- `TASKS`: a DAG of LLM tasks; each task produces one or more SQL views
+- `TASKS`: a DAG of tasks; each task runs either via `prompt` (LLM) or `sql` (deterministic) and produces one or more SQL views
 - `EXPORTS` (optional): functions that materialize reports (CSV/XLSX/etc.) from the finished workspace
 
 The result is one portable `.db` file containing the raw inputs, all agent-created views, validation results, and an execution trace.
 
 ```
-spec module -> ingest -> DAG -> agents (concurrent) -> validate -> export -> output.db
+spec module -> ingest -> DAG -> tasks (concurrent) -> validate -> export -> output.db
 ```
 
 ## What Problem It Solves
 
-- **Reproducible, reviewable LLM work**: outputs are SQL view definitions stored in the database.
+- **Reproducible, reviewable work**: outputs are SQL view definitions stored in the database.
 - **Strong guardrails**: agents can only `CREATE VIEW`/`CREATE MACRO` (no tables, no inserts) and are namespace-restricted per task.
 - **Fast iteration**: views are late-binding; tweak upstream logic and downstream results update automatically.
 

@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.api import OpenRouterClient
 from src.spec import load_spec_from_module, resolve_module_path
 from src.workspace import Workspace, read_workspace_meta
-from src.task import resolve_dag, validate_task_graph
+from src.task import resolve_dag, validate_task_graph, validation_outputs
 
 log = logging.getLogger(__name__)
 
@@ -490,7 +490,7 @@ def show(target: Path | None, spec: str | None):
             else:
                 prefix = "    "
 
-            kind = "sql" if getattr(t, "sql", None) else "prompt"
+            kind = t.run_mode()
             click.echo(f"{prefix}type: {kind}")
 
             # Inputs — mark external (base table) vs task-produced
@@ -525,11 +525,7 @@ def show(target: Path | None, spec: str | None):
         if t.output_columns:
             n_schemas = len(t.output_columns)
             parts.append(f"{n_schemas} output schema{'s' if n_schemas > 1 else ''}")
-        n_val = sum(
-            1
-            for o in t.outputs
-            if o == f"{t.name}__validation" or o.startswith(f"{t.name}__validation_")
-        )
+        n_val = len(validation_outputs(t))
         if n_val:
             parts.append(f"{n_val} validation view{'s' if n_val > 1 else ''}")
         if parts:

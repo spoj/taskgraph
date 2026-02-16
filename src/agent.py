@@ -16,7 +16,7 @@ import uuid
 from typing import Any, cast
 from .agent_loop import run_agent_loop, AgentResult
 from .api import OpenRouterClient, create_model_callable
-from .task import Task
+from .task import Task, validation_outputs
 
 log = logging.getLogger(__name__)
 
@@ -558,11 +558,7 @@ def _build_task_user_message(
     parts.append("")
 
     # Validation view UX hint
-    val_outputs = [
-        o
-        for o in task.outputs
-        if o == f"{task.name}__validation" or o.startswith(f"{task.name}__validation_")
-    ]
+    val_outputs = validation_outputs(task)
     if val_outputs:
         parts.append("VALIDATION VIEWS:")
         parts.append(
