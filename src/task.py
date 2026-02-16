@@ -12,14 +12,14 @@ Example:
             name="prep",
             inputs=["raw_rows"],
             outputs=["rows_clean"],
-            repair_context="Clean and normalize raw rows...",
+            intent="Clean and normalize raw rows...",
             sql="CREATE OR REPLACE VIEW rows_clean AS SELECT ...",
         ),
         Task(
             name="match",
             inputs=["rows_clean", "reference"],
             outputs=["matches", "match_summary", "match__validation"],
-            repair_context="Match normalized rows against a reference table...",
+            intent="Match normalized rows against a reference table...",
             sql="CREATE OR REPLACE VIEW matches AS SELECT ...",
             # Create a view named 'match__validation' with status/message rows.
         ),
@@ -76,7 +76,7 @@ class Task:
             task to fail.
         output_columns: Optional schema check. Maps view_name -> list of required column
             names. Validation fails if a view is missing any declared column.
-        repair_context: Objective text used when repairing failed SQL tasks.
+        intent: Objective text used when repairing failed SQL tasks.
         repair_on_warn: If True, warnings in validation views trigger LLM repair.
     """
 
@@ -94,7 +94,7 @@ class Task:
     sql_strict: str = ""
 
     # Objective for repair mode when sql fails.
-    repair_context: str = ""
+    intent: str = ""
 
     # If True, validation warnings trigger LLM repair.
     repair_on_warn: bool = False

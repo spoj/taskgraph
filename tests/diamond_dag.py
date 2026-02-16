@@ -119,7 +119,7 @@ INPUTS = {
 
 prep = {
     "name": "prep",
-    "repair_context": (
+    "intent": (
         "Split the transactions table into two views based on the 'type' column:\n"
         "- 'prepared_sales': rows where type='sale', with columns: id, date, product, amount, region\n"
         "- 'prepared_costs': rows where type='cost', with columns: id, date, product, category, amount, region\n"
@@ -145,7 +145,7 @@ prep = {
 
 sales = {
     "name": "sales",
-    "repair_context": (
+    "intent": (
         "Summarize sales by product. Create a view 'sales_summary' with columns:\n"
         "- product: product name\n"
         "- total_sales: sum of amount\n"
@@ -169,7 +169,7 @@ sales = {
 
 costs = {
     "name": "costs",
-    "repair_context": (
+    "intent": (
         "Summarize costs by product. Create a view 'costs_summary' with columns:\n"
         "- product: product name\n"
         "- total_costs: sum of amount\n"
@@ -195,7 +195,7 @@ costs = {
 
 report = {
     "name": "report",
-    "repair_context": (
+    "intent": (
         "Create a profit report combining sales and costs. Create a view 'profit_report' with columns:\n"
         "- product: product name\n"
         "- total_sales: from sales_summary\n"

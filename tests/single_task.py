@@ -28,7 +28,7 @@ INPUTS = {
 TASKS = [
     {
         "name": "summarize",
-        "repair_context": (
+        "intent": (
             "Summarize employees by department. Create a view 'department_summary' with:\n"
             "- department: department name\n"
             "- headcount: number of employees\n"

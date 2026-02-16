@@ -170,7 +170,7 @@ def init(force: bool):
 TASKS = [
     {
         "name": "double",
-        "repair_context": "Create a view 'output' with columns x and x2 (x*2).",
+        "intent": "Create a view 'output' with columns x and x2 (x*2).",
         "sql": "CREATE VIEW output AS SELECT x, x * 2 AS x2 FROM data",
         "inputs": ["data"],
         "outputs": ["output"],
@@ -495,7 +495,7 @@ def show(target: Path | None, spec: str | None):
             for name in sorted(counts.keys()):
                 click.echo(f"  {name}: {counts[name]} rows")
 
-        contexts = _meta_json(meta, "task_repair_contexts")
+        contexts = _meta_json(meta, "task_intents")
         if contexts:
             click.echo(f"\nTasks ({len(contexts)}):")
             for name in sorted(contexts.keys()):

@@ -28,7 +28,7 @@ independent agent writing namespace-enforced SQL views.
 A Python module defining:
 ```python
 INPUTS     = {"table_name": callable_or_data, ...}  # callable returns DataFrame/list[dict]/dict[str,list]
-TASKS      = [{"name": ..., "repair_context": ..., "sql": ..., "inputs": [...], "outputs": [...]}, ...]  # or sql_strict
+TASKS      = [{"name": ..., "intent": ..., "sql": ..., "inputs": [...], "outputs": [...]}, ...]  # or sql_strict
 EXPORTS    = {"report.xlsx": fn(conn, path), ...}     # optional export functions
 ```
 
@@ -47,7 +47,7 @@ INPUTS = {
 
 At the `load_spec` boundary, if a value is a dict with a `"data"` key, `columns` and `validate_sql` are extracted per-input and passed to the Workspace as `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]`.
 
-Task `sql` or `sql_strict` must be a **string**. `repair_context` is required for `sql` tasks.
+Task `sql` or `sql_strict` must be a **string**. `intent` is required for `sql` tasks.
 
 **Allowed libraries in spec modules**: stdlib (pathlib, csv, json, etc.), polars, openpyxl.
 No other third-party imports. Spec modules should be pure data + ingestion logic.

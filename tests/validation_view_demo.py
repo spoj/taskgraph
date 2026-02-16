@@ -101,7 +101,7 @@ INPUTS = {
 TASKS = [
     {
         "name": "categorize",
-        "repair_context": (
+        "intent": (
             "Categorize each expense line into a spending category based on the\n"
             "vendor and description. Use these categories:\n"
             "- 'Office' for office supplies, furniture, toner (vendor: Acme Corp)\n"

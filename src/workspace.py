@@ -75,7 +75,7 @@ def persist_workspace_meta(
     """)
     conn.execute("DELETE FROM _workspace_meta")
 
-    task_repair_contexts = {t.name: t.repair_context for t in tasks}
+    task_intents = {t.name: t.intent for t in tasks}
 
     created_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -108,7 +108,7 @@ def persist_workspace_meta(
         ("taskgraph_version", tg_version),
         ("python_version", sys.version.split()[0]),
         ("platform", platform.platform()),
-        ("task_repair_contexts", json.dumps(task_repair_contexts, sort_keys=True)),
+        ("task_intents", json.dumps(task_intents, sort_keys=True)),
         ("llm_model", model),
     ]
 

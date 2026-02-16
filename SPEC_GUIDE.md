@@ -121,7 +121,7 @@ INPUTS = {
 TASKS = [
     {
         "name": "match",
-        "repair_context": (
+        "intent": (
             "Match invoices to payments. Create view 'matches' with columns:\n"
             "- invoice_row_id: invoices._row_id\n"
             "- payment_row_id: payments._row_id\n"
@@ -234,7 +234,7 @@ Each task declares `inputs` and `outputs` (views). Validation is expressed by pr
 TASKS = [
     {
         "name": "match",
-        "repair_context": "...",
+        "intent": "...",
         "sql": "CREATE OR REPLACE VIEW output AS SELECT ...;"
                "CREATE OR REPLACE VIEW match__validation AS SELECT ...",
         "inputs": ["invoices", "payments"],
@@ -260,7 +260,7 @@ TASKS = [
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | `str` | Yes | Unique identifier. Also the namespace prefix for intermediate views. |
-| `repair_context` | `str` | Required for `sql` | Objective text used if LLM repair is triggered. |
+| `intent` | `str` | Required for `sql` | Objective text used if LLM repair is triggered. |
 | `repair_on_warn` | `bool` | No | If true, warnings in validation views trigger LLM repair. Defaults to false. |
 | `sql` | `str` | Exactly one of `sql` or `sql_strict` | Deterministic statements executed directly (views/macros only). Multiple statements are allowed in one string and will be split by DuckDB's parser. On failure, Taskgraph can use the LLM to repair the SQL and retry. |
 | `sql_strict` | `str` | Exactly one of `sql` or `sql_strict` | Deterministic, immutable statements (views/macros only). No LLM repair. |
@@ -291,7 +291,7 @@ The agent receives:
 1. A system prompt describing DuckDB SQL syntax, constraints, and workflow guidance.
 2. A user message containing:
    - The task name and the issue (error message or validation failure summary)
-   - Your `repair_context` text
+   - Your `intent` text
    - The original SQL that failed
    - Required output view names (with expected columns, if declared)
    - Validation view definitions (if any)
@@ -481,21 +481,21 @@ INPUTS = {
 TASKS = [
     {
         "name": "clean_sales",
-        "repair_context": "Normalize sales data...",
+        "intent": "Normalize sales data...",
         "sql": "CREATE OR REPLACE VIEW sales AS SELECT ...",
         "inputs": ["raw_sales"],
         "outputs": ["sales"],
     },
     {
         "name": "clean_costs",
-        "repair_context": "Normalize cost data...",
+        "intent": "Normalize cost data...",
         "sql": "CREATE OR REPLACE VIEW costs AS SELECT ...",
         "inputs": ["raw_costs"],
         "outputs": ["costs"],
     },
     {
         "name": "reconcile",
-        "repair_context": "Match sales to costs...",
+        "intent": "Match sales to costs...",
         "sql": "CREATE OR REPLACE VIEW output AS SELECT ...",
         "inputs": ["sales", "costs"],
         "outputs": ["output"],
@@ -578,7 +578,7 @@ SELECT key, value FROM _workspace_meta
 Keys (v2):
 - `meta_version`
 - `created_at_utc`
-- `task_repair_contexts`
+- `task_intents`
 - `llm_model`, `llm_reasoning_effort`, `llm_max_iterations`
 - `inputs_row_counts`, `inputs_schema`
 - `run` (JSON: run context)
@@ -592,7 +592,7 @@ To make outputs self-documenting, require provenance columns in `output_columns`
 TASKS = [
     {
         "name": "match",
-        "repair_context": "... Include a match_reason column explaining why each pair was matched ...",
+        "intent": "... Include a match_reason column explaining why each pair was matched ...",
         "sql": "CREATE OR REPLACE VIEW output AS SELECT ...",
         "inputs": ["invoices", "payments"],
         "outputs": ["output"],
@@ -603,17 +603,23 @@ TASKS = [
 ]
 ```
 
-The agent must produce these columns or validation fails. The repair context should explain what you expect in each column. This gives you per-row audit explanations in the output view itself.
+The agent must produce these columns or validation fails. The intent should explain what you expect in each column. This gives you per-row audit explanations in the output view itself.
 
 ---
 
-## Repair Context Tips
+## Writing Good Intent
 
-The repair context is your objective text for when SQL repair is triggered. Treat it like a contract that guides the LLM to fix broken SQL safely.
+The `intent` field is your objective text for the LLM repair agent. Write it broad-to-specific: start with *why* the task exists, then *how* it works, then the *output contract*.
 
-### Treat repair_context as a contract
+### Three layers
 
-Include (in plain English) all of the things you would put in a code review checklist:
+1. **Business context** (1-2 sentences): Why does this task exist? What business question does it answer? Who uses the output?
+2. **Logic description** (2-4 sentences): The approach in plain English — matching strategy, edge cases, expected data shape.
+3. **Output contract**: View names, required columns, constraints, tolerances.
+
+### Write intent from broad to specific
+
+Include everything you would put in a code review checklist:
 - output view names
 - required columns (and semantics)
 - uniqueness/completeness constraints
@@ -622,13 +628,27 @@ Include (in plain English) all of the things you would put in a code review chec
 
 Then enforce it with `output_columns` and `{task_name}__validation` views.
 
-### Be specific about matching criteria
+### Weak vs strong intent
 
 ```
-BAD:  "Match invoices to payments"
-GOOD: "Match invoices to payments by amount (within 0.01 tolerance) and date
-       (same day). Use vendor name similarity (jaro_winkler > 0.8) as a
-       tiebreaker when multiple payments match the same amount and date."
+WEAK:
+"Match invoices to payments"
+
+STRONG:
+"Finance needs a monthly reconciliation of invoices against bank payments to
+identify unpaid invoices and duplicate payments.
+
+Match invoices to payments by amount (within 0.01 tolerance) and date (same day).
+Use vendor name similarity (jaro_winkler > 0.8) as a tiebreaker when multiple
+payments match the same amount and date. Some invoices will not match — these
+should appear as unmatched rows.
+
+OUTPUT VIEW: matches
+  - invoice_row_id: INTEGER — invoices._row_id
+  - payment_row_id: INTEGER — payments._row_id (NULL if unmatched)
+  - match_reason: VARCHAR — why the pair was matched
+  - match_score: DOUBLE — confidence (0-1)
+Every invoice must appear exactly once."
 ```
 
 ### Explain data semantics
@@ -636,17 +656,6 @@ GOOD: "Match invoices to payments by amount (within 0.01 tolerance) and date
 ```
 NOTE ON SIGNS: Detail amounts have OPPOSITE sign to summary amounts.
 For a correct match: SUM(detail.Amount) + summary.Amount ≈ 0 for each category.
-```
-
-### Specify the output contract precisely
-
-```
-OUTPUT VIEW: output
-Two columns:
-  - left_ids:  INTEGER[] — list of _row_id values from invoices
-  - right_ids: INTEGER[] — list of _row_id values from payments
-Each row is one matched group. Unmatched invoices: right_ids is NULL.
-Every row in both inputs must appear exactly once.
 ```
 
 ### Tell the repair logic about edge cases

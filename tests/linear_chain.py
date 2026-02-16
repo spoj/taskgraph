@@ -61,7 +61,7 @@ INPUTS = {
 
 parse = {
     "name": "parse",
-    "repair_context": (
+    "intent": (
         "Parse the raw_orders table. The 'items' column contains comma-separated\n"
         "entries in the format 'sku:quantity' (e.g. 'widget_a:2,widget_b:1').\n\n"
         "Create a view 'order_lines' with one row per item per order:\n"
@@ -93,7 +93,7 @@ parse = {
 
 enrich = {
     "name": "enrich",
-    "repair_context": (
+    "intent": (
         "Join order_lines with price_list to compute line totals.\n\n"
         "Create a view 'enriched_lines' with all columns from order_lines plus:\n"
         "- unit_price: from the price_list\n"
@@ -115,7 +115,7 @@ enrich = {
 
 aggregate = {
     "name": "aggregate",
-    "repair_context": (
+    "intent": (
         "Create two summary views from enriched_lines:\n\n"
         "1. 'customer_totals' with columns:\n"
         "   - customer\n"

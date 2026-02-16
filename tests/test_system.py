@@ -92,7 +92,7 @@ def _make_task(**kwargs) -> Task:
     """Helper to create a Task with defaults."""
     defaults = {
         "name": "t",
-        "repair_context": "test",
+        "intent": "test",
         "inputs": [],
         "outputs": [],
     }
@@ -1259,53 +1259,53 @@ class TestInputValidation:
 
 
 # ===========================================================================
-# 8. Repair Context Resolution
+# 8. Intent Resolution
 # ===========================================================================
 
 
-class TestRepairContextResolution:
-    """Tests for repair_context handling in spec loading."""
+class TestIntentResolution:
+    """Tests for intent handling in spec loading."""
 
-    def test_string_repair_context_passthrough(self, tmp_path):
-        """Plain string repair_context is accepted in spec loading."""
+    def test_string_intent_passthrough(self, tmp_path):
+        """Plain string intent is accepted in spec loading."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "a", "repair_context": "do the thing", '
+            'TASKS = [{"name": "a", "intent": "do the thing", '
             '"sql": "CREATE VIEW out AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
         result = load_spec_from_module(module_path)
-        assert result["tasks"][0].repair_context == "do the thing"
+        assert result["tasks"][0].intent == "do the thing"
 
-    def test_non_string_repair_context_raises(self, tmp_path):
-        """Non-string repair_context raises ValueError."""
+    def test_non_string_intent_raises(self, tmp_path):
+        """Non-string intent raises ValueError."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "a", "repair_context": 123, '
+            'TASKS = [{"name": "a", "intent": 123, '
             '"sql": "CREATE VIEW out AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
-        with pytest.raises(ValueError, match="repair_context must be a string"):
+        with pytest.raises(ValueError, match="intent must be a string"):
             load_spec_from_module(module_path)
 
-    def test_empty_repair_context_raises(self, tmp_path):
-        """SQL tasks must provide non-empty repair_context."""
+    def test_empty_intent_raises(self, tmp_path):
+        """SQL tasks must provide non-empty intent."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "a", "repair_context": " ", '
+            'TASKS = [{"name": "a", "intent": " ", '
             '"sql": "CREATE VIEW out AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
-        with pytest.raises(ValueError, match="must specify non-empty repair_context"):
+        with pytest.raises(ValueError, match="must specify non-empty intent"):
             load_spec_from_module(module_path)
 
     def test_missing_sql_raises(self, tmp_path):
@@ -1315,7 +1315,7 @@ class TestRepairContextResolution:
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "a", "repair_context": "do it", '
+            'TASKS = [{"name": "a", "intent": "do it", '
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
         with pytest.raises(
@@ -1461,7 +1461,7 @@ class TestLoadSpec:
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"data": [{"x": 1}]}\n'
-            'TASKS = [{"name": "t1", "repair_context": "do it", '
+            'TASKS = [{"name": "t1", "intent": "do it", '
             '"sql": "CREATE VIEW out AS SELECT 1 AS x", '
             '"inputs": ["data"], "outputs": ["out"]}]\n',
         )
@@ -1470,7 +1470,7 @@ class TestLoadSpec:
         assert "data" in result["inputs"]
         assert len(result["tasks"]) == 1
         assert result["tasks"][0].name == "t1"
-        assert result["tasks"][0].repair_context == "do it"
+        assert result["tasks"][0].intent == "do it"
 
     def test_rich_inputs_extracted(self, tmp_path):
         """Rich INPUTS with columns and validate_sql are parsed."""
@@ -1485,7 +1485,7 @@ class TestLoadSpec:
             '        "validate_sql": ["SELECT 1 FROM tbl WHERE a IS NULL"],\n'
             "    }\n"
             "}\n"
-            'TASKS = [{"name": "t", "repair_context": "p", '
+            'TASKS = [{"name": "t", "intent": "p", '
             '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
             '"inputs": ["tbl"], "outputs": ["o"]}]\n',
         )
@@ -1505,7 +1505,7 @@ class TestLoadSpec:
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "t", "repair_context": "p", '
+            'TASKS = [{"name": "t", "intent": "p", '
             '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["o"]}]\n',
         )
@@ -1539,7 +1539,7 @@ class TestLoadSpec:
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": []}\n'
-            'TASKS = [{"name": "t", "repair_context": "p", '
+            'TASKS = [{"name": "t", "intent": "p", '
             '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["o"]}]\n',
         )
@@ -1554,7 +1554,7 @@ class TestLoadSpec:
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": []}\n'
-            'TASKS = [{"name": "t", "repair_context": "p", '
+            'TASKS = [{"name": "t", "intent": "p", '
             '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["o"]}]\n'
             "def my_export(conn, path): pass\n"
@@ -1573,7 +1573,7 @@ class TestLoadSpec:
             tmp_path,
             "from src.task import Task\n"
             'INPUTS = {"t": []}\n'
-            'TASKS = [Task(name="t", repair_context="p", '
+            'TASKS = [Task(name="t", intent="p", '
             'sql="CREATE VIEW o AS SELECT 1 AS x", '
             'inputs=["t"], outputs=["o"])]\n',
         )
@@ -1601,7 +1601,7 @@ class TestLoadSpec:
             tmp_path,
             'def load_data(): return [{"x": 1}]\n'
             'INPUTS = {"t": load_data}\n'
-            'TASKS = [{"name": "t", "repair_context": "p", '
+            'TASKS = [{"name": "t", "intent": "p", '
             '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
             '"inputs": ["t"], "outputs": ["o"]}]\n',
         )
@@ -2130,7 +2130,7 @@ class TestWorkspaceMeta:
 
     def test_roundtrip(self, conn):
         """Write and read workspace metadata."""
-        tasks = [_make_task(name="t", repair_context="test context", outputs=["out"])]
+        tasks = [_make_task(name="t", intent="test context", outputs=["out"])]
         persist_workspace_meta(
             conn,
             model="gpt-5",
@@ -2141,11 +2141,11 @@ class TestWorkspaceMeta:
         assert meta["llm_model"] == "gpt-5"
         assert meta["meta_version"] == "2"
         assert "created_at_utc" in meta
-        assert "task_repair_contexts" in meta
+        assert "task_intents" in meta
         assert "run" in meta
 
-        # Check repair contexts stored correctly
-        contexts = json.loads(meta["task_repair_contexts"])
+        # Check intents stored correctly
+        contexts = json.loads(meta["task_intents"])
         assert contexts["t"] == "test context"
 
         # Check input row counts
@@ -2184,31 +2184,31 @@ class TestWorkspaceMeta:
         assert read_workspace_meta(c) == {}
         c.close()
 
-    def test_full_repair_contexts_stored(self, conn):
-        """Full repair contexts are stored without truncation."""
+    def test_full_intents_stored(self, conn):
+        """Full intents are stored without truncation."""
         long_context = "x" * 1000
-        tasks = [_make_task(name="t", repair_context=long_context, outputs=["out"])]
+        tasks = [_make_task(name="t", intent=long_context, outputs=["out"])]
         persist_workspace_meta(
             conn,
             model="m",
             tasks=tasks,
         )
         meta = read_workspace_meta(conn)
-        contexts = json.loads(meta["task_repair_contexts"])
+        contexts = json.loads(meta["task_intents"])
         assert contexts["t"] == long_context
         assert len(contexts["t"]) == 1000
 
 
 # ===========================================================================
-# Agent repair context
+# Agent intent
 # ===========================================================================
 
 
-class TestAgentRepairContext:
+class TestAgentIntent:
     """Tests for build_sql_repair_prompt — the user message sent to the repair agent."""
 
     def test_basic_structure(self):
-        """Repair prompt has TASK, ISSUE, REQUIRED OUTPUTS, REPAIR CONTEXT, ORIGINAL SQL, ALLOWED VIEWS."""
+        """Repair prompt has TASK, ISSUE, REQUIRED OUTPUTS, INTENT, ORIGINAL SQL, ALLOWED VIEWS."""
         task = _make_task(
             name="match",
             inputs=["data"],
@@ -2221,7 +2221,7 @@ class TestAgentRepairContext:
         assert "some error happened" in msg
         assert "REQUIRED OUTPUTS:" in msg
         assert "- output" in msg
-        assert "REPAIR CONTEXT:" in msg
+        assert "INTENT:" in msg
         assert "ORIGINAL SQL:" in msg
         assert "CREATE OR REPLACE VIEW output AS SELECT * FROM data" in msg
         assert "ALLOWED VIEWS: output or match_*" in msg

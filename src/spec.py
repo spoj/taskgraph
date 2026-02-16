@@ -6,7 +6,7 @@ INPUTS values can be:
 - Simple: callable or raw data
 - Rich: dict with "data" key + optional "columns" and "validate_sql"
 
-Task repair_context values must be strings.
+Task intent values must be strings.
 """
 
 import importlib
@@ -101,11 +101,11 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
                     task_name, t.get("sql_strict", ""), "sql_strict"
                 )
 
-            # repair_context is used only for sql repair mode.
-            if "repair_context" in t and not isinstance(t["repair_context"], str):
+            # intent is used only for sql repair mode.
+            if "intent" in t and not isinstance(t["intent"], str):
                 raise ValueError(
-                    f"Task '{task_name}' repair_context must be a string, "
-                    f"got {type(t['repair_context']).__name__}"
+                    f"Task '{task_name}' intent must be a string, "
+                    f"got {type(t['intent']).__name__}"
                 )
             if "repair_on_warn" in t and not isinstance(t["repair_on_warn"], bool):
                 raise ValueError(f"Task '{task_name}' repair_on_warn must be a bool")
@@ -121,9 +121,9 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
                 raise ValueError(
                     f"Task '{task_name}' must specify exactly one of 'sql' or 'sql_strict'"
                 )
-            if sql_statements and not (t.get("repair_context") or "").strip():
+            if sql_statements and not (t.get("intent") or "").strip():
                 raise ValueError(
-                    f"Task '{task_name}' with 'sql' must specify non-empty repair_context"
+                    f"Task '{task_name}' with 'sql' must specify non-empty intent"
                 )
             if t.get("repair_on_warn") and sql_strict_statements:
                 raise ValueError(
@@ -149,9 +149,9 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
             raise ValueError(
                 f"Task '{t.name}' must specify exactly one of 'sql' or 'sql_strict'"
             )
-        if sql_statements and not (t.repair_context or "").strip():
+        if sql_statements and not (t.intent or "").strip():
             raise ValueError(
-                f"Task '{t.name}' with 'sql' must specify non-empty repair_context"
+                f"Task '{t.name}' with 'sql' must specify non-empty intent"
             )
         if t.repair_on_warn and sql_strict_statements:
             raise ValueError(f"Task '{t.name}' uses repair_on_warn with 'sql_strict'")
