@@ -559,7 +559,7 @@ Keys (v2):
 - `llm_model`, `llm_reasoning_effort`, `llm_max_iterations`
 - `inputs_row_counts`, `inputs_schema`
   - `run` (JSON: run context; may include source_db when starting from an existing db)
-- `spec` (JSON: module/git info)
+- `spec` (JSON: module)
 
 ### Adding provenance columns
 

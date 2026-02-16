@@ -30,7 +30,6 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 from src.api import OpenRouterClient
 from src.spec import load_spec_from_module, resolve_module_path
-from src.spec_repo import get_spec_repo_info
 from src.workspace import Workspace
 
 log = logging.getLogger(__name__)
@@ -142,13 +141,7 @@ async def _execute_run(
 
     try:
         _append_log(state, f"Loading spec: {spec_module}")
-        spec_path = resolve_module_path(spec_module)
-        repo_info = get_spec_repo_info(spec_path)
-        if repo_info.dirty:
-            _append_log(
-                state,
-                f"WARNING: spec repo is dirty ({repo_info.root}); run is not strictly reproducible.",
-            )
+        resolve_module_path(spec_module)
         spec = load_spec_from_module(spec_module)
 
         # Rewrite export paths to use export_dir
@@ -165,9 +158,6 @@ async def _execute_run(
             input_columns=spec.get("input_columns", {}),
             input_validate_sql=spec.get("input_validate_sql", {}),
             spec_module=spec_module,
-            spec_git_commit=repo_info.commit,
-            spec_git_root=str(repo_info.root),
-            spec_git_dirty=repo_info.dirty,
         )
 
         re = reasoning_effort if reasoning_effort != "low" else None

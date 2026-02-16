@@ -70,9 +70,6 @@ def persist_workspace_meta(
     input_row_counts: dict[str, int] | None = None,
     source_db: str | None = None,
     spec_module: str | None = None,
-    spec_git_commit: str | None = None,
-    spec_git_root: str | None = None,
-    spec_git_dirty: bool | None = None,
 ) -> None:
     """Write workspace-level metadata to _workspace_meta.
 
@@ -147,12 +144,6 @@ def persist_workspace_meta(
     spec: dict[str, Any] = {}
     if spec_module:
         spec["module"] = spec_module
-    if spec_git_commit:
-        spec["git_commit"] = spec_git_commit
-    if spec_git_root:
-        spec["git_root"] = spec_git_root
-    if spec_git_dirty is not None:
-        spec["git_dirty"] = bool(spec_git_dirty)
     if spec:
         rows.append(("spec", json.dumps(spec, sort_keys=True)))
 
@@ -224,8 +215,6 @@ class Workspace:
             return zero rows. Checked after ingestion and input_columns,
             before tasks run.
         spec_module: Module path used to load the spec.
-        spec_git_commit: Git commit hash for the spec repo.
-        spec_git_root: Git repo root for the spec module.
     """
 
     db_path: Path | str
@@ -235,9 +224,6 @@ class Workspace:
     input_columns: dict[str, list[str]] = field(default_factory=dict)
     input_validate_sql: dict[str, list[str]] = field(default_factory=dict)
     spec_module: str | None = None
-    spec_git_commit: str | None = None
-    spec_git_root: str | None = None
-    spec_git_dirty: bool | None = None
 
     def _validate_config(self) -> None:
         """Validate the workspace configuration before running."""
@@ -467,9 +453,6 @@ class Workspace:
             max_iterations=max_iterations,
             input_row_counts=input_row_counts,
             spec_module=self.spec_module,
-            spec_git_commit=self.spec_git_commit,
-            spec_git_root=self.spec_git_root,
-            spec_git_dirty=self.spec_git_dirty,
         )
 
         # Validate inputs before running tasks
@@ -644,9 +627,6 @@ class Workspace:
             input_row_counts=input_row_counts,
             source_db=str(source_db),
             spec_module=self.spec_module,
-            spec_git_commit=self.spec_git_commit,
-            spec_git_root=self.spec_git_root,
-            spec_git_dirty=self.spec_git_dirty,
         )
 
         # Validate inputs only when re-ingesting

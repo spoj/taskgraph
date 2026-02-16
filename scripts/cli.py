@@ -40,7 +40,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.api import OpenRouterClient
 from src.spec import load_spec_from_module, resolve_module_path
-from src.spec_repo import get_spec_repo_info
 from src.workspace import Workspace, read_workspace_meta
 from src.task import resolve_dag, validate_task_graph
 
@@ -247,16 +246,9 @@ def run(
 
     # Resolve and validate spec module
     try:
-        spec_path = resolve_module_path(spec)
-        repo_info = get_spec_repo_info(spec_path)
+        resolve_module_path(spec)
     except ValueError as e:
         raise click.ClickException(str(e))
-
-    if repo_info.dirty:
-        click.echo(
-            f"WARNING: spec repo is dirty ({repo_info.root}); run is not strictly reproducible.",
-            err=True,
-        )
 
     # Load workspace spec
     try:
@@ -280,13 +272,9 @@ def run(
         input_columns=loaded["input_columns"],
         input_validate_sql=loaded["input_validate_sql"],
         spec_module=spec,
-        spec_git_commit=repo_info.commit,
-        spec_git_root=str(repo_info.root),
-        spec_git_dirty=repo_info.dirty,
     )
 
     log.info("Spec: %s", spec)
-    log.info("Spec commit: %s", repo_info.commit)
     log.info("Output: %s", output)
     log.info("Model: %s", model)
     log.info("Tasks: %d\n", len(loaded["tasks"]))
@@ -365,8 +353,6 @@ def show(target: Path | None, spec: str | None):
             click.echo(f"Source: {run.get('source_db')}")
         if spec_m.get("module"):
             click.echo(f"Spec: {spec_m.get('module')}")
-        if spec_m.get("git_commit"):
-            click.echo(f"Spec commit: {spec_m.get('git_commit')}")
 
         counts = _meta_json(meta, "inputs_row_counts")
         if counts:
@@ -400,16 +386,9 @@ def show(target: Path | None, spec: str | None):
 
     spec_module = spec
     try:
-        spec_path = resolve_module_path(spec_module)
-        repo_info = get_spec_repo_info(spec_path)
+        resolve_module_path(spec_module)
     except ValueError as e:
         raise click.ClickException(str(e))
-
-    if repo_info.dirty:
-        click.echo(
-            f"WARNING: spec repo is dirty ({repo_info.root}); output may not be reproducible.",
-            err=True,
-        )
 
     try:
         loaded = load_spec_from_module(spec_module)
