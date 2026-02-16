@@ -77,7 +77,9 @@ class Task:
         output_columns: Optional schema check. Maps view_name -> list of required column
             names. Validation fails if a view is missing any declared column.
         intent: Objective text used when repairing failed SQL tasks.
-        repair_on_warn: If True, warnings in validation views trigger LLM repair.
+        repair_on_warn: If True (default), warnings in validation views trigger
+            LLM repair. Set to False for monitoring-only validation views where
+            you want to log warnings without spending tokens on repair.
     """
 
     name: str
@@ -97,7 +99,7 @@ class Task:
     intent: str = ""
 
     # If True, validation warnings trigger LLM repair.
-    repair_on_warn: bool = False
+    repair_on_warn: bool = True
 
     def run_mode(self) -> str:
         """Return execution mode: 'sql_strict' or 'sql'.

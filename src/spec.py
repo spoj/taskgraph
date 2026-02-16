@@ -153,9 +153,6 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
             raise ValueError(
                 f"Task '{t.name}' with 'sql' must specify non-empty intent"
             )
-        if t.repair_on_warn and sql_strict_statements:
-            raise ValueError(f"Task '{t.name}' uses repair_on_warn with 'sql_strict'")
-
     return {
         "inputs": inputs,
         "tasks": tasks,

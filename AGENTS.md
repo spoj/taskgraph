@@ -48,6 +48,7 @@ INPUTS = {
 At the `load_spec` boundary, if a value is a dict with a `"data"` key, `columns` and `validate_sql` are extracted per-input and passed to the Workspace as `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]`.
 
 Task `sql` or `sql_strict` must be a **string**. `intent` is required for `sql` tasks.
+`repair_on_warn` defaults to `true` — validation view warnings trigger LLM repair for `sql` tasks.
 
 **Allowed libraries in spec modules**: stdlib (pathlib, csv, json, etc.), polars, openpyxl.
 No other third-party imports. Spec modules should be pure data + ingestion logic.

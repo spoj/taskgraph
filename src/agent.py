@@ -45,9 +45,10 @@ MAX_RESULT_CHARS = 30_000
 
 # --- System prompt ---
 
-SYSTEM_PROMPT = """You are a SQL repair agent. A task's SQL failed and you must fix it.
-You work in a DuckDB database. You can read anything, but can only write views and macros
-within the task's namespace (specified per task).
+SYSTEM_PROMPT = """You are a SQL repair agent working in a DuckDB database.
+You are called when a task's SQL failed or produced validation warnings.
+You can read anything, but can only write views and macros within the task's namespace
+(specified per task).
 
 CONSTRAINTS:
 - Allowed statements: SELECT, SUMMARIZE, CREATE/DROP VIEW, CREATE/DROP MACRO
@@ -63,6 +64,15 @@ VALIDATION:
 - Some tasks require validation views (named '{task}__validation' or '{task}__validation_*').
   These must have columns: status VARCHAR ('pass'|'warn'|'fail'), message VARCHAR.
   Any 'fail' row fails the task. No fail rows = pass.
+- 'warn' rows are acceptable — they indicate quality issues, not hard errors.
+  Try to reduce warnings by improving the output views, but if warnings reflect
+  genuine data issues that cannot be resolved, leave them in place and stop.
+- Validation views define the quality contract. When fixing issues:
+  - Preferred: fix the output views (the data-producing SQL).
+  - Allowed: fix bugs in validation views (wrong joins, bad column references,
+    incorrect counts — where the measurement itself is broken).
+  - Forbidden: weakening the contract — do not lower thresholds, add WHERE
+    exclusions to filter out failing rows, or change what is being measured.
 
 CATALOG INTROSPECTION:
   SELECT view_name, sql FROM duckdb_views() WHERE internal = false
@@ -487,7 +497,7 @@ def execute_sql(
 
 
 def build_sql_repair_prompt(task: Task, issue: str) -> str:
-    """Build a prompt to repair a failed SQL task using the LLM."""
+    """Build a prompt for the LLM to repair a failed or warned SQL task."""
     statements = task.sql_statements()
     sql_block_lines = []
     for i, stmt in enumerate(statements, start=1):

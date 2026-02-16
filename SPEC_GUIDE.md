@@ -226,7 +226,7 @@ A list of task definitions. Each task is executed deterministically using SQL:
 - `sql`: deterministic SQL with optional LLM repair on error or validation failure
 - `sql_strict`: deterministic SQL with no LLM repair
 
-The LLM only runs when a `sql` task fails validation (or warns with `repair_on_warn: true`).
+The LLM only runs when a `sql` task fails or when validation views emit warnings (default behavior). Set `repair_on_warn: false` to disable warning-triggered repair for monitoring-only validation views.
 
 Each task declares `inputs` and `outputs` (views). Validation is expressed by producing one or more views named `{task_name}__validation` and/or `{task_name}__validation_*`.
 
@@ -261,7 +261,7 @@ TASKS = [
 |-------|------|----------|-------------|
 | `name` | `str` | Yes | Unique identifier. Also the namespace prefix for intermediate views. |
 | `intent` | `str` | Required for `sql` | Objective text used if LLM repair is triggered. |
-| `repair_on_warn` | `bool` | No | If true, warnings in validation views trigger LLM repair. Defaults to false. |
+| `repair_on_warn` | `bool` | No | If true (default), warnings in validation views trigger LLM repair. Set to `false` for monitoring-only validation views. Ignored for `sql_strict` tasks. |
 | `sql` | `str` | Exactly one of `sql` or `sql_strict` | Deterministic statements executed directly (views/macros only). Multiple statements are allowed in one string and will be split by DuckDB's parser. On failure, Taskgraph can use the LLM to repair the SQL and retry. |
 | `sql_strict` | `str` | Exactly one of `sql` or `sql_strict` | Deterministic, immutable statements (views/macros only). No LLM repair. |
 | `inputs` | `list[str]` | Yes | Tables/views this task reads. Can be ingested tables or outputs of other tasks. |
@@ -682,8 +682,29 @@ Stronger validation makes repairs more accurate and earlier. Prefer failing fast
 
 - Add `{task_name}__validation` views that check completeness, totals, and uniqueness.
 - Use `output_columns` to enforce schema contracts immediately.
-- Treat warnings as repair triggers when needed (`repair_on_warn: true`).
 - Keep validation errors concise and actionable.
+
+### Validation views are repair triggers by default
+
+Validation views that emit `warn` rows automatically trigger LLM repair (`repair_on_warn` defaults to `true`). This means validation views are **actionable** — the agent sees the warnings and attempts to fix the underlying SQL.
+
+Write `warn` thresholds at the quality level where you'd want the agent to intervene:
+
+```sql
+-- This validation view triggers repair when match rate drops below 90%
+CREATE OR REPLACE VIEW match__validation AS
+SELECT
+  CASE WHEN pct < 0.90 THEN 'warn' ELSE 'pass' END AS status,
+  format('Match rate {:.1f}%', pct * 100) AS message
+FROM (
+  SELECT count(*) FILTER (WHERE matched) * 1.0 / count(*) AS pct
+  FROM matches
+)
+```
+
+The agent starts from **working SQL** (the original SQL already succeeded), so warning-triggered repair is the cheapest and highest-success-rate repair scenario.
+
+**When to opt out**: Set `repair_on_warn: false` when validation views are purely observational — you want to log quality metrics in the output database but not spend tokens trying to improve them. This is the minority case.
 
 ---
 
