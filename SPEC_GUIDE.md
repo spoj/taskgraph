@@ -262,6 +262,15 @@ TASKS = [
 - If an input name matches a prior task's output, Taskgraph wires the dependency automatically.
 - Two tasks may not declare the same output view name.
 
+### Compensation over upstream rewrites
+
+If a task discovers an issue with upstream data, it should **compensate in its own outputs** rather than attempting to rewrite upstream logic. Tasks cannot override another task's outputs due to namespace enforcement and duplicate-output checks. The intended pattern is:
+
+- Add diagnostic or corrective intermediate views in the current task's namespace.
+- Update the task's own output views to apply the correction.
+
+This keeps provenance stable and avoids introducing extra variance across the DAG.
+
 ### What the agent sees
 
 The agent receives:
