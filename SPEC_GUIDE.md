@@ -299,6 +299,7 @@ The agent has a single tool: `run_sql`. It can execute:
 
 Deterministic `sql` and `sql_strict` tasks are more restrictive: they may only execute `CREATE/DROP VIEW` and `CREATE/DROP MACRO` statements (no standalone `SELECT`).
 If a `sql` task fails, Taskgraph may invoke the LLM to repair it; `sql_strict` never invokes the LLM.
+Recommendation: prefer `sql` over `sql_strict` unless you explicitly want to forbid repair.
 
 The agent can call `run_sql` multiple times in parallel within a single turn.
 
