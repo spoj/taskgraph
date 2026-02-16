@@ -14,13 +14,13 @@ OpenRouter pricing (per million tokens):
 Single DuckDB database as shared workspace. Tasks form a DAG, each runs as an
 independent agent writing namespace-enforced SQL views.
 
-- `src/agent.py` — task agent: system prompt, SQL execution, namespace enforcement
+- `src/agent.py` — task agent: SQL execution, optional LLM repair, namespace enforcement
 - `src/agent_loop.py` — generic async agent loop with concurrent tool execution
 - `src/api.py` — OpenRouter client. Connection pooling, cache_control on last message, reasoning_effort
 - `src/task.py` — Task dataclass, DAG resolution (topo-sort via Kahn's algorithm), dependency graph, graph validation
- - `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling, optionally start from previous .db
+- `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling
 - `src/ingest.py` — Ingestion: DataFrame/list[dict]/dict[str,list] -> DuckDB with _row_id PK
-- `src/spec.py` — shared spec loader (used by CLI and web), spec module resolution
+- `src/spec.py` — shared spec loader, spec module resolution
 - `scripts/cli.py` — CLI entry point: `taskgraph run`, `taskgraph show`
 
 ## Workspace Spec Contract
@@ -28,7 +28,7 @@ independent agent writing namespace-enforced SQL views.
 A Python module defining:
 ```python
 INPUTS     = {"table_name": callable_or_data, ...}  # callable returns DataFrame/list[dict]/dict[str,list]
-TASKS      = [{"name": ..., "prompt": ..., "inputs": [...], "outputs": [...]}, ...]
+TASKS      = [{"name": ..., "repair_context": ..., "sql": ..., "inputs": [...], "outputs": [...]}, ...]  # or sql_strict
 EXPORTS    = {"report.xlsx": fn(conn, path), ...}     # optional export functions
 ```
 
@@ -47,7 +47,7 @@ INPUTS = {
 
 At the `load_spec` boundary, if a value is a dict with a `"data"` key, `columns` and `validate_sql` are extracted per-input and passed to the Workspace as `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]`.
 
-Task `prompt` must be a **string**.
+Task `sql` or `sql_strict` must be a **string**. `repair_context` is required for `sql` tasks.
 
 **Allowed libraries in spec modules**: stdlib (pathlib, csv, json, etc.), polars, openpyxl.
 No other third-party imports. Spec modules should be pure data + ingestion logic.

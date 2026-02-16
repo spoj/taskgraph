@@ -1308,17 +1308,19 @@ class TestRepairContextResolution:
         with pytest.raises(ValueError, match="must specify non-empty repair_context"):
             load_spec_from_module(module_path)
 
-    def test_prompt_rejected(self, tmp_path):
-        """prompt is no longer supported in specs."""
+    def test_missing_sql_raises(self, tmp_path):
+        """Tasks must specify exactly one of sql or sql_strict."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
             'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "a", "prompt": "do it", '
+            'TASKS = [{"name": "a", "repair_context": "do it", '
             '"inputs": ["t"], "outputs": ["out"]}]\n',
         )
-        with pytest.raises(ValueError, match="prompt.*no longer supported"):
+        with pytest.raises(
+            ValueError, match="must specify exactly one of 'sql' or 'sql_strict'"
+        ):
             load_spec_from_module(module_path)
 
 
@@ -1562,35 +1564,6 @@ class TestLoadSpec:
         result = load_spec_from_module(module_path)
         assert "out.csv" in result["exports"]
         assert callable(result["exports"]["out.csv"])
-
-    def test_path_prompt_rejected(self, tmp_path):
-        """prompt is rejected for any type."""
-        from src.spec import load_spec_from_module
-
-        module_path = _write_spec_module(
-            tmp_path,
-            "from pathlib import Path\n"
-            'INPUTS = {"t": []}\n'
-            'TASKS = [{"name": "t", "prompt": Path("recipe.sql"), '
-            '"inputs": ["t"], "outputs": ["out"]}]\n',
-        )
-
-        with pytest.raises(ValueError, match="prompt.*no longer supported"):
-            load_spec_from_module(module_path)
-
-    def test_list_prompt_rejected(self, tmp_path):
-        """prompt is rejected for any type."""
-        from src.spec import load_spec_from_module
-
-        module_path = _write_spec_module(
-            tmp_path,
-            'INPUTS = {"t": []}\n'
-            'TASKS = [{"name": "t", "prompt": ["Do the thing."], '
-            '"inputs": ["t"], "outputs": ["out"]}]\n',
-        )
-
-        with pytest.raises(ValueError, match="prompt.*no longer supported"):
-            load_spec_from_module(module_path)
 
     def test_task_objects_accepted(self, tmp_path):
         """Tasks can be Task objects directly (not just dicts)."""

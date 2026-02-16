@@ -173,7 +173,8 @@ def init(force: bool):
 TASKS = [
     {
         "name": "double",
-        "prompt": "Create a view 'output' with columns x and x2 (x*2).",
+        "repair_context": "Create a view 'output' with columns x and x2 (x*2).",
+        "sql": "CREATE VIEW output AS SELECT x, x * 2 AS x2 FROM data",
         "inputs": ["data"],
         "outputs": ["output"],
         "output_columns": {"output": ["x", "x2"]},

@@ -1,6 +1,6 @@
 # Taskgraph
 
-Taskgraph runs tasks against your data (LLM-driven or deterministic SQL), but instead of generating code files it writes auditable DuckDB SQL views into a single workspace database.
+Taskgraph runs deterministic SQL tasks against your data, with optional LLM repair on failure, and writes auditable DuckDB SQL views into a single workspace database.
 
 You define a "workspace spec" (a Python module) that declares:
 - `INPUTS`: how to load data into DuckDB tables

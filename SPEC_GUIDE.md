@@ -4,7 +4,7 @@ This guide targets people writing **workspace specs**: Python modules (usually s
 
 A spec defines:
 - `INPUTS`: how to ingest data into DuckDB tables
-- `TASKS`: a DAG of LLM tasks; each task produces one or more SQL views
+- `TASKS`: a DAG of SQL tasks (deterministic) with optional LLM repair; each task produces one or more SQL views
 - `EXPORTS` (optional): functions that export files from the final workspace
 
 Specs are imported as modules (e.g. `my_app.specs.main`). Taskgraph does not load specs from file paths.

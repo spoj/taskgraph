@@ -90,12 +90,6 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
             t = dict(t)  # shallow copy to avoid mutating the original
             task_name = t.get("name", "")
 
-            if "prompt" in t:
-                raise ValueError(
-                    f"Task '{task_name}' uses 'prompt', which is no longer supported. "
-                    "Use 'sql' (repairable) or 'sql_strict' instead."
-                )
-
             # Deterministic SQL (optional). If present, the harness will
             # execute it directly (no LLM). Accept str or list[str].
             if "sql" in t:
