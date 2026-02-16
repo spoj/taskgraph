@@ -20,6 +20,7 @@ from pathlib import Path
 import duckdb
 import polars as pl
 import pytest
+from click.testing import CliRunner
 
 from src.agent import (
     execute_sql,
@@ -35,6 +36,42 @@ from src.ingest import coerce_to_dataframe, ingest_table
 from src.task import Task, resolve_dag, validate_task_graph
 from src.workspace import Workspace, persist_workspace_meta, read_workspace_meta
 from src.agent import run_sql_only_task
+
+
+def test_cli_run_sql_strict_does_not_require_openrouter_api_key(tmp_path, monkeypatch):
+    """sql_strict specs should run without OPENROUTER_API_KEY.
+
+    This is a regression test for the CLI requiring the key even when no
+    task would invoke the LLM.
+    """
+    from scripts.cli import main
+
+    spec_source = """\
+INPUTS = {}
+
+TASKS = [
+    {
+        "name": "t",
+        "inputs": [],
+        "outputs": ["v"],
+        "sql_strict": ["CREATE VIEW v AS SELECT 1 AS x"],
+    }
+]
+"""
+
+    spec_module = _write_spec_module(tmp_path, spec_source)
+    out_db = tmp_path / "out.db"
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["run", "--spec", spec_module, "-o", str(out_db)],
+        env={"OPENROUTER_API_KEY": ""},
+    )
+    assert result.exit_code == 0, result.output
+    assert out_db.exists()
 
 
 # ---------------------------------------------------------------------------

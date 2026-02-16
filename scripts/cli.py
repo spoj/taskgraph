@@ -42,7 +42,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.api import OpenRouterClient
 from src.spec import load_spec_from_module, resolve_module_path
 from src.workspace import Workspace, read_workspace_meta
-from src.task import resolve_dag, validate_task_graph, validation_outputs
+from src.task import (
+    Task,
+    resolve_dag,
+    resolve_task_deps,
+    validate_task_graph,
+    validation_outputs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -323,23 +329,52 @@ def run(
     log.info("Model: %s", model)
     log.info("Tasks: %d\n", len(loaded["tasks"]))
 
-    _require_openrouter_api_key()
+    needs_llm = any(
+        getattr(t, "run_mode", lambda: "agent")() in {"agent", "sql"}
+        for t in loaded["tasks"]
+    )
+    if needs_llm:
+        _require_openrouter_api_key()
 
     async def _run():
-        async with OpenRouterClient(reasoning_effort=reasoning_effort) as client:
-            if from_db is None:
-                return await workspace.run(
+        if needs_llm:
+            async with OpenRouterClient(reasoning_effort=reasoning_effort) as client:
+                if from_db is None:
+                    return await workspace.run(
+                        client=client,
+                        model=model,
+                        max_iterations=max_iterations,
+                    )
+                return await workspace.rerun(
+                    source_db=from_db,
                     client=client,
                     model=model,
                     max_iterations=max_iterations,
+                    reingest=reingest,
                 )
-            return await workspace.rerun(
-                source_db=from_db,
-                client=client,
+
+        # SQL-only workspace: don't require OPENROUTER_API_KEY and don't
+        # create an http client.
+        class _ClientStub:
+            reasoning_effort: str | None
+
+            def __init__(self, reasoning_effort: str | None):
+                self.reasoning_effort = reasoning_effort
+
+        client = _ClientStub(reasoning_effort=reasoning_effort)
+        if from_db is None:
+            return await workspace.run(
+                client=client,  # type: ignore[arg-type]
                 model=model,
                 max_iterations=max_iterations,
-                reingest=reingest,
             )
+        return await workspace.rerun(
+            source_db=from_db,
+            client=client,  # type: ignore[arg-type]
+            model=model,
+            max_iterations=max_iterations,
+            reingest=reingest,
+        )
 
     result = asyncio.run(_run())
 
@@ -463,59 +498,101 @@ def show(target: Path | None, spec: str | None):
         detail = "  ".join(parts) if parts else "(no validation)"
         click.echo(f"  {name:<{name_width}}  {detail}")
 
-    # --- DAG ---
+    # --- DAG (tree) ---
+    # Use resolve_dag for full validation (cycles, duplicate outputs). Display
+    # uses a dependency tree view instead of execution layers.
     try:
-        layers = resolve_dag(tasks)
+        resolve_dag(tasks)
+        deps = resolve_task_deps(tasks)
     except ValueError as e:
         click.echo(f"\nDAG error: {e}")
         sys.exit(1)
 
-    total_tasks = sum(len(layer) for layer in layers)
-    click.echo(f"\nDAG ({len(layers)} layers, {total_tasks} tasks):\n")
+    total_tasks = len(tasks)
+    click.echo(f"\nDAG (tree, {total_tasks} tasks):\n")
+
+    task_by_name = {t.name: t for t in tasks}
+    # parent -> sorted children
+    children: dict[str, list[str]] = {t.name: [] for t in tasks}
+    for name, parents in deps.items():
+        for p in parents:
+            children[p].append(name)
+    for p in children:
+        children[p] = sorted(set(children[p]))
+
+    roots = sorted([name for name, parents in deps.items() if not parents])
 
     # Collect all task outputs for showing which inputs are external vs task-produced
-    all_task_outputs = set()
+    all_task_outputs: set[str] = set()
     for t in tasks:
         all_task_outputs.update(t.outputs)
 
-    for li, layer in enumerate(layers, 1):
-        layer_names = " | ".join(t.name for t in layer)
-        click.echo(f"  Layer {li} \u2500 {layer_names}")
+    def _fmt_task_details(t: Task) -> str:
+        kind = t.run_mode()
 
-        for t in layer:
-            # If multiple tasks in layer, indent with task name header
-            if len(layer) > 1:
-                click.echo(f"    {t.name}")
-                prefix = "      "
-            else:
-                prefix = "    "
-
-            kind = t.run_mode()
-            click.echo(f"{prefix}type: {kind}")
-
-            # Inputs — mark external (base table) vs task-produced
-            if t.inputs:
-                parts = []
-                for inp in t.inputs:
-                    if inp in all_task_outputs:
-                        parts.append(inp)
-                    else:
-                        parts.append(f"{inp} (table)")
-                click.echo(f"{prefix}in:  {', '.join(parts)}")
-            else:
-                click.echo(f"{prefix}in:  (none)")
-
-            # Outputs — show column count if output_columns defined
-            out_parts = []
-            for o in t.outputs:
-                cols = t.output_columns.get(o, [])
-                if cols:
-                    out_parts.append(f"{o} ({len(cols)} cols)")
+        if t.inputs:
+            inp_parts = []
+            for inp in t.inputs:
+                if inp in all_task_outputs:
+                    inp_parts.append(inp)
                 else:
-                    out_parts.append(o)
-            click.echo(f"{prefix}out: {', '.join(out_parts)}")
+                    inp_parts.append(f"{inp} (table)")
+            inp_s = ", ".join(inp_parts)
+        else:
+            inp_s = "(none)"
 
-        click.echo()
+        out_parts = []
+        for o in t.outputs:
+            cols = t.output_columns.get(o, [])
+            out_parts.append(f"{o} ({len(cols)} cols)" if cols else o)
+
+        return f"type={kind}  in={inp_s}  out={', '.join(out_parts) if out_parts else '(none)'}"
+
+    def _emit_subtree(
+        name: str, prefix: str, is_last: bool, stack: set[str], seen: set[str]
+    ):
+        t = task_by_name[name]
+        branch = "`- " if is_last else "|- "
+        click.echo(f"{prefix}{branch}{name}  {_fmt_task_details(t)}")
+
+        # Avoid infinite recursion (shouldn't happen if resolve_dag passed) and
+        # reduce noise for shared downstream tasks in DAGs.
+        if name in stack:
+            click.echo(f"{prefix}{'   ' if is_last else '|  '}[cycle]")
+            return
+        if name in seen:
+            click.echo(f"{prefix}{'   ' if is_last else '|  '}[shared]")
+            return
+
+        seen.add(name)
+        stack.add(name)
+
+        kids = children.get(name, [])
+        next_prefix = prefix + ("   " if is_last else "|  ")
+        for i, child in enumerate(kids):
+            _emit_subtree(
+                child,
+                prefix=next_prefix,
+                is_last=(i == len(kids) - 1),
+                stack=stack,
+                seen=seen,
+            )
+
+        stack.remove(name)
+
+    if not roots:
+        click.echo("  (no tasks)")
+    else:
+        seen: set[str] = set()
+        for i, r in enumerate(roots):
+            _emit_subtree(
+                r,
+                prefix="  ",
+                is_last=(i == len(roots) - 1),
+                stack=set(),
+                seen=seen,
+            )
+    click.echo()
 
     # --- Validation summary ---
     has_validation = False

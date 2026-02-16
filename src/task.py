@@ -83,15 +83,27 @@ class Task:
     output_columns: dict[str, list[str]] = field(default_factory=dict)
 
     # Deterministic SQL statements (views/macros only). If provided, the
-    # workspace harness executes these statements directly (no LLM).
+    # workspace harness executes these statements directly; on failure
+    # it may optionally attempt LLM repair.
     sql: list[str] = field(default_factory=list)
 
-    def run_mode(self) -> str:
-        """Return execution mode: 'sql' or 'agent'.
+    # Immutable deterministic SQL (no LLM repair). Same constraints as sql.
+    sql_strict: list[str] = field(default_factory=list)
 
-        Spec parsing enforces exactly one of (sql, prompt) is provided.
+    def run_mode(self) -> str:
+        """Return execution mode: 'sql_strict', 'sql', or 'agent'.
+
+        Spec parsing enforces exactly one of (sql_strict, sql, prompt) is provided.
         """
-        return "sql" if self.sql else "agent"
+        if self.sql_strict:
+            return "sql_strict"
+        if self.sql:
+            return "sql"
+        return "agent"
+
+    def sql_statements(self) -> list[str]:
+        """Return SQL statements for sql/sql_strict tasks."""
+        return self.sql_strict or self.sql
 
     def validate(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
         """Run validation. Returns error messages (empty = pass).

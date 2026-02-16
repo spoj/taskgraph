@@ -52,6 +52,7 @@ uv run taskgraph run
 5) Ensure your LLM credential is set:
 
 Taskgraph uses OpenRouter; set `OPENROUTER_API_KEY` in your environment (or in a `.env` loaded by your app).
+If your spec only uses `sql_strict` tasks, no LLM key is required.
 
 Two common patterns:
 
@@ -211,8 +212,9 @@ def load_data():
 ## TASKS
 
 A list of task definitions. Each task is executed either:
-- by an LLM agent (`prompt`), or
-- deterministically (`sql` statements)
+- by an LLM agent (`prompt`),
+- deterministically (`sql` statements, with automatic LLM repair on error/validation failure), or
+- deterministically and immutable (`sql_strict` statements, no LLM repair)
 
 Each task declares `inputs` and `outputs` (views). Validation is expressed by producing one or more views named `{task_name}__validation` and/or `{task_name}__validation_*`.
 
@@ -246,8 +248,9 @@ TASKS = [
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | `str` | Yes | Unique identifier. Also the namespace prefix for intermediate views. |
-| `prompt` | `str` | Exactly one of `prompt` or `sql` | LLM instructions. Runs as an agent that writes views/macros via `run_sql`. |
-| `sql` | `str` or `list[str]` | Exactly one of `prompt` or `sql` | Deterministic statements executed directly (views/macros only). |
+| `prompt` | `str` | Exactly one of `prompt`, `sql`, or `sql_strict` | LLM instructions. Runs as an agent that writes views/macros via `run_sql`. |
+| `sql` | `str` or `list[str]` | Exactly one of `prompt`, `sql`, or `sql_strict` | Deterministic statements executed directly (views/macros only). On failure, Taskgraph can use the LLM to repair the SQL and retry. |
+| `sql_strict` | `str` or `list[str]` | Exactly one of `prompt`, `sql`, or `sql_strict` | Deterministic, immutable statements (views/macros only). No LLM repair. |
 | `inputs` | `list[str]` | Yes | Tables/views this task reads. Can be ingested tables or outputs of other tasks. |
 | `outputs` | `list[str]` | Yes | Views the task must create. Validation checks these exist. |
 | `output_columns` | `dict[str, list[str]]` | No | Required columns per output view. Checks names only, not types. Extra columns are fine. |
@@ -285,7 +288,8 @@ The agent has a single tool: `run_sql`. It can execute:
 | `DROP MACRO` | Yes | Yes |
 | Everything else | **No** | — |
 
-Deterministic `sql` tasks are more restrictive: they may only execute `CREATE/DROP VIEW` and `CREATE/DROP MACRO` statements (no standalone `SELECT`).
+Deterministic `sql` and `sql_strict` tasks are more restrictive: they may only execute `CREATE/DROP VIEW` and `CREATE/DROP MACRO` statements (no standalone `SELECT`).
+If a `sql` task fails, Taskgraph may invoke the LLM to repair it; `sql_strict` never invokes the LLM.
 
 The agent can call `run_sql` multiple times in parallel within a single turn.
 

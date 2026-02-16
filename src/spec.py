@@ -76,6 +76,24 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
 
     # Accept tasks as dicts or Task objects
     tasks = []
+
+    def _normalize_sql(task_name: str, value: Any, key: str) -> list[str]:
+        if isinstance(value, str):
+            sql = [value]
+        elif isinstance(value, list) and all(isinstance(s, str) for s in value):
+            sql = value
+        else:
+            raise ValueError(f"Task '{task_name}' {key} must be a string or list[str]")
+        stripped: list[str] = []
+        for s in sql:
+            s2 = s.strip()
+            if not s2:
+                raise ValueError(
+                    f"Task '{task_name}' {key} contains an empty statement"
+                )
+            stripped.append(s2)
+        return stripped
+
     for t in module.TASKS:
         if isinstance(t, dict):
             t = dict(t)  # shallow copy to avoid mutating the original
@@ -90,39 +108,37 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
             # Deterministic SQL (optional). If present, the harness will
             # execute it directly (no LLM). Accept str or list[str].
             if "sql" in t:
-                sql = t.get("sql", [])
-                if isinstance(sql, str):
-                    sql = [sql]
-                if not isinstance(sql, list) or not all(
-                    isinstance(s, str) for s in sql
-                ):
-                    raise ValueError(
-                        f"Task '{task_name}' sql must be a string or list[str]"
-                    )
-                stripped: list[str] = []
-                for s in sql:
-                    s2 = s.strip()
-                    if not s2:
-                        raise ValueError(
-                            f"Task '{task_name}' sql contains an empty statement"
-                        )
-                    stripped.append(s2)
-                t["sql"] = stripped
+                t["sql"] = _normalize_sql(task_name, t.get("sql", []), "sql")
+
+            # Immutable deterministic SQL (optional). No LLM repair.
+            if "sql_strict" in t:
+                t["sql_strict"] = _normalize_sql(
+                    task_name, t.get("sql_strict", []), "sql_strict"
+                )
 
             # prompt is optional to specify in the dict, but tasks must provide
             # exactly one of: sql or prompt (non-empty).
             t.setdefault("prompt", "")
 
             sql_statements = t.get("sql") or []
+            sql_strict_statements = t.get("sql_strict") or []
             prompt_text = (t.get("prompt") or "").strip()
 
+            if sql_statements and sql_strict_statements:
+                raise ValueError(
+                    f"Task '{task_name}' must not specify both 'sql' and 'sql_strict'"
+                )
             if sql_statements and prompt_text:
                 raise ValueError(
                     f"Task '{task_name}' must not specify both 'sql' and 'prompt'"
                 )
-            if not sql_statements and not prompt_text:
+            if sql_strict_statements and prompt_text:
                 raise ValueError(
-                    f"Task '{task_name}' must specify exactly one of 'sql' or 'prompt'"
+                    f"Task '{task_name}' must not specify both 'sql_strict' and 'prompt'"
+                )
+            if not sql_statements and not sql_strict_statements and not prompt_text:
+                raise ValueError(
+                    f"Task '{task_name}' must specify exactly one of 'sql', 'sql_strict', or 'prompt'"
                 )
 
             tasks.append(Task(**t))

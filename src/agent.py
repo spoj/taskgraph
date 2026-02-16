@@ -531,6 +531,7 @@ def _build_task_user_message(
     schema_info: str,
     existing_views: list[tuple[str, int]] | None = None,
     validation_errors: list[str] | None = None,
+    prompt_override: str | None = None,
 ) -> str:
     """Build the user message for a task-scoped agent.
 
@@ -546,7 +547,8 @@ def _build_task_user_message(
 
     parts.append(f"TASK: {task.name}")
     parts.append("")
-    parts.append(task.prompt)
+    prompt_text = task.prompt if prompt_override is None else prompt_override
+    parts.append(prompt_text)
     parts.append("")
 
     parts.append("AVAILABLE TABLES:")
@@ -607,6 +609,37 @@ def _build_task_user_message(
     return "\n".join(parts)
 
 
+def build_sql_repair_prompt(task: Task, error: str) -> str:
+    """Build a prompt to repair a failed SQL task using the LLM."""
+    statements = task.sql_statements()
+    sql_block_lines = []
+    for i, stmt in enumerate(statements, start=1):
+        sql_block_lines.append(f"-- statement {i}")
+        sql_block_lines.append(stmt)
+        sql_block_lines.append("")
+    sql_block = "\n".join(sql_block_lines).rstrip()
+
+    parts = [
+        "SQL REPAIR MODE",
+        "This task failed running deterministic SQL. Fix the SQL and repair the views.",
+        "",
+        "ORIGINAL SQL:",
+        "```sql",
+        sql_block,
+        "```",
+        "",
+        "ERROR:",
+        error or "(no error message)",
+        "",
+        "INSTRUCTIONS:",
+        "- Use CREATE OR REPLACE VIEW/MACRO to fix outputs.",
+        "- Keep required output view names unchanged.",
+        "- Minimize changes; only add intermediate views with the task prefix.",
+        "- You may SELECT with LIMIT to inspect data if needed.",
+    ]
+    return "\n".join(parts)
+
+
 # --- Agent entry point ---
 
 
@@ -619,6 +652,7 @@ async def run_task_agent(
     max_iterations: int = 200,
     existing_views: list[tuple[str, int]] | None = None,
     validation_errors: list[str] | None = None,
+    prompt_override: str | None = None,
 ) -> AgentResult:
     """Run the agent for a single Task within a shared workspace database.
 
@@ -637,6 +671,7 @@ async def run_task_agent(
             for views already in this task's namespace.
         validation_errors: For reruns — errors from validating the
             existing views against fresh input data.
+        prompt_override: Optional replacement for task.prompt.
     Returns:
         AgentResult with success status, final message, and usage stats.
     """
@@ -650,7 +685,11 @@ async def run_task_agent(
 
     # Build messages
     user_message = _build_task_user_message(
-        task, schema_info, existing_views, validation_errors
+        task,
+        schema_info,
+        existing_views=existing_views,
+        validation_errors=validation_errors,
+        prompt_override=prompt_override,
     )
 
     initial_messages = [
@@ -772,14 +811,15 @@ async def run_sql_only_task(
 ) -> AgentResult:
     """Execute a deterministic SQL-only task.
 
-    The task provides a list of SQL statements (task.sql). Each statement is
-    executed with the same namespace enforcement as agent tasks.
+    The task provides a list of SQL statements (task.sql or task.sql_strict).
+    Each statement is executed with the same namespace enforcement as agent tasks.
     """
     init_trace_table(conn)
 
     start_time = time.time()
 
-    if not task.sql:
+    statements = task.sql_statements()
+    if not statements:
         return AgentResult(
             success=False,
             final_message="SQL-only task has no SQL statements",
@@ -791,14 +831,16 @@ async def run_sql_only_task(
     allowed_views = set(task.outputs)
     namespace = task.name
 
-    for q in task.sql:
+    mode_label = "sql_strict" if task.run_mode() == "sql_strict" else "sql"
+
+    for q in statements:
         ok, err = _is_sql_only_statement_allowed(q)
         if not ok:
             persist_task_meta(
                 conn,
                 task.name,
                 {
-                    "model": "sql",
+                    "model": mode_label,
                     "outputs": task.outputs,
                     "iterations": 0,
                     "tool_calls": 0,
@@ -829,7 +871,7 @@ async def run_sql_only_task(
                 conn,
                 task.name,
                 {
-                    "model": "sql",
+                    "model": mode_label,
                     "outputs": task.outputs,
                     "iterations": 0,
                     "tool_calls": 0,
@@ -855,7 +897,7 @@ async def run_sql_only_task(
             conn,
             task.name,
             {
-                "model": "sql",
+                "model": mode_label,
                 "outputs": task.outputs,
                 "iterations": 0,
                 "tool_calls": 0,
@@ -876,7 +918,7 @@ async def run_sql_only_task(
         conn,
         task.name,
         {
-            "model": "sql",
+            "model": mode_label,
             "outputs": task.outputs,
             "iterations": 0,
             "tool_calls": 0,

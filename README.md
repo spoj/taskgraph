@@ -4,7 +4,7 @@ Taskgraph runs tasks against your data (LLM-driven or deterministic SQL), but in
 
 You define a "workspace spec" (a Python module) that declares:
 - `INPUTS`: how to load data into DuckDB tables
-- `TASKS`: a DAG of tasks; each task runs either via `prompt` (LLM) or `sql` (deterministic) and produces one or more SQL views
+- `TASKS`: a DAG of tasks; each task runs via `prompt` (LLM), `sql` (deterministic with optional LLM repair), or `sql_strict` (deterministic, no LLM) and produces one or more SQL views
 - `EXPORTS` (optional): functions that materialize reports (CSV/XLSX/etc.) from the finished workspace
 
 The result is one portable `.db` file containing the raw inputs, all agent-created views, validation results, and an execution trace.
