@@ -400,18 +400,7 @@ def run(
                     model=model,
                     max_iterations=max_iterations,
                 )
-
-        # SQL-only workspace: don't require OPENROUTER_API_KEY and don't
-        # create an http client.
-        class _ClientStub:
-            reasoning_effort: str | None
-
-            def __init__(self, reasoning_effort: str | None):
-                self.reasoning_effort = reasoning_effort
-
-        client = _ClientStub(reasoning_effort=reasoning_effort)
         return await workspace.run(
-            client=client,  # type: ignore[arg-type]
             model=model,
             max_iterations=max_iterations,
         )

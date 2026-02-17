@@ -54,18 +54,26 @@ _CREATE_VIEW_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Connection used solely for extract_statements (lightweight, never writes)
+_parser_conn: duckdb.DuckDBPyConnection | None = None
+
+
+def _get_parser_conn() -> duckdb.DuckDBPyConnection:
+    """Lazy singleton in-memory connection for SQL parsing."""
+    global _parser_conn
+    if _parser_conn is None:
+        _parser_conn = duckdb.connect(":memory:")
+    return _parser_conn
+
 
 def _split_sql_statements(sql_text: str) -> list[str]:
     sql_text = (sql_text or "").strip()
     if not sql_text:
         return []
-    conn = duckdb.connect()
     try:
-        statements = conn.extract_statements(sql_text)
+        statements = _get_parser_conn().extract_statements(sql_text)
     except duckdb.Error:
         return [sql_text]
-    finally:
-        conn.close()
     return [s.query.strip() for s in statements if s.query.strip()]
 
 

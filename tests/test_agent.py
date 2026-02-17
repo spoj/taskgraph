@@ -664,14 +664,3 @@ class TestTransformPrompt:
         )
         msg = build_transform_prompt(task)
         assert "- result: id, score" in msg
-
-    def test_feedback_included(self):
-        """Validation feedback is included when provided."""
-        task = _make_task(
-            name="t",
-            outputs=["out"],
-            prompt="Create output view",
-        )
-        msg = build_transform_prompt(task, feedback="Validation failed: missing rows")
-        assert "VALIDATION FAILED:" in msg
-        assert "missing rows" in msg

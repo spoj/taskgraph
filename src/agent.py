@@ -13,7 +13,7 @@ import time
 import datetime
 import decimal
 import uuid
-from typing import Any, cast
+from typing import Any, Callable, cast
 from .agent_loop import run_agent_loop, AgentResult
 from .api import OpenRouterClient, create_model_callable
 from .task import Task, is_validation_view_for_task
@@ -177,6 +177,8 @@ def is_sql_allowed(
     query: str,
     allowed_views: set[str] | None = None,
     namespace: str | None = None,
+    forbidden_names: Callable[[str], bool] | None = None,
+    ddl_only: bool = False,
 ) -> tuple[bool, str]:
     """Check if a SQL query is allowed.
 
@@ -188,6 +190,8 @@ def is_sql_allowed(
         allowed_views: If set, only these view/macro names can be created/dropped
             (in addition to namespace-prefixed names).
         namespace: If set, names starting with "{namespace}_" are also allowed.
+        forbidden_names: Optional function that returns True for disallowed names.
+        ddl_only: If True, only allow CREATE/DROP VIEW|MACRO statements.
     """
     try:
         statements = _get_parser_conn().extract_statements(query)
@@ -211,10 +215,14 @@ def is_sql_allowed(
 
     # SELECT — always allowed (covers UNION, INTERSECT, EXCEPT, SUMMARIZE, DESCRIBE)
     if st == StatementType.SELECT:
+        if ddl_only:
+            return False, "SQL-only tasks only allow CREATE/DROP VIEW|MACRO statements"
         return True, ""
 
     # EXPLAIN — allowed (read-only introspection)
     if st == StatementType.EXPLAIN:
+        if ddl_only:
+            return False, "SQL-only tasks only allow CREATE/DROP VIEW|MACRO statements"
         return True, ""
 
     # CREATE — only VIEW and MACRO
@@ -224,8 +232,16 @@ def is_sql_allowed(
         if kind_match:
             kind = kind_match.group(1).upper()
             label = "view" if kind == "VIEW" else "macro"
+            name = _extract_name(sql, _CREATE_NAME_RE)
+            if name and forbidden_names and forbidden_names(name):
+                return (
+                    False,
+                    (
+                        f"Cannot create/drop validation view '{name}' during transform. "
+                        "Validation views are created in validate_sql."
+                    ),
+                )
             if allowed_views is not None or namespace is not None:
-                name = _extract_name(sql, _CREATE_NAME_RE)
                 ok, err = _check_name_allowed(
                     label, "create", name, allowed_views, namespace
                 )
@@ -241,8 +257,16 @@ def is_sql_allowed(
         if kind_match:
             kind = kind_match.group(1).upper()
             label = "view" if kind == "VIEW" else "macro"
+            name = _extract_name(sql, _DROP_NAME_RE)
+            if name and forbidden_names and forbidden_names(name):
+                return (
+                    False,
+                    (
+                        f"Cannot create/drop validation view '{name}' during transform. "
+                        "Validation views are created in validate_sql."
+                    ),
+                )
             if allowed_views is not None or namespace is not None:
-                name = _extract_name(sql, _DROP_NAME_RE)
                 ok, err = _check_name_allowed(
                     label, "drop", name, allowed_views, namespace
                 )
@@ -351,6 +375,8 @@ def execute_sql(
     task_name: str | None = None,
     query_timeout_s: int = DEFAULT_QUERY_TIMEOUT_S,
     max_result_chars: int = MAX_RESULT_CHARS,
+    forbidden_names: Callable[[str], bool] | None = None,
+    ddl_only: bool = False,
 ) -> dict[str, Any]:
     """Execute SQL query and return results.
 
@@ -366,7 +392,13 @@ def execute_sql(
     """
     start_time = time.perf_counter()
 
-    allowed, error_msg = is_sql_allowed(query, allowed_views, namespace)
+    allowed, error_msg = is_sql_allowed(
+        query,
+        allowed_views=allowed_views,
+        namespace=namespace,
+        forbidden_names=forbidden_names,
+        ddl_only=ddl_only,
+    )
     if not allowed:
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         log_trace(
@@ -504,7 +536,6 @@ def _format_input_schema_lines(
 
 def build_transform_prompt(
     task: Task,
-    feedback: str = "",
     input_lines: list[str] | None = None,
 ) -> str:
     """Build a prompt for the LLM to produce task outputs."""
@@ -547,17 +578,6 @@ def build_transform_prompt(
             ]
         )
 
-    if feedback:
-        parts.extend(
-            [
-                "",
-                "VALIDATION FAILED:",
-                feedback,
-                "",
-                "Fix the issues and reply when done.",
-            ]
-        )
-
     parts.extend(
         [
             "",
@@ -566,32 +586,6 @@ def build_transform_prompt(
     )
 
     return "\n".join(parts)
-
-
-def _validation_view_forbidden_error(query: str, task: Task) -> str | None:
-    """Reject attempts to create/drop validation views during transform."""
-    try:
-        statements = _get_parser_conn().extract_statements(query)
-    except duckdb.Error:
-        return None
-    if not statements or len(statements) != 1:
-        return None
-
-    stmt = statements[0]
-    StatementType = cast(Any, duckdb.StatementType)
-    if stmt.type == StatementType.CREATE:
-        name = _extract_name(stmt.query, _CREATE_NAME_RE)
-    elif stmt.type == StatementType.DROP:
-        name = _extract_name(stmt.query, _DROP_NAME_RE)
-    else:
-        return None
-
-    if name and is_validation_view_for_task(name, task.name):
-        return (
-            f"Cannot create/drop validation view '{name}' during transform. "
-            "Validation views are created in validate_sql."
-        )
-    return None
 
 
 # --- Agent entry point ---
@@ -603,8 +597,6 @@ async def run_task_agent(
     client: OpenRouterClient,
     model: str = "openai/gpt-5.2",
     max_iterations: int = 200,
-    feedback: str = "",
-    prior_messages: list[dict[str, Any]] | None = None,
 ) -> AgentResult:
     """Run the agent for a single Task within a shared workspace database.
 
@@ -612,19 +604,19 @@ async def run_task_agent(
     its declared outputs or with its name as prefix. It can SELECT from
     any table/view.
 
+    Validation (structural + SQL validation views) runs inside the agent
+    loop. If validation fails, the agent gets feedback and continues
+    within the same iteration budget.
+
     Args:
         conn: DuckDB connection (shared workspace database).
         task: Task specification.
         client: OpenRouterClient (must be in async context).
         model: Model identifier.
         max_iterations: Maximum agent iterations.
-        feedback: Optional validation feedback for a retry.
-        prior_messages: Optional prior messages to continue a session.
     Returns:
         AgentResult with success status, final message, and usage stats.
     """
-    init_trace_table(conn)
-
     start_time = time.time()
 
     # Namespace enforcement
@@ -632,22 +624,12 @@ async def run_task_agent(
     namespace = task.name
 
     # Build messages
-    if prior_messages:
-        initial_messages = list(prior_messages)
-        if feedback:
-            initial_messages.append(
-                {
-                    "role": "user",
-                    "content": f"VALIDATION FAILED:\n{feedback}\n\nFix the issues and reply when done.",
-                }
-            )
-    else:
-        input_lines = _format_input_schema_lines(conn, task.inputs)
-        user_message = build_transform_prompt(task, feedback, input_lines)
-        initial_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ]
+    input_lines = _format_input_schema_lines(conn, task.inputs)
+    user_message = build_transform_prompt(task, input_lines)
+    initial_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
 
     # Build tool list
     tools = [_create_sql_tool()]
@@ -658,24 +640,25 @@ async def run_task_agent(
     async def tool_executor(name: str, args: dict[str, Any]) -> str:
         if name == "run_sql":
             query = args.get("query", "")
-            validation_error = _validation_view_forbidden_error(query, task)
-            if validation_error:
-                return json.dumps({"success": False, "error": validation_error})
+            forbidden_names = lambda view_name: is_validation_view_for_task(
+                view_name, task.name
+            )
             result = execute_sql(
                 conn,
                 query,
                 allowed_views=allowed_views,
                 namespace=namespace,
                 task_name=task.name,
+                forbidden_names=forbidden_names,
             )
             log.debug(".")
             return json.dumps(result, default=_json_default)
 
         return json.dumps({"success": False, "error": f"Unknown tool: {name}"})
 
-    # Validation: check declared outputs exist and schemas
+    # Validation: structural checks + SQL validation views
     def validation_fn() -> tuple[bool, str]:
-        errors = task.validate_transform(conn)
+        errors = validate_task_complete(conn, task)
         if errors:
             return False, "\n".join(f"- {e}" for e in errors)
         return True, ""
@@ -732,34 +715,6 @@ async def run_task_agent(
 # --- SQL-only task executor ---
 
 
-def _is_sql_only_statement_allowed(query: str) -> tuple[bool, str]:
-    """Restrict SQL-only tasks to CREATE/DROP VIEW|MACRO statements.
-
-    SQL-only tasks are intended to be fully deterministic and side-effect free
-    beyond defining views/macros. We explicitly disallow SELECT/EXPLAIN even
-    though the agent tool allows them.
-    """
-    try:
-        statements = _get_parser_conn().extract_statements(query)
-    except duckdb.ParserException as e:
-        return False, f"SQL parse error: {e}"
-    except Exception as e:
-        return False, f"SQL parse error: {e}"
-
-    if not statements:
-        return False, "Empty query"
-    if len(statements) > 1:
-        return False, "Only one statement allowed at a time"
-
-    stmt = statements[0]
-    st = stmt.type
-    StatementType = cast(Any, duckdb.StatementType)
-
-    if st not in {StatementType.CREATE, StatementType.DROP}:
-        return False, "SQL-only tasks only allow CREATE/DROP VIEW|MACRO statements"
-    return True, ""
-
-
 async def run_sql_only_task(
     conn: duckdb.DuckDBPyConnection,
     task: Task,
@@ -769,8 +724,6 @@ async def run_sql_only_task(
     The task provides a list of SQL statements (task.sql).
     Each statement is executed with the same namespace enforcement as agent tasks.
     """
-    init_trace_table(conn)
-
     start_time = time.time()
 
     statements = task.sql_statements()
@@ -787,103 +740,47 @@ async def run_sql_only_task(
     namespace = task.name
 
     mode_label = "sql"
+    forbidden_names = lambda view_name: is_validation_view_for_task(
+        view_name, task.name
+    )
+    execution_error: str | None = None
 
     for q in statements:
-        validation_error = _validation_view_forbidden_error(q, task)
-        if validation_error:
-            persist_task_meta(
-                conn,
-                task.name,
-                {
-                    "model": mode_label,
-                    "outputs": task.outputs,
-                    "iterations": 0,
-                    "tool_calls": 0,
-                    "elapsed_s": round(time.time() - start_time, 1),
-                    "validation": "FAILED",
-                    "error": validation_error,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                },
-            )
-            return AgentResult(
-                success=False,
-                final_message=validation_error,
-                iterations=0,
-                messages=[],
-                tool_calls_count=0,
-            )
-        ok, err = _is_sql_only_statement_allowed(q)
-        if not ok:
-            persist_task_meta(
-                conn,
-                task.name,
-                {
-                    "model": mode_label,
-                    "outputs": task.outputs,
-                    "iterations": 0,
-                    "tool_calls": 0,
-                    "elapsed_s": round(time.time() - start_time, 1),
-                    "validation": "FAILED",
-                    "error": err,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                },
-            )
-            return AgentResult(
-                success=False,
-                final_message=err,
-                iterations=0,
-                messages=[],
-                tool_calls_count=0,
-            )
-
         result = execute_sql(
             conn,
             q,
             allowed_views=allowed_views,
             namespace=namespace,
             task_name=task.name,
+            forbidden_names=forbidden_names,
+            ddl_only=True,
         )
         if not result.get("success", False):
-            err_msg = str(result.get("error") or "SQL execution failed")
-            persist_task_meta(
-                conn,
-                task.name,
-                {
-                    "model": mode_label,
-                    "outputs": task.outputs,
-                    "iterations": 0,
-                    "tool_calls": 0,
-                    "elapsed_s": round(time.time() - start_time, 1),
-                    "validation": "FAILED",
-                    "error": err_msg,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                },
-            )
-            return AgentResult(
-                success=False,
-                final_message=err_msg,
-                iterations=0,
-                messages=[],
-                tool_calls_count=0,
-            )
+            execution_error = str(result.get("error") or "SQL execution failed")
+            break
 
-    errors = task.validate_transform(conn)
+    validation_errors: list[str] = []
+    if execution_error is None:
+        validation_errors = validate_task_complete(conn, task)
+
     elapsed_s = time.time() - start_time
-    if errors:
-        msg = "\n".join(f"- {e}" for e in errors)
-        persist_task_meta(
-            conn,
-            task.name,
-            {
-                "model": mode_label,
-                "outputs": task.outputs,
-                "iterations": 0,
-                "tool_calls": 0,
-                "elapsed_s": round(elapsed_s, 1),
-                "validation": "FAILED",
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            },
-        )
+    validation_status = "FAILED" if execution_error or validation_errors else "PASSED"
+    meta: dict[str, Any] = {
+        "model": mode_label,
+        "outputs": task.outputs,
+        "iterations": 0,
+        "tool_calls": 0,
+        "elapsed_s": round(elapsed_s, 1),
+        "validation": validation_status,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    if execution_error:
+        meta["error"] = execution_error
+
+    persist_task_meta(conn, task.name, meta)
+
+    if execution_error or validation_errors:
+        msg = execution_error or "\n".join(f"- {e}" for e in validation_errors)
         return AgentResult(
             success=False,
             final_message=msg,
@@ -891,20 +788,6 @@ async def run_sql_only_task(
             messages=[],
             tool_calls_count=0,
         )
-
-    persist_task_meta(
-        conn,
-        task.name,
-        {
-            "model": mode_label,
-            "outputs": task.outputs,
-            "iterations": 0,
-            "tool_calls": 0,
-            "elapsed_s": round(elapsed_s, 1),
-            "validation": "PASSED",
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        },
-    )
 
     return AgentResult(
         success=True,
@@ -923,8 +806,6 @@ def run_validate_sql(
 
     Returns a list of error messages (empty = success).
     """
-    init_trace_table(conn)
-
     statements = task.validate_sql_statements()
     if not statements:
         return []
@@ -933,18 +814,33 @@ def run_validate_sql(
     namespace = f"{task.name}__validation"
 
     for q in statements:
-        ok, err = _is_sql_only_statement_allowed(q)
-        if not ok:
-            return [err]
-
         result = execute_sql(
             conn,
             q,
             allowed_views=allowed_views,
             namespace=namespace,
             task_name=task.name,
+            ddl_only=True,
         )
         if not result.get("success", False):
             return [str(result.get("error") or "validate_sql execution failed")]
 
+    return []
+
+
+def validate_task_complete(
+    conn: duckdb.DuckDBPyConnection,
+    task: Task,
+) -> list[str]:
+    """Run full task validation and return error messages (empty = pass)."""
+    errors = task.validate_transform(conn)
+    if errors:
+        return errors
+    if task.has_validation():
+        errors = run_validate_sql(conn=conn, task=task)
+        if errors:
+            return errors
+        errors = task.validate_validation_views(conn)
+        if errors:
+            return errors
     return []

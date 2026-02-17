@@ -43,7 +43,7 @@ from .diff import (
     ViewChange,
 )
 from .ingest import ingest_table
-from .agent import run_task_agent, run_sql_only_task, run_validate_sql
+from .agent import init_trace_table, run_task_agent, run_sql_only_task
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
 
 log = logging.getLogger(__name__)
@@ -403,17 +403,27 @@ class Workspace:
         self,
         conn: duckdb.DuckDBPyConnection,
         task: Task,
-        client: OpenRouterClient,
+        client: OpenRouterClient | None,
         model: str,
         max_iterations: int,
     ) -> AgentResult:
-        """Execute a single task (SQL or LLM) and return its result."""
+        """Execute a single task (SQL or LLM) and return its result.
+
+        For LLM tasks, both structural and SQL validation run inside the
+        agent loop — the agent gets feedback and self-corrects within its
+        iteration budget.
+
+        For SQL-only tasks, validation runs once after execution (no agent
+        to retry).
+        """
         mode = task.transform_mode()
 
         if mode == "sql":
-            result = await run_sql_only_task(conn=conn, task=task)
+            return await run_sql_only_task(conn=conn, task=task)
         elif mode == "prompt":
-            result = await run_task_agent(
+            if client is None:
+                raise RuntimeError(f"Task '{task.name}' requires an OpenRouterClient")
+            return await run_task_agent(
                 conn=conn,
                 task=task,
                 client=client,
@@ -423,68 +433,9 @@ class Workspace:
         else:
             raise RuntimeError(f"Unknown task mode: {mode}")
 
-        if not result.success:
-            return result
-
-        if not task.has_validation():
-            return result
-
-        def validation_errors() -> list[str]:
-            errors = run_validate_sql(conn=conn, task=task)
-            if errors:
-                return errors
-            return task.validate_validation_views(conn)
-
-        errors = validation_errors()
-        if not errors:
-            return result
-
-        if mode == "prompt":
-            max_validation_retries = 3
-            current = result
-            for attempt in range(1, max_validation_retries + 1):
-                feedback = "\n".join(f"- {e}" for e in errors)
-                log.warning(
-                    "[%s] Validation failed; retry %d/%d",
-                    task.name,
-                    attempt,
-                    max_validation_retries,
-                )
-                current = await run_task_agent(
-                    conn=conn,
-                    task=task,
-                    client=client,
-                    model=model,
-                    max_iterations=max_iterations,
-                    feedback=feedback,
-                    prior_messages=current.messages,
-                )
-                if not current.success:
-                    return current
-                errors = validation_errors()
-                if not errors:
-                    return current
-            return AgentResult(
-                success=False,
-                final_message="\n".join(f"- {e}" for e in errors),
-                iterations=current.iterations,
-                messages=current.messages,
-                usage=current.usage,
-                tool_calls_count=current.tool_calls_count,
-            )
-
-        return AgentResult(
-            success=False,
-            final_message="\n".join(f"- {e}" for e in errors),
-            iterations=result.iterations,
-            messages=result.messages,
-            usage=result.usage,
-            tool_calls_count=result.tool_calls_count,
-        )
-
     async def run(
         self,
-        client: OpenRouterClient,
+        client: OpenRouterClient | None = None,
         model: str = "openai/gpt-5.2",
         max_iterations: int = 200,
     ) -> WorkspaceResult:
@@ -513,6 +464,7 @@ class Workspace:
         if db_path.exists():
             db_path.unlink()
         conn = duckdb.connect(str(db_path))
+        init_trace_table(conn)
 
         log.info("Ingesting %d input(s)...", len(self.inputs))
         input_row_counts = self._ingest_all(conn)
@@ -522,7 +474,7 @@ class Workspace:
             conn,
             model,
             tasks=self.tasks,
-            reasoning_effort=client.reasoning_effort,
+            reasoning_effort=client.reasoning_effort if client else None,
             max_iterations=max_iterations,
             input_row_counts=input_row_counts,
             spec_module=self.spec_module,
