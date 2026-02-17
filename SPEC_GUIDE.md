@@ -499,7 +499,7 @@ The `.db` is a queryable audit trail. After a run, you can open it and trace how
 
 ### Inspect the database
 
-After a run, task outputs and validation views are **materialized as tables** (frozen). Intermediate `{task}_*` views stay as views for debuggability. The original view SQL definitions are preserved in `_view_definitions`.
+After a run, task outputs and validation views are **materialized as tables** (frozen). Intermediate `{task}_*` views stay as views for debuggability. Every SQL statement (including input validation) is logged in `_trace`. The `_view_definitions` view (derived from `_trace`) provides lineage — the original CREATE VIEW SQL for each materialized output.
 
 ```bash
 # Show all user-created tables (materialized outputs + inputs)
@@ -520,7 +520,7 @@ duckdb output.db "SELECT * FROM invoices WHERE _row_id = 42"
 
 ### Lineage via `_view_definitions`
 
-After materialization, output views become tables. Their original SQL is preserved in `_view_definitions`:
+After materialization, output views become tables. Their original SQL is available via `_view_definitions` (a view derived from `_trace`):
 
 ```sql
 SELECT task, view_name, sql FROM _view_definitions ORDER BY task, view_name
@@ -533,7 +533,7 @@ intermediate_view → materialized_table → ... → input_table
 
 ### SQL execution trace
 
-Every SQL query the agent executed is logged in `_trace`:
+Every SQL query executed — by task agents, SQL-only tasks, and input validation — is logged in `_trace`:
 ```sql
 SELECT task, query, success, error, row_count, elapsed_ms
 FROM _trace

@@ -62,13 +62,13 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 ## Key Design Decisions
 
 - **Workspace = single .db** — all data, views, metadata, trace in one file (DuckDB format).
-- **Agents only write SQL views and macros** — no tables, no inserts. After task completion, declared outputs and validation views are materialized as tables. Original SQL preserved in `_view_definitions` table. Intermediate `{task}_*` views stay as views for debuggability.
+- **Agents only write SQL views and macros** — no tables, no inserts. After task completion, declared outputs and validation views are materialized as tables. Original SQL is in `_trace`; the `_view_definitions` view (derived from `_trace`) provides lineage queries. Intermediate `{task}_*` views stay as views for debuggability.
 - **Namespace enforcement** — DuckDB `extract_statements` for statement type classification + regex for name extraction; each task can only CREATE/DROP views and macros with its declared outputs or `{name}_*` prefixed names
 - **DAG is static** — declared upfront, deps resolved from output->input edges. Each task starts as soon as all its dependencies complete (greedy scheduling, not layer-by-layer). Layers still computed for display via `resolve_dag()`.
 - **Failure isolation** — a failed task only blocks its downstream dependents, not the entire layer. Unrelated branches continue.
 - **Result size cap** — SELECT results exceeding 30k chars (~20k tokens) are rejected with an error nudging the agent to use LIMIT. Configurable via `max_result_chars` on `execute_sql()`.
 - **SQL trace** in _trace table with task column for per-task filtering
-- **View materialization** — after task success, declared outputs + validation views are converted from views to tables via `materialize_task_outputs()` (which delegates to `materialize_views()`). Input validation views are also materialized on success via the same `materialize_views()` core function. Original SQL saved to `_view_definitions` table. Downstream tasks read pre-computed tables. Intermediate `{task}_*` views stay as views.
+- **View materialization** — after task success, declared outputs + validation views are converted from views to tables via `materialize_task_outputs()` (which delegates to `materialize_views()`). Input validation views are also materialized on success via the same `materialize_views()` core function. Original CREATE VIEW SQL is already in `_trace` (logged during execution); `_view_definitions` is a derived view on `_trace`. Downstream tasks read pre-computed tables. Intermediate `{task}_*` views stay as views.
 - **Per-task metadata** in _task_meta table (PK: task, value: meta_json JSON blob)
 - **Display**: `.` per SQL tool call at DEBUG level only
 - **Concurrency**: asyncio cooperative — true parallelism only at LLM API call level, DuckDB access naturally serialized on single thread
@@ -83,7 +83,7 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 - **Per-query timeout** (`agent.py`): `DEFAULT_QUERY_TIMEOUT_S = 30`. Uses `threading.Timer` + `conn.interrupt()`. Catches `duckdb.InterruptException`, connection stays usable. Configurable via `query_timeout_s` param on `execute_sql()`.
 - **Output schema validation** (`task.py`): `output_columns: dict[str, list[str]]` on `Task`. Runs after view existence check, before validation view enforcement. Queries `information_schema.columns` and checks required columns are present.
 - **Task validation views** (`task.py`): tasks can declare `validate_sql` that creates `{task}__validation` / `{task}__validation_*` views with columns `status`, `message`. Any row with status='fail' fails the task.
-- **Input validation** (`workspace.py`): `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, str]` on `Workspace`. Runs after ingestion, before tasks. Column check short-circuits before SQL checks. Callable errors caught with context. Empty tables logged as warnings. Passing input validation views are materialized as tables (same as task validation views); failing views are dropped.
+- **Input validation** (`workspace.py`): `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, str]` on `Workspace`. Runs after ingestion, before tasks. Column check short-circuits before SQL checks. Callable errors caught with context. Empty tables logged as warnings. Input validation SQL is logged to `_trace` (with `task` = input table name). Passing input validation views are materialized as tables (same as task validation views); failing views are dropped.
 
 ## CLI Commands
 

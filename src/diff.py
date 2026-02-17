@@ -47,12 +47,17 @@ class ViewChange:
 
 
 def snapshot_views(conn: duckdb.DuckDBPyConnection) -> dict[str, ViewSnapshot]:
-    """Snapshot all non-internal view definitions, schemas, and row counts."""
+    """Snapshot all user view definitions, schemas, and row counts.
+
+    Excludes ``_``-prefixed infrastructure views (e.g. ``_view_definitions``)
+    which are internal to the workspace machinery.
+    """
     snapshots: dict[str, ViewSnapshot] = {}
 
     try:
         views = conn.execute(
-            "SELECT view_name, sql FROM duckdb_views() WHERE internal = false"
+            "SELECT view_name, sql FROM duckdb_views() "
+            "WHERE internal = false AND view_name[1] != '_'"
         ).fetchall()
     except duckdb.Error:
         return snapshots

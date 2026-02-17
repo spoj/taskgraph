@@ -10,8 +10,9 @@ dependencies complete (not layer-by-layer). A failed task only blocks
 its downstream dependents; unrelated branches continue.
 
 After a task passes validation, its declared output views are
-materialized as tables (frozen). The original SQL definitions are
-preserved in the ``_view_definitions`` table for lineage queries.
+materialized as tables (frozen). The original SQL that created each
+view is already in ``_trace`` (logged during execution). A derived
+``_view_definitions`` view on ``_trace`` provides lineage queries.
 Intermediate views (``{task}_*``) are left as views for debuggability.
 
 Usage:
@@ -47,7 +48,7 @@ from .diff import (
     persist_changes,
 )
 from .ingest import FileInput, ingest_file, ingest_table
-from .agent import init_trace_table, run_task_agent, run_sql_only_task
+from .agent import init_trace_table, log_trace, run_task_agent, run_sql_only_task
 from .task import (
     Task,
     resolve_dag,
@@ -176,18 +177,6 @@ def upsert_workspace_meta(
 # --- View materialization ---
 
 
-def _ensure_view_definitions_table(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create the _view_definitions table if it doesn't exist."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS _view_definitions (
-            task VARCHAR NOT NULL,
-            view_name VARCHAR NOT NULL,
-            sql VARCHAR NOT NULL,
-            PRIMARY KEY (task, view_name)
-        )
-    """)
-
-
 def _drop_views(conn: duckdb.DuckDBPyConnection, view_names: list[str]) -> None:
     """Drop a list of views (best-effort cleanup)."""
     for name in view_names:
@@ -205,22 +194,22 @@ def materialize_views(
     """Materialize a list of views as tables.
 
     Core materialization logic shared by task outputs and input validation
-    views. For each view that exists:
+    views. For each view that exists, does a 3-step swap: CREATE TABLE
+    from view, DROP VIEW, RENAME TABLE.
 
-    1. Saves the SQL definition to ``_view_definitions`` (keyed by *label*).
-    2. Does a 3-step swap: CREATE TABLE from view, DROP VIEW, RENAME TABLE.
+    The original CREATE VIEW SQL is already recorded in ``_trace`` (from
+    the exec that created it). The ``_view_definitions`` view on ``_trace``
+    provides lineage queries.
 
     Args:
         conn: DuckDB connection.
         view_names: View names to materialize. Duplicates are ignored.
             Missing views are silently skipped.
-        label: Label stored in the ``task`` column of ``_view_definitions``
-            (task name for task outputs, input table name for input validation).
+        label: Not used for lineage anymore (SQL is already in _trace).
+            Kept for API compatibility and logging.
 
     Returns the number of views materialized.
     """
-    _ensure_view_definitions_table(conn)
-
     # Deduplicate while preserving order
     seen: set[str] = set()
     unique_names: list[str] = []
@@ -231,23 +220,13 @@ def materialize_views(
 
     materialized = 0
     for view_name in unique_names:
-        # Get the view's SQL definition before converting
+        # Check the view exists before attempting materialization
         rows = conn.execute(
-            "SELECT sql FROM duckdb_views() WHERE internal = false AND view_name = ?",
+            "SELECT 1 FROM duckdb_views() WHERE internal = false AND view_name = ?",
             [view_name],
         ).fetchall()
         if not rows:
             continue  # View doesn't exist (task may have failed or already materialized)
-
-        view_sql = rows[0][0]
-
-        # Preserve the SQL definition for lineage
-        conn.execute(
-            "INSERT INTO _view_definitions (task, view_name, sql) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT (task, view_name) DO UPDATE SET sql = excluded.sql",
-            [label, view_name, view_sql],
-        )
 
         # Materialize: create table from view, drop view, rename table.
         # Drop any leftover tmp table from a previous crashed run, then
@@ -281,8 +260,9 @@ def materialize_task_outputs(
     pre-computed data instead of re-evaluating the entire upstream view
     chain on every query.
 
-    The original view SQL definitions are preserved in ``_view_definitions``
-    for lineage and audit queries.
+    The original CREATE VIEW SQL is in ``_trace`` (logged when the agent
+    or SQL-only task executed it). The ``_view_definitions`` view on
+    ``_trace`` provides the same lineage interface.
 
     What gets materialized:
     - Declared task outputs (``task.outputs``)
@@ -443,9 +423,27 @@ class Workspace:
 
             # Execute all statements (CREATE VIEW etc.)
             for sql in stmts:
+                start = time.perf_counter()
                 try:
                     conn.execute(sql)
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    log_trace(
+                        conn,
+                        sql,
+                        success=True,
+                        elapsed_ms=elapsed_ms,
+                        task_name=table_name,
+                    )
                 except duckdb.Error as e:
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    log_trace(
+                        conn,
+                        sql,
+                        success=False,
+                        error=str(e),
+                        elapsed_ms=elapsed_ms,
+                        task_name=table_name,
+                    )
                     errors.append(f"Input validation SQL error for '{table_name}': {e}")
                     # Clean up any views created so far
                     _drop_views(conn, all_created_views)

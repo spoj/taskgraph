@@ -6,7 +6,7 @@ import duckdb
 import pytest
 
 from tests.conftest import _make_task
-from src.agent import run_sql_only_task
+from src.agent import run_sql_only_task, log_trace
 from src.ingest import ingest_table
 from src.workspace import Workspace, persist_workspace_meta, read_workspace_meta
 from src.workspace import materialize_task_outputs
@@ -298,8 +298,10 @@ class TestMaterializeTaskOutputs:
         assert row == (1, "hello")
 
     def test_preserves_sql_in_view_definitions(self, conn):
-        """Original view SQL is saved to _view_definitions table."""
-        conn.execute("CREATE VIEW out AS SELECT 42 AS val")
+        """Original view SQL is visible in _view_definitions (derived from _trace)."""
+        sql = "CREATE VIEW out AS SELECT 42 AS val"
+        conn.execute(sql)
+        log_trace(conn, sql, success=True, task_name="t")
         task = _make_task(name="t", outputs=["out"])
 
         materialize_task_outputs(conn, task)
@@ -314,8 +316,12 @@ class TestMaterializeTaskOutputs:
 
     def test_multiple_outputs(self, conn):
         """All declared outputs are materialized."""
-        conn.execute("CREATE VIEW a AS SELECT 1 AS x")
-        conn.execute("CREATE VIEW b AS SELECT 2 AS x")
+        sql_a = "CREATE VIEW a AS SELECT 1 AS x"
+        sql_b = "CREATE VIEW b AS SELECT 2 AS x"
+        conn.execute(sql_a)
+        conn.execute(sql_b)
+        log_trace(conn, sql_a, success=True, task_name="t")
+        log_trace(conn, sql_b, success=True, task_name="t")
         task = _make_task(name="t", outputs=["a", "b"])
 
         n = materialize_task_outputs(conn, task)
@@ -510,16 +516,14 @@ class TestMaterializeTaskOutputs:
         assert "watch out" in warnings[0]
 
     def test_validation_view_sql_preserved(self, conn):
-        """Validation view SQL is saved in _view_definitions."""
-        conn.execute(
-            "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
-        )
+        """Validation view SQL is visible in _view_definitions (derived from _trace)."""
+        sql = "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
+        conn.execute(sql)
+        log_trace(conn, sql, success=True, task_name="t")
         task = _make_task(
             name="t",
             outputs=[],
-            validate_sql=(
-                "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
-            ),
+            validate_sql=sql,
         )
 
         materialize_task_outputs(conn, task)

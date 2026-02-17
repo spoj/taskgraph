@@ -331,7 +331,14 @@ def persist_task_meta(
 
 
 def init_trace_table(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create the _trace table if it doesn't exist."""
+    """Create the _trace table and derived views.
+
+    Also creates ``_view_definitions`` as a view on ``_trace`` — it
+    extracts the last successful ``CREATE VIEW`` statement per view name,
+    giving the same ``(task, view_name, sql)`` interface that the old
+    ``_view_definitions`` table provided, but derived entirely from the
+    trace log.
+    """
     conn.execute("CREATE SEQUENCE IF NOT EXISTS _trace_seq")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _trace (
@@ -344,6 +351,23 @@ def init_trace_table(conn: duckdb.DuckDBPyConnection) -> None:
             row_count INTEGER,
             elapsed_ms DOUBLE
         )
+    """)
+    conn.execute(r"""
+        CREATE OR REPLACE VIEW _view_definitions AS
+        SELECT task, view_name, query AS sql
+        FROM (
+            SELECT task,
+                   regexp_extract(query, 'VIEW\s+"?(\w+)"?', 1) AS view_name,
+                   query,
+                   row_number() OVER (
+                       PARTITION BY regexp_extract(query, 'VIEW\s+"?(\w+)"?', 1)
+                       ORDER BY id DESC
+                   ) AS rn
+            FROM _trace
+            WHERE success = true
+              AND regexp_matches(query, '(?i)^\s*CREATE\s+(OR\s+REPLACE\s+)?VIEW\s')
+        )
+        WHERE rn = 1
     """)
 
 
