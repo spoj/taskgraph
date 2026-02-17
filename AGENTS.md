@@ -21,7 +21,7 @@ independent agent writing namespace-enforced SQL views.
 - `src/sql_utils.py` — shared SQL utilities: parser connection, statement splitting, column schema queries, CREATE name extraction
 - `src/task.py` — Task dataclass, DAG resolution (topo-sort via Kahn's algorithm), dependency graph, graph validation
 - `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling, per-task change tracking, view materialization
-- `src/ingest.py` — Ingestion: DataFrame/list[dict]/dict[str,list] -> DuckDB with _row_id PK
+- `src/ingest.py` — Ingestion: DataFrame/list[dict]/dict[str,list] or file paths -> DuckDB with _row_id PK
 - `src/spec.py` — shared spec loader, spec module resolution
 - `scripts/cli.py` — CLI entry point: `tg init`, `tg run`, `tg show`
 
@@ -29,7 +29,7 @@ independent agent writing namespace-enforced SQL views.
 
 A Python module defining:
 ```python
-INPUTS     = {"table_name": callable_or_data, ...}  # callable returns DataFrame/list[dict]/dict[str,list]
+INPUTS     = {"table_name": callable_or_data_or_file, ...}  # callable returns DataFrame/list[dict]/dict[str,list]
 TASKS      = [
   {"name": ..., "prompt": ..., "inputs": [...], "outputs": [...], "validate_sql": "..."},
   {"name": ..., "sql": "...", "inputs": [...], "outputs": [...]},
@@ -37,12 +37,12 @@ TASKS      = [
 EXPORTS    = {"report.xlsx": fn(conn, path), ...}     # optional export functions
 ```
 
-INPUTS values can be **simple** (callable or raw data) or **rich** (dict with `"data"` key + optional validation):
+INPUTS values can be **simple** (callable, raw data, or file path) or **rich** (dict with `"source"` key + optional validation):
 
 ```python
 INPUTS = {
     "invoices": {
-        "data": load_invoices,                                   # callable or raw data
+        "source": "data/invoices.xlsx#Sheet1",                   # file path or callable or raw data
         "columns": ["id", "amount", "date"],                     # optional: required columns
         "validate_sql": ["SELECT id FROM invoices WHERE amount IS NULL"],  # optional: must return 0 rows
     },
@@ -50,7 +50,7 @@ INPUTS = {
 }
 ```
 
-At the `load_spec` boundary, if a value is a dict with a `"data"` key, `columns` and `validate_sql` are extracted per-input and passed to the Workspace as `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]`.
+At the `load_spec` boundary, if a value is a dict with a `"source"` key, `columns` and `validate_sql` are extracted per-input and passed to the Workspace as `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]`.
 
 Task `sql` or `prompt` must be a **string**. Exactly one is required per task.
 `validate_sql` (optional) is a **string** that runs after the transform to create

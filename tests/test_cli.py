@@ -69,7 +69,7 @@ class TestLoadSpec:
             tmp_path,
             "INPUTS = {\n"
             '    "tbl": {\n'
-            '        "data": [{"a": 1, "b": 2}],\n'
+            '        "source": [{"a": 1, "b": 2}],\n'
             '        "columns": ["a", "b"],\n'
             '        "validate_sql": ["SELECT 1 FROM tbl WHERE a IS NULL"],\n'
             "    }\n"
@@ -87,8 +87,32 @@ class TestLoadSpec:
         # The actual data is the list, not the dict
         assert result["inputs"]["tbl"] == [{"a": 1, "b": 2}]
 
+    def test_file_input_parsed_relative_to_spec(self, tmp_path):
+        """File input strings resolve relative to the spec directory."""
+        from src.ingest import FileInput
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            'INPUTS = {"sales": "data/sales.csv"}\n'
+            'TASKS = [{"name": "t", '
+            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
+            '"inputs": ["sales"], "outputs": ["o"]}]\n',
+        )
+
+        module_dir = tmp_path / module_path
+        data_dir = module_dir / "data"
+        data_dir.mkdir()
+        (data_dir / "sales.csv").write_text("id,val\n1,a\n")
+
+        result = load_spec_from_module(module_path)
+        file_input = result["inputs"]["sales"]
+        assert isinstance(file_input, FileInput)
+        assert file_input.format == "csv"
+        assert file_input.path == (data_dir / "sales.csv").resolve()
+
     def test_simple_input_no_validation(self, tmp_path):
-        """Simple INPUTS (no dict with 'data') have no validation metadata."""
+        """Simple INPUTS (no dict with 'source') have no validation metadata."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(

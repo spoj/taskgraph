@@ -13,7 +13,7 @@ Usage:
 
 INPUTS = {
     "raw_orders": {
-        "data": [
+        "source": [
             {
                 "order_id": "ORD-001",
                 "customer": "alice",
@@ -48,7 +48,7 @@ INPUTS = {
         "columns": ["order_id", "customer", "items", "date"],
     },
     "price_list": {
-        "data": [
+        "source": [
             {"sku": "widget_a", "unit_price": 10.00},
             {"sku": "widget_b", "unit_price": 25.00},
             {"sku": "widget_c", "unit_price": 7.50},

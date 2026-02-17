@@ -45,9 +45,8 @@ from .diff import (
     diff_snapshots,
     format_changes,
     persist_changes,
-    ViewChange,
 )
-from .ingest import ingest_table
+from .ingest import FileInput, ingest_file, ingest_table
 from .agent import init_trace_table, run_task_agent, run_sql_only_task
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
 from .sql_utils import get_column_schema
@@ -55,7 +54,7 @@ from .sql_utils import get_column_schema
 log = logging.getLogger(__name__)
 
 # Type aliases
-InputValue = Any  # Callable[[], TableData] | TableData
+InputValue = Any  # Callable[[], TableData] | TableData | FileInput
 ExportFn = Callable[[duckdb.DuckDBPyConnection, Path], None]
 
 
@@ -269,10 +268,10 @@ class Workspace:
 
     Args:
         db_path: Path for the output database (created fresh).
-        inputs: Mapping of table_name -> callable or raw data.
-            If callable, it is called at ingest time and must return
-            a DataFrame, list[dict], or dict[str, list].
-            If not callable, it is treated as raw data directly.
+    inputs: Mapping of table_name -> file input, callable, or raw data.
+        File inputs are parsed by the spec loader and ingested via DuckDB
+        or the PDF extractor. Callables return DataFrame, list[dict], or
+        dict[str, list]. Non-callables are treated as raw data directly.
         tasks: List of Task definitions forming a DAG.
         exports: Mapping of output_path -> fn(conn, path).
             Export functions run after all tasks pass. They receive the
@@ -305,7 +304,9 @@ class Workspace:
                 + "\n".join(f"  - {e}" for e in errors)
             )
 
-    def _ingest_all(self, conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
+    async def _ingest_all(
+        self, conn: duckdb.DuckDBPyConnection, client: Any | None
+    ) -> dict[str, int]:
         """Resolve all inputs and ingest into the database.
 
         Auto-checks:
@@ -316,16 +317,18 @@ class Workspace:
         """
         row_counts: dict[str, int] = {}
         for table_name, value in self.inputs.items():
-            if callable(value):
+            if isinstance(value, FileInput):
+                await ingest_file(conn, value, table_name, client=client)
+            elif callable(value):
                 try:
                     data = value()
                 except Exception as e:
                     raise RuntimeError(
                         f"Input '{table_name}' callable failed: {e}"
                     ) from e
+                ingest_table(conn, data, table_name)
             else:
-                data = value
-            ingest_table(conn, data, table_name)
+                ingest_table(conn, value, table_name)
             row = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()
             count = row[0] if row else 0
             row_counts[table_name] = count
@@ -544,112 +547,115 @@ class Workspace:
         if db_path.exists():
             db_path.unlink()
         conn = duckdb.connect(str(db_path))
-        init_trace_table(conn)
+        try:
+            init_trace_table(conn)
 
-        log.info("Ingesting %d input(s)...", len(self.inputs))
-        input_row_counts = self._ingest_all(conn)
+            log.info("Ingesting %d input(s)...", len(self.inputs))
+            input_row_counts = await self._ingest_all(conn, client=client)
 
-        # Persist workspace metadata (after ingestion so we have row counts)
-        persist_workspace_meta(
-            conn,
-            model,
-            tasks=self.tasks,
-            reasoning_effort=client.reasoning_effort if client else None,
-            max_iterations=max_iterations,
-            input_row_counts=input_row_counts,
-            spec_module=self.spec_module,
-        )
+            # Persist workspace metadata (after ingestion so we have row counts)
+            persist_workspace_meta(
+                conn,
+                model,
+                tasks=self.tasks,
+                reasoning_effort=client.reasoning_effort if client else None,
+                max_iterations=max_iterations,
+                input_row_counts=input_row_counts,
+                spec_module=self.spec_module,
+            )
 
-        # Validate inputs before running tasks
-        if self.input_columns or self.input_validate_sql:
-            log.info("Validating inputs...")
-            input_errors = self._validate_inputs(conn)
-            if input_errors:
-                conn.close()
-                elapsed_s = time.time() - start_time
-                log.error("Input validation failed:")
-                for e in input_errors:
-                    log.error("  - %s", e)
-                raise ValueError(
-                    "Input validation failed:\n"
-                    + "\n".join(f"  - {e}" for e in input_errors)
+            # Validate inputs before running tasks
+            if self.input_columns or self.input_validate_sql:
+                log.info("Validating inputs...")
+                input_errors = self._validate_inputs(conn)
+                if input_errors:
+                    elapsed_s = time.time() - start_time
+                    log.error("Input validation failed:")
+                    for e in input_errors:
+                        log.error("  - %s", e)
+                    raise ValueError(
+                        "Input validation failed:\n"
+                        + "\n".join(f"  - {e}" for e in input_errors)
+                    )
+
+            async def run_one(task: Task) -> tuple[str, AgentResult]:
+                log.info(
+                    "[%s] Starting (outputs: %s)",
+                    task.name,
+                    ", ".join(task.outputs),
+                )
+                before = snapshot_views(conn)
+                result = await self._execute_task(
+                    conn=conn,
+                    task=task,
+                    client=client,
+                    model=model,
+                    max_iterations=max_iterations,
+                )
+                after = snapshot_views(conn)
+                changes = diff_snapshots(before, after)
+                if changes:
+                    persist_changes(conn, task.name, changes)
+                    change_summary = format_changes(task.name, changes)
+                    if change_summary:
+                        log.info("%s", change_summary)
+                # Materialize successful task outputs as tables so downstream
+                # tasks read pre-computed data instead of re-evaluating view chains.
+                if result.success:
+                    n = materialize_task_outputs(conn, task)
+                    if n:
+                        log.debug("[%s] Materialized %d output(s)", task.name, n)
+                return task.name, result
+
+            task_results, all_success = await self._run_task_dag(self.tasks, run_one)
+
+            # Run exports if all tasks passed
+            export_errors: dict[str, str] = {}
+            if all_success and self.exports:
+                log.info("--- Exports (%d) ---", len(self.exports))
+                export_errors = self._run_exports(conn)
+
+            # Persist export results for later inspection
+            if self.exports:
+                results: dict[str, dict[str, Any]] = {}
+                for name in sorted(self.exports.keys()):
+                    if name in export_errors:
+                        results[name] = {"ok": False, "error": export_errors[name]}
+                    else:
+                        results[name] = {"ok": bool(all_success), "error": None}
+                exports_meta = {
+                    "attempted": bool(all_success),
+                    "results": results,
+                }
+                upsert_workspace_meta(
+                    conn,
+                    [("exports", json.dumps(exports_meta, sort_keys=True))],
                 )
 
-        # Accumulate per-task view changes for reporting
-        task_changes: list[tuple[str, list[ViewChange]]] = []
+            elapsed_s = time.time() - start_time
 
-        async def run_one(task: Task) -> tuple[str, AgentResult]:
-            log.info("[%s] Starting (outputs: %s)", task.name, ", ".join(task.outputs))
-            before = snapshot_views(conn)
-            result = await self._execute_task(
-                conn=conn,
-                task=task,
-                client=client,
-                model=model,
-                max_iterations=max_iterations,
+            status = "ALL PASSED" if all_success else "SOME FAILED"
+            log.info("--- Workspace complete: %s (%.1fs) ---", status, elapsed_s)
+            for name, result in task_results.items():
+                s = "PASS" if result.success else "FAIL"
+                tokens = (
+                    result.usage["prompt_tokens"] + result.usage["completion_tokens"]
+                )
+                log.info(
+                    "  %s: %s (%d iters, %d tools, %d tokens)",
+                    name,
+                    s,
+                    result.iterations,
+                    result.tool_calls_count,
+                    tokens,
+                )
+
+            return WorkspaceResult(
+                success=all_success and not export_errors,
+                task_results=task_results,
+                elapsed_s=elapsed_s,
+                dag_layers=dag_layer_names,
+                export_errors=export_errors,
             )
-            after = snapshot_views(conn)
-            changes = diff_snapshots(before, after)
-            if changes:
-                persist_changes(conn, task.name, changes)
-                task_changes.append((task.name, changes))
-                change_summary = format_changes(task.name, changes)
-                if change_summary:
-                    log.info("%s", change_summary)
-            # Materialize successful task outputs as tables so downstream
-            # tasks read pre-computed data instead of re-evaluating view chains.
-            if result.success:
-                n = materialize_task_outputs(conn, task)
-                if n:
-                    log.debug("[%s] Materialized %d output(s)", task.name, n)
-            return task.name, result
-
-        task_results, all_success = await self._run_task_dag(self.tasks, run_one)
-
-        # Run exports if all tasks passed
-        export_errors: dict[str, str] = {}
-        if all_success and self.exports:
-            log.info("--- Exports (%d) ---", len(self.exports))
-            export_errors = self._run_exports(conn)
-
-        # Persist export results for later inspection
-        if self.exports:
-            results: dict[str, dict[str, Any]] = {}
-            for name in sorted(self.exports.keys()):
-                if name in export_errors:
-                    results[name] = {"ok": False, "error": export_errors[name]}
-                else:
-                    results[name] = {"ok": bool(all_success), "error": None}
-            exports_meta = {
-                "attempted": bool(all_success),
-                "results": results,
-            }
-            upsert_workspace_meta(
-                conn,
-                [("exports", json.dumps(exports_meta, sort_keys=True))],
-            )
-
-        conn.close()
-        elapsed_s = time.time() - start_time
-
-        status = "ALL PASSED" if all_success else "SOME FAILED"
-        log.info("--- Workspace complete: %s (%.1fs) ---", status, elapsed_s)
-        for name, result in task_results.items():
-            s = "PASS" if result.success else "FAIL"
-            tokens = result.usage["prompt_tokens"] + result.usage["completion_tokens"]
-            log.info(
-                "  %s: %s (%d iters, %d tools, %d tokens)",
-                name,
-                s,
-                result.iterations,
-                result.tool_calls_count,
-                tokens,
-            )
-
-        return WorkspaceResult(
-            success=all_success and not export_errors,
-            task_results=task_results,
-            elapsed_s=elapsed_s,
-            dag_layers=dag_layer_names,
-            export_errors=export_errors,
-        )
+        finally:
+            conn.close()

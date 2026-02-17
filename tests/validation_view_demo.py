@@ -11,7 +11,7 @@ Usage:
 
 INPUTS = {
     "expenses": {
-        "data": [
+        "source": [
             {
                 "id": 1,
                 "date": "2025-01-05",
@@ -87,7 +87,7 @@ INPUTS = {
     },
     # Expected total for this dataset
     "expected_total": {
-        "data": [
+        "source": [
             {"label": "expected", "total": 19000.00},
         ],
         "columns": ["label", "total"],

@@ -1,8 +1,22 @@
+import asyncio
+from pathlib import Path
+
 import pytest
 import polars as pl
+from openpyxl import Workbook
 
 from tests.conftest import _make_task
-from src.ingest import coerce_to_dataframe, ingest_table
+from src.ingest import (
+    coerce_to_dataframe,
+    ingest_csv,
+    ingest_excel,
+    ingest_parquet,
+    ingest_pdf,
+    ingest_table,
+    PDF_RESPONSE_FORMAT,
+    parse_file_path,
+    parse_file_string,
+)
 from src.workspace import Workspace
 
 
@@ -111,6 +125,110 @@ class TestIngestion:
         ingest_table(conn, df, "empty_t")
         count = conn.execute("SELECT COUNT(*) FROM empty_t").fetchone()[0]
         assert count == 0
+
+    def test_ingest_csv_file(self, conn, tmp_path: Path):
+        df = pl.DataFrame({"id": [1, 2], "val": ["a", "b"]})
+        path = tmp_path / "data.csv"
+        df.write_csv(path)
+
+        ingest_csv(conn, path, "csv_t")
+        rows = conn.execute(
+            "SELECT _row_id, id, val FROM csv_t ORDER BY _row_id"
+        ).fetchall()
+        assert rows == [(1, 1, "a"), (2, 2, "b")]
+
+    def test_ingest_parquet_file(self, conn, tmp_path: Path):
+        df = pl.DataFrame({"id": [1, 2], "val": ["a", "b"]})
+        path = tmp_path / "data.parquet"
+        df.write_parquet(path)
+
+        ingest_parquet(conn, path, "parquet_t")
+        rows = conn.execute(
+            "SELECT _row_id, id, val FROM parquet_t ORDER BY _row_id"
+        ).fetchall()
+        assert rows == [(1, 1, "a"), (2, 2, "b")]
+
+    def test_ingest_excel_file(self, conn, tmp_path: Path):
+        path = tmp_path / "data.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        ws.append(["id", "val"])
+        ws.append([1, "a"])
+        ws.append([2, "b"])
+        wb.save(path)
+
+        ingest_excel(conn, path, "excel_t")
+        rows = conn.execute(
+            "SELECT _row_id, id, val FROM excel_t ORDER BY _row_id"
+        ).fetchall()
+        assert rows == [(1, 1, "a"), (2, 2, "b")]
+
+    def test_ingest_excel_specific_sheet(self, conn, tmp_path: Path):
+        path = tmp_path / "data.xlsx"
+        wb = Workbook()
+        ws1 = wb.active
+        ws1.title = "Sheet1"
+        ws1.append(["id", "val"])
+        ws1.append([1, "a"])
+        ws2 = wb.create_sheet(title="Budget")
+        ws2.append(["id", "val"])
+        ws2.append([99, "z"])
+        wb.save(path)
+
+        ingest_excel(conn, path, "excel_t", sheet="Budget")
+        rows = conn.execute(
+            "SELECT _row_id, id, val FROM excel_t ORDER BY _row_id"
+        ).fetchall()
+        assert rows == [(1, 99, "z")]
+
+    def test_ingest_pdf_file(self, conn, tmp_path: Path):
+        path = tmp_path / "data.pdf"
+        path.write_bytes(b"%PDF-1.4\n%fake\n")
+
+        class DummyClient:
+            def __init__(self):
+                self.calls = []
+
+            async def chat(self, model, messages, response_format=None):
+                self.calls.append(
+                    {
+                        "model": model,
+                        "messages": messages,
+                        "response_format": response_format,
+                    }
+                )
+                return {
+                    "message": {
+                        "content": '{"rows": [{"id": 1, "val": "a"}, {"id": 2, "val": "b"}]}'
+                    },
+                    "usage": {},
+                }
+
+        client = DummyClient()
+        asyncio.run(ingest_pdf(conn, path, "pdf_t", client=client))
+
+        rows = conn.execute(
+            "SELECT _row_id, id, val FROM pdf_t ORDER BY _row_id"
+        ).fetchall()
+        assert rows == [(1, 1, "a"), (2, 2, "b")]
+        assert client.calls
+        content = client.calls[0]["messages"][0]["content"]
+        assert any(item.get("type") == "image_url" for item in content)
+        assert client.calls[0]["response_format"] == PDF_RESPONSE_FORMAT
+
+    def test_parse_file_string(self, tmp_path: Path):
+        base_dir = tmp_path
+        file_input = parse_file_string("data.xlsx#Sheet2", base_dir=base_dir)
+        assert file_input.format == "excel"
+        assert file_input.sheet == "Sheet2"
+        assert str(file_input.path).endswith("data.xlsx")
+
+    def test_parse_file_path(self, tmp_path: Path):
+        path = tmp_path / "data.csv"
+        file_input = parse_file_path(path, base_dir=tmp_path)
+        assert file_input.format == "csv"
+        assert file_input.sheet is None
 
 
 class TestInputValidation:
@@ -277,4 +395,4 @@ class TestInputValidation:
             inputs={"broken": bad_loader},
         )
         with pytest.raises(RuntimeError, match="Input 'broken' callable failed"):
-            ws._ingest_all(conn)
+            asyncio.run(ws._ingest_all(conn, client=None))

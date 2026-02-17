@@ -114,13 +114,14 @@ uv run taskgraph run --spec my_app.specs.main
 
 ### Simple format
 
-The value is a callable (called at ingest time) or raw data.
+The value is a callable (called at ingest time), raw data, or a file path.
 
 ```python
 INPUTS = {
     "sales": load_sales,                           # callable -> DataFrame
     "rates": [{"ccy": "USD", "rate": 1.0}, ...],  # list[dict]
     "config": {"key": ["a", "b"], "val": [1, 2]}, # dict[str, list]
+    "events": "data/events.parquet",              # file path (extension-based)
 }
 ```
 
@@ -131,12 +132,12 @@ Accepted return types from callables:
 
 ### Rich format
 
-The value is a dict with a `"data"` key plus optional validation.
+The value is a dict with a `"source"` key plus optional validation.
 
 ```python
 INPUTS = {
     "invoices": {
-        "data": load_invoices,
+        "source": "data/invoices.xlsx#Sheet1",
         "columns": ["id", "amount", "date", "vendor"],
         "validate_sql": [
             "SELECT 'null amount at id=' || id FROM invoices WHERE amount IS NULL",
@@ -147,11 +148,30 @@ INPUTS = {
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `data` | callable or raw data | Yes | Same as simple format |
+| `source` | callable, raw data, or file path | Yes | Same as simple format, with file path support |
 | `columns` | `list[str]` | No | Required columns. Checked after ingestion, before tasks. Missing columns abort the run. |
 | `validate_sql` | `list[str]` | No | SQL queries that must return 0 rows. Each returned row is an error. Runs after column check. |
 
-Detection: a dict value with a `"data"` key is treated as rich format. A dict without `"data"` is treated as raw `dict[str, list]` data.
+Detection: a dict value with a `"source"` key is treated as rich format. A dict without `"source"` is treated as raw `dict[str, list]` data.
+
+### File paths
+
+Strings ending in one of the supported extensions are treated as file inputs:
+
+| Extension | Ingested via | Notes |
+|-----------|--------------|-------|
+| `.csv` | DuckDB `read_csv_auto` | Auto-detect schema |
+| `.parquet` | DuckDB `read_parquet` | Native parquet reader |
+| `.xlsx` / `.xls` | DuckDB `read_xlsx` | Use `#SheetName` to pick a sheet |
+| `.pdf` | Gemini 3 Flash (OpenRouter) | Extracts tabular data into JSON (requires OPENROUTER_API_KEY) |
+
+Excel sheet selection uses a fragment:
+
+```python
+"budget": "data/invoices.xlsx#Budget"
+```
+
+Relative file paths resolve from the spec file's directory.
 
 ### The `_row_id` column
 

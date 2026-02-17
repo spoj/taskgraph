@@ -39,6 +39,7 @@ if _cwd not in sys.path:
     sys.path.insert(0, _cwd)
 
 from src.api import OpenRouterClient, DEFAULT_MODEL
+from src.ingest import FileInput
 from src.agent_loop import DEFAULT_MAX_ITERATIONS
 from src.spec import load_spec_from_module, resolve_module_path
 from src.workspace import Workspace, read_workspace_meta
@@ -491,11 +492,16 @@ def run(
         log.info("")
 
     needs_llm = any(t.transform_mode() == "prompt" for t in loaded["tasks"])
-    if needs_llm:
+    needs_pdf = any(
+        isinstance(value, FileInput) and value.format == "pdf"
+        for value in loaded["inputs"].values()
+    )
+    needs_client = needs_llm or needs_pdf
+    if needs_client:
         _require_openrouter_api_key()
 
     async def _run():
-        if needs_llm:
+        if needs_client:
             async with OpenRouterClient(reasoning_effort=reasoning_effort) as client:
                 return await workspace.run(
                     client=client,

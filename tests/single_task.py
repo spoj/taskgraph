@@ -11,7 +11,7 @@ Usage:
 
 INPUTS = {
     "employees": {
-        "data": [
+        "source": [
             {"id": 1, "name": "Alice", "department": "Engineering", "salary": 120000},
             {"id": 2, "name": "Bob", "department": "Engineering", "salary": 110000},
             {"id": 3, "name": "Carol", "department": "Sales", "salary": 95000},

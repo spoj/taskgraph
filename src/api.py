@@ -135,6 +135,7 @@ class OpenRouterClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str = "auto",
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Make a chat completion request.
@@ -144,6 +145,7 @@ class OpenRouterClient:
             messages: List of message dicts
             tools: Optional list of tool definitions
             tool_choice: "auto", "none", or "required"
+            response_format: Optional response_format payload
 
         Returns:
             {
@@ -165,6 +167,9 @@ class OpenRouterClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
+
+        if response_format:
+            payload["response_format"] = response_format
 
         payload["reasoning"] = {"effort": self.reasoning_effort}
 

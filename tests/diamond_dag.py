@@ -15,7 +15,7 @@ Tests: DAG resolution, layer concurrency, namespace enforcement.
 
 INPUTS = {
     "transactions": {
-        "data": lambda: [
+        "source": lambda: [
             {
                 "id": 1,
                 "date": "2025-01-05",
@@ -105,7 +105,7 @@ INPUTS = {
         "columns": ["id", "date", "type", "product", "amount", "region"],
     },
     "products": {
-        "data": [
+        "source": [
             {"name": "Widget A", "sku": "WA-001", "unit_price": 100.00},
             {"name": "Widget B", "sku": "WB-001", "unit_price": 250.00},
             {"name": "Widget C", "sku": "WC-001", "unit_price": 300.00},

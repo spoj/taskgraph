@@ -3,8 +3,8 @@
 A spec is a Python module defining INPUTS, TASKS, and optional EXPORTS.
 
 INPUTS values can be:
-- Simple: callable or raw data
-- Rich: dict with "data" key + optional "columns" and "validate_sql"
+- Simple: callable, raw data, or file path
+- Rich: dict with "source" key + optional "columns" and "validate_sql"
 
 Task prompt values must be strings.
 """
@@ -15,6 +15,12 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from .ingest import (
+    FileInput,
+    is_supported_file_string,
+    parse_file_path,
+    parse_file_string,
+)
 from .task import Task
 
 
@@ -40,23 +46,39 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
         raise ValueError("Spec must define TASKS")
 
     raw_inputs = module.INPUTS
+    spec_dir = Path(module.__file__).resolve().parent if module.__file__ else Path.cwd()
 
     # Parse INPUTS: separate data from validation metadata
     inputs: dict[str, Any] = {}
     input_columns: dict[str, list[str]] = {}
     input_validate_sql: dict[str, list[str]] = {}
 
+    def _resolve_source(source: Any) -> Any:
+        if isinstance(source, FileInput):
+            return source
+        if isinstance(source, Path):
+            return parse_file_path(source, base_dir=spec_dir)
+        if isinstance(source, str) and is_supported_file_string(source):
+            return parse_file_string(source, base_dir=spec_dir)
+        return source
+
     for name, value in raw_inputs.items():
-        if isinstance(value, dict) and "data" in value:
-            # Rich format: {"data": ..., "columns": [...], "validate_sql": [...]}
-            inputs[name] = value["data"]
+        if isinstance(value, dict) and "source" in value:
+            # Rich format: {"source": ..., "columns": [...], "validate_sql": [...]}
+            inputs[name] = _resolve_source(value["source"])
             if "columns" in value:
                 input_columns[name] = value["columns"]
             if "validate_sql" in value:
                 input_validate_sql[name] = value["validate_sql"]
-        else:
-            # Simple format: callable or raw data
-            inputs[name] = value
+            continue
+
+        if isinstance(value, dict) and "data" in value:
+            raise ValueError(
+                f"Input '{name}' uses deprecated key 'data'; use 'source' instead"
+            )
+
+        # Simple format: callable or raw data
+        inputs[name] = _resolve_source(value)
 
     # Accept tasks as dicts or Task objects
     tasks = []
