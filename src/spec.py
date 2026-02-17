@@ -6,32 +6,16 @@ INPUTS values can be:
 - Simple: callable or raw data
 - Rich: dict with "data" key + optional "columns" and "validate_sql"
 
-Task intent values must be strings.
+Task prompt values must be strings.
 """
 
 import importlib
 import importlib.util
-import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 from .task import Task
-
-
-def _load_module(spec_path: Path) -> ModuleType:
-    """Load a Python module from a file path."""
-    spec_dir = str(spec_path.resolve().parent)
-    if spec_dir not in sys.path:
-        sys.path.insert(0, spec_dir)
-
-    spec = importlib.util.spec_from_file_location("workspace_spec", spec_path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"Cannot load spec from {spec_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def resolve_module_path(module_path: str) -> Path:
@@ -77,7 +61,7 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
     # Accept tasks as dicts or Task objects
     tasks = []
 
-    def _normalize_sql(task_name: str, value: Any, key: str) -> str:
+    def _normalize_text(task_name: str, value: Any, key: str) -> str:
         if not isinstance(value, str):
             raise ValueError(f"Task '{task_name}' {key} must be a string")
         s2 = value.strip()
@@ -91,43 +75,30 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
             task_name = t.get("name", "")
 
             # Deterministic SQL (optional). If present, the harness will
-            # execute it directly (no LLM). Accept str or list[str].
+            # execute it directly (no LLM). Accept str.
             if "sql" in t:
-                t["sql"] = _normalize_sql(task_name, t.get("sql", ""), "sql")
+                t["sql"] = _normalize_text(task_name, t.get("sql", ""), "sql")
 
-            # Immutable deterministic SQL (optional). No LLM repair.
-            if "sql_strict" in t:
-                t["sql_strict"] = _normalize_sql(
-                    task_name, t.get("sql_strict", ""), "sql_strict"
-                )
+            # Prompt-driven transform (optional).
+            if "prompt" in t:
+                t["prompt"] = _normalize_text(task_name, t.get("prompt", ""), "prompt")
 
-            # intent is used only for sql repair mode.
-            if "intent" in t and not isinstance(t["intent"], str):
-                raise ValueError(
-                    f"Task '{task_name}' intent must be a string, "
-                    f"got {type(t['intent']).__name__}"
+            # Validation SQL (optional).
+            if "validate_sql" in t:
+                t["validate_sql"] = _normalize_text(
+                    task_name, t.get("validate_sql", ""), "validate_sql"
                 )
-            if "repair_on_warn" in t and not isinstance(t["repair_on_warn"], bool):
-                raise ValueError(f"Task '{task_name}' repair_on_warn must be a bool")
 
             sql_statements = (t.get("sql") or "").strip()
-            sql_strict_statements = (t.get("sql_strict") or "").strip()
+            prompt_text = (t.get("prompt") or "").strip()
 
-            if sql_statements and sql_strict_statements:
+            if sql_statements and prompt_text:
                 raise ValueError(
-                    f"Task '{task_name}' must not specify both 'sql' and 'sql_strict'"
+                    f"Task '{task_name}' must not specify both 'sql' and 'prompt'"
                 )
-            if not sql_statements and not sql_strict_statements:
+            if not sql_statements and not prompt_text:
                 raise ValueError(
-                    f"Task '{task_name}' must specify exactly one of 'sql' or 'sql_strict'"
-                )
-            if sql_statements and not (t.get("intent") or "").strip():
-                raise ValueError(
-                    f"Task '{task_name}' with 'sql' must specify non-empty intent"
-                )
-            if t.get("repair_on_warn") and sql_strict_statements:
-                raise ValueError(
-                    f"Task '{task_name}' uses repair_on_warn with 'sql_strict'"
+                    f"Task '{task_name}' must specify exactly one of 'sql' or 'prompt'"
                 )
 
             tasks.append(Task(**t))
@@ -139,19 +110,27 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
             )
 
     for t in tasks:
+        if not isinstance(t.sql, str):
+            raise ValueError(
+                f"Task '{t.name}' sql must be a string, got {type(t.sql).__name__}"
+            )
+        if not isinstance(t.prompt, str):
+            raise ValueError(
+                f"Task '{t.name}' prompt must be a string, got {type(t.prompt).__name__}"
+            )
+        if not isinstance(t.validate_sql, str):
+            raise ValueError(
+                f"Task '{t.name}' validate_sql must be a string, got {type(t.validate_sql).__name__}"
+            )
         sql_statements = (t.sql or "").strip()
-        sql_strict_statements = (t.sql_strict or "").strip()
-        if sql_statements and sql_strict_statements:
+        prompt_text = (t.prompt or "").strip()
+        if sql_statements and prompt_text:
             raise ValueError(
-                f"Task '{t.name}' must not specify both 'sql' and 'sql_strict'"
+                f"Task '{t.name}' must not specify both 'sql' and 'prompt'"
             )
-        if not sql_statements and not sql_strict_statements:
+        if not sql_statements and not prompt_text:
             raise ValueError(
-                f"Task '{t.name}' must specify exactly one of 'sql' or 'sql_strict'"
-            )
-        if sql_statements and not (t.intent or "").strip():
-            raise ValueError(
-                f"Task '{t.name}' with 'sql' must specify non-empty intent"
+                f"Task '{t.name}' must specify exactly one of 'sql' or 'prompt'"
             )
     return {
         "inputs": inputs,

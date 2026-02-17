@@ -119,11 +119,6 @@ INPUTS = {
 
 prep = {
     "name": "prep",
-    "intent": (
-        "Split the transactions table into two views based on the 'type' column:\n"
-        "- 'prepared_sales': rows where type='sale', with columns: id, date, product, amount, region\n"
-        "- 'prepared_costs': rows where type='cost', with columns: id, date, product, category, amount, region\n"
-    ),
     "sql": """
         CREATE OR REPLACE VIEW prepared_sales AS
         SELECT id, date, product, amount, region
@@ -145,12 +140,6 @@ prep = {
 
 sales = {
     "name": "sales",
-    "intent": (
-        "Summarize sales by product. Create a view 'sales_summary' with columns:\n"
-        "- product: product name\n"
-        "- total_sales: sum of amount\n"
-        "- num_transactions: count of transactions\n"
-    ),
     "sql": """
         CREATE OR REPLACE VIEW sales_summary AS
         SELECT
@@ -169,13 +158,6 @@ sales = {
 
 costs = {
     "name": "costs",
-    "intent": (
-        "Summarize costs by product. Create a view 'costs_summary' with columns:\n"
-        "- product: product name\n"
-        "- total_costs: sum of amount\n"
-        "- materials_cost: sum where category='materials'\n"
-        "- labor_cost: sum where category='labor'\n"
-    ),
     "sql": """
         CREATE OR REPLACE VIEW costs_summary AS
         SELECT
@@ -195,15 +177,6 @@ costs = {
 
 report = {
     "name": "report",
-    "intent": (
-        "Create a profit report combining sales and costs. Create a view 'profit_report' with columns:\n"
-        "- product: product name\n"
-        "- total_sales: from sales_summary\n"
-        "- total_costs: from costs_summary\n"
-        "- profit: total_sales - total_costs\n"
-        "- margin_pct: round(profit / total_sales * 100, 1)\n"
-        "Use LEFT JOIN so products with sales but no costs still appear.\n"
-    ),
     "sql": """
         CREATE OR REPLACE VIEW profit_report AS
         SELECT

@@ -4,10 +4,10 @@ This guide targets people writing **workspace specs**: Python modules (usually s
 
 A spec defines:
 - `INPUTS`: how to ingest data into DuckDB tables
-- `TASKS`: a DAG of SQL tasks (deterministic) with optional LLM repair; each task produces one or more SQL views
+- `TASKS`: a DAG of tasks; each task runs via `sql` (deterministic SQL) or `prompt` (LLM transform) and produces one or more SQL views
 - `EXPORTS` (optional): functions that export files from the final workspace
 
-Specs are imported as modules (e.g. `my_app.specs.main`). Taskgraph does not load specs from file paths.
+Specs are imported as modules (e.g. `my_app.specs.main`). File paths are accepted by the CLI and auto-resolved to module paths.
 
 ## Recommended Layout
 
@@ -52,7 +52,7 @@ uv run taskgraph run
 5) Ensure your LLM credential is set:
 
 Taskgraph uses OpenRouter; set `OPENROUTER_API_KEY` in your environment (or in a `.env` loaded by your app).
-If your spec only uses `sql_strict` tasks, no LLM key is required.
+If your spec only uses `sql` tasks, no LLM key is required.
 
 Two common patterns:
 
@@ -121,27 +121,20 @@ INPUTS = {
 TASKS = [
     {
         "name": "match",
-        "intent": (
+        "prompt": (
             "Match invoices to payments. Create view 'matches' with columns:\n"
             "- invoice_row_id: invoices._row_id\n"
             "- payment_row_id: payments._row_id\n"
             "- match_reason: brief explanation\n"
             "One invoice matches at most one payment; leave unmatched invoices out."
         ),
-        "sql": """
-            CREATE OR REPLACE VIEW matches AS
-            SELECT
-                i._row_id AS invoice_row_id,
-                p._row_id AS payment_row_id,
-                'amount+date' AS match_reason
-            FROM invoices i
-            JOIN payments p
-                ON i.amount = p.amount
-               AND i.date = p.date
-            """,
         "inputs": ["invoices", "payments"],
         "outputs": ["matches"],
         "output_columns": {"matches": ["invoice_row_id", "payment_row_id", "match_reason"]},
+        "validate_sql": """
+            CREATE OR REPLACE VIEW match__validation AS
+            SELECT 'pass' AS status, 'ok' AS message
+        """,
     },
 ]
 ```
@@ -222,35 +215,32 @@ def load_data():
 
 ## TASKS
 
-A list of task definitions. Each task is executed deterministically using SQL:
-- `sql`: deterministic SQL with optional LLM repair on error or validation failure
-- `sql_strict`: deterministic SQL with no LLM repair
+A list of task definitions. Each task has exactly one transform mode:
+- `sql`: deterministic SQL statements executed directly (views/macros only).
+- `prompt`: LLM-driven transform. The agent writes SQL views/macros.
 
-The LLM only runs when a `sql` task fails or when validation views emit warnings (default behavior). Set `repair_on_warn: false` to disable warning-triggered repair for monitoring-only validation views.
-
-Each task declares `inputs` and `outputs` (views). Validation is expressed by producing one or more views named `{task_name}__validation` and/or `{task_name}__validation_*`.
+Validation is optional and deterministic via `validate_sql`, which runs after the transform to create `{task_name}__validation*` views. Validation views are not listed in `outputs`.
 
 ```python
 TASKS = [
     {
         "name": "match",
-        "intent": "...",
-        "sql": "CREATE OR REPLACE VIEW output AS SELECT ...;"
-               "CREATE OR REPLACE VIEW match__validation AS SELECT ...",
+        "prompt": "...",
         "inputs": ["invoices", "payments"],
-        "outputs": ["output", "match__validation"],
+        "outputs": ["matches"],
         "output_columns": {
-            "output": ["left_ids", "right_ids"],
-            "match__validation": ["status", "message"],
+            "matches": ["invoice_row_id", "payment_row_id", "match_reason"],
         },
+        "validate_sql": """
+            CREATE OR REPLACE VIEW match__validation AS
+            SELECT 'pass' AS status, 'ok' AS message
+        """,
     },
     {
-        "name": "recon",
-        "sql": "CREATE OR REPLACE VIEW recon AS SELECT ...;"
-               "CREATE OR REPLACE VIEW recon__validation AS SELECT ...",
-        "inputs": ["output"],
-        "outputs": ["recon", "recon__validation"],
-        "output_columns": {"recon__validation": ["status", "message"]},
+        "name": "summary",
+        "sql": "CREATE OR REPLACE VIEW match_summary AS SELECT ...",
+        "inputs": ["matches"],
+        "outputs": ["match_summary"],
     },
 ]
 ```
@@ -260,10 +250,9 @@ TASKS = [
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | `str` | Yes | Unique identifier. Also the namespace prefix for intermediate views. |
-| `intent` | `str` | Required for `sql` | Objective text used if LLM repair is triggered. |
-| `repair_on_warn` | `bool` | No | If true (default), warnings in validation views trigger LLM repair. Set to `false` for monitoring-only validation views. Ignored for `sql_strict` tasks. |
-| `sql` | `str` | Exactly one of `sql` or `sql_strict` | Deterministic statements executed directly (views/macros only). Multiple statements are allowed in one string and will be split by DuckDB's parser. On failure, Taskgraph can use the LLM to repair the SQL and retry. |
-| `sql_strict` | `str` | Exactly one of `sql` or `sql_strict` | Deterministic, immutable statements (views/macros only). No LLM repair. |
+| `sql` | `str` | Exactly one of `sql` or `prompt` | Deterministic statements executed directly (views/macros only). Multiple statements are allowed in one string and will be split by DuckDB's parser. |
+| `prompt` | `str` | Exactly one of `sql` or `prompt` | Objective text for LLM-driven transforms. |
+| `validate_sql` | `str` | No | Deterministic SQL that creates `{task}__validation*` views. Runs after the transform. |
 | `inputs` | `list[str]` | Yes | Tables/views this task reads. Can be ingested tables or outputs of other tasks. |
 | `outputs` | `list[str]` | Yes | Views the task must create. Validation checks these exist. |
 | `output_columns` | `dict[str, list[str]]` | No | Required columns per output view. Checks names only, not types. Extra columns are fine. |
@@ -290,14 +279,14 @@ The agent receives:
 
 1. A system prompt describing DuckDB SQL syntax, constraints, and workflow guidance.
 2. A user message containing:
-   - The task name and the issue (error message or validation failure summary)
-   - Your `intent` text
-   - The original SQL that failed
+   - The task name
+   - Your `prompt` text
+   - Input tables with schemas
    - Required output view names (with expected columns, if declared)
-   - Validation view definitions (if any)
+   - `validate_sql` (if provided)
    - Naming rules: the agent can create views/macros named either as declared outputs or prefixed with `{task_name}_` (e.g., task `match` can create `match_step1`, `match_candidates`, etc.)
-   
-   The agent discovers available tables and schemas by querying the DuckDB catalog directly (instructions are in the system prompt).
+    
+   If validation fails, the agent receives validation feedback and can retry once.
 
 ### What the agent can do
 
@@ -314,9 +303,8 @@ The agent has a single tool: `run_sql`. It can execute:
 | `DROP MACRO` | Yes | Yes |
 | Everything else | **No** | — |
 
-Deterministic `sql` and `sql_strict` tasks are more restrictive: they may only execute `CREATE/DROP VIEW` and `CREATE/DROP MACRO` statements (no standalone `SELECT`).
-If a `sql` task fails, Taskgraph may invoke the LLM to repair it; `sql_strict` never invokes the LLM.
-Recommendation: prefer `sql` over `sql_strict` unless you explicitly want to forbid repair.
+Deterministic `sql` tasks are more restrictive: they may only execute `CREATE/DROP VIEW` and `CREATE/DROP MACRO` statements (no standalone `SELECT`).
+`prompt` tasks are the only ones that invoke the LLM.
 
 The agent can call `run_sql` multiple times in parallel within a single turn.
 
@@ -334,7 +322,7 @@ The agent is told about these DuckDB features in its system prompt:
 - **Best-match selection**: `arg_min(val, ordering)`, `arg_max(val, ordering)`
 - **Conditional aggregates**: `count(*) FILTER (WHERE cond)`
 - **Nearest-match joins**: `ASOF JOIN`
-- **List/array operations**: `list_value()`, `unnest()`, `list_sort()`, `list_filter(lst, x -> cond)`, list comprehensions `[x * 2 FOR x IN list IF x > 0]`
+- **List/array operations**: `list_agg()`, `unnest()`, `list_filter(lst, x -> cond)`, list comprehensions `[x * 2 FOR x IN list IF x > 0]`
 - **Reusable logic**: `CREATE MACRO name(args) AS expr` (scalar) and `CREATE MACRO name(args) AS TABLE (SELECT ...)` (table-valued)
 
 ### Namespace and intermediate views
@@ -355,7 +343,7 @@ Views are late-binding in DuckDB — updating `match_legs` automatically propaga
 
 ## Validation
 
-Validation runs automatically when the agent stops producing tool calls. There are three checks, in order, short-circuiting on first failure:
+Validation runs automatically after the transform. There are three checks, in order, short-circuiting on first failure:
 
 ### 1. Output view existence
 
@@ -368,9 +356,9 @@ If `output_columns` is specified, each listed column must be present in the view
 View 'output' is missing required column(s): left_ids. Actual columns: category, count
 ```
 
-### 3. Validation view
+### 3. Validation SQL
 
-Task validation is expressed by producing one or more views named `{task_name}__validation` and/or `{task_name}__validation_*` and declaring them in `outputs`.
+Task validation is expressed by `validate_sql`, which runs after the transform and creates one or more views named `{task_name}__validation` and/or `{task_name}__validation_*`.
 
 Contract:
 - The view must have columns `status` and `message`.
@@ -397,6 +385,7 @@ WHERE NOT EXISTS (
 );
 ```
 
+`warn` rows are informational and shown by the CLI; only `fail` rows block the task.
 You can optionally add helper columns (not required by the harness), such as `evidence_view` to point reviewers to a drill-down view.
 
 ---
@@ -481,21 +470,18 @@ INPUTS = {
 TASKS = [
     {
         "name": "clean_sales",
-        "intent": "Normalize sales data...",
         "sql": "CREATE OR REPLACE VIEW sales AS SELECT ...",
         "inputs": ["raw_sales"],
         "outputs": ["sales"],
     },
     {
         "name": "clean_costs",
-        "intent": "Normalize cost data...",
         "sql": "CREATE OR REPLACE VIEW costs AS SELECT ...",
         "inputs": ["raw_costs"],
         "outputs": ["costs"],
     },
     {
         "name": "reconcile",
-        "intent": "Match sales to costs...",
         "sql": "CREATE OR REPLACE VIEW output AS SELECT ...",
         "inputs": ["sales", "costs"],
         "outputs": ["output"],
@@ -578,7 +564,7 @@ SELECT key, value FROM _workspace_meta
 Keys (v2):
 - `meta_version`
 - `created_at_utc`
-- `task_intents`
+- `task_prompts`
 - `llm_model`, `llm_reasoning_effort`, `llm_max_iterations`
 - `inputs_row_counts`, `inputs_schema`
 - `run` (JSON: run context)
@@ -592,7 +578,7 @@ To make outputs self-documenting, require provenance columns in `output_columns`
 TASKS = [
     {
         "name": "match",
-        "intent": "... Include a match_reason column explaining why each pair was matched ...",
+        "prompt": "... Include a match_reason column explaining why each pair was matched ...",
         "sql": "CREATE OR REPLACE VIEW output AS SELECT ...",
         "inputs": ["invoices", "payments"],
         "outputs": ["output"],
@@ -603,13 +589,13 @@ TASKS = [
 ]
 ```
 
-The agent must produce these columns or validation fails. The intent should explain what you expect in each column. This gives you per-row audit explanations in the output view itself.
+The agent must produce these columns or validation fails. The prompt should explain what you expect in each column. This gives you per-row audit explanations in the output view itself.
 
 ---
 
-## Writing Good Intent
+## Writing Good Prompts
 
-The `intent` field is your objective text for the LLM repair agent. Write it broad-to-specific: start with *why* the task exists, then *how* it works, then the *output contract*.
+The `prompt` field is your objective text for LLM-driven transforms. Write it broad-to-specific: start with *why* the task exists, then *how* it works, then the *output contract*.
 
 ### Three layers
 
@@ -617,7 +603,7 @@ The `intent` field is your objective text for the LLM repair agent. Write it bro
 2. **Logic description** (2-4 sentences): The approach in plain English — matching strategy, edge cases, expected data shape.
 3. **Output contract**: View names, required columns, constraints, tolerances.
 
-### Write intent from broad to specific
+### Write prompt from broad to specific
 
 Include everything you would put in a code review checklist:
 - output view names
@@ -626,9 +612,9 @@ Include everything you would put in a code review checklist:
 - tolerances for numeric comparisons
 - how to break ties
 
-Then enforce it with `output_columns` and `{task_name}__validation` views.
+Then enforce it with `output_columns` and `validate_sql` validation views.
 
-### Weak vs strong intent
+### Weak vs strong prompt
 
 ```
 WEAK:
@@ -658,7 +644,7 @@ NOTE ON SIGNS: Detail amounts have OPPOSITE sign to summary amounts.
 For a correct match: SUM(detail.Amount) + summary.Amount ≈ 0 for each category.
 ```
 
-### Tell the repair logic about edge cases
+### Call out edge cases
 
 ```
 - foreign_amount = 0 means there is no foreign leg for that row
@@ -678,20 +664,22 @@ Include these columns in the output for audit purposes:
 
 ## Strong Validation and Fail-Fast Patterns
 
-Stronger validation makes repairs more accurate and earlier. Prefer failing fast so the LLM repair sees the right error signal.
+Stronger validation catches issues earlier and makes prompt-task retries more effective. Prefer failing fast with precise, actionable messages.
 
-- Add `{task_name}__validation` views that check completeness, totals, and uniqueness.
+- Use `validate_sql` views that check completeness, totals, and uniqueness.
 - Use `output_columns` to enforce schema contracts immediately.
 - Keep validation errors concise and actionable.
 
-### Validation views are repair triggers by default
+### Warnings vs failures
 
-Validation views that emit `warn` rows automatically trigger LLM repair (`repair_on_warn` defaults to `true`). This means validation views are **actionable** — the agent sees the warnings and attempts to fix the underlying SQL.
+- `fail` rows block the task.
+- `warn` rows are informational and shown by the CLI.
+- Prompt tasks get one retry when validation fails.
 
-Write `warn` thresholds at the quality level where you'd want the agent to intervene:
+Write `warn` thresholds at the quality level you want to monitor:
 
 ```sql
--- This validation view triggers repair when match rate drops below 90%
+-- This validation view emits a warning when match rate drops below 90%
 CREATE OR REPLACE VIEW match__validation AS
 SELECT
   CASE WHEN pct < 0.90 THEN 'warn' ELSE 'pass' END AS status,
@@ -702,9 +690,7 @@ FROM (
 )
 ```
 
-The agent starts from **working SQL** (the original SQL already succeeded), so warning-triggered repair is the cheapest and highest-success-rate repair scenario.
-
-**When to opt out**: Set `repair_on_warn: false` when validation views are purely observational — you want to log quality metrics in the output database but not spend tokens trying to improve them. This is the minority case.
+If you want the run to fail when quality drops, emit `fail` instead of `warn`.
 
 ---
 

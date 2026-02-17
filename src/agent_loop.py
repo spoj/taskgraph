@@ -213,7 +213,7 @@ async def run_agent_loop(
                     messages.append(
                         {
                             "role": "user",
-                            "content": f"Validation failed:\n{error_msg}",
+                            "content": f"VALIDATION FAILED:\n{error_msg}\n\nFix the issues and reply when done.",
                         }
                     )
             else:

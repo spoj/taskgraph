@@ -16,7 +16,7 @@ import uuid
 from typing import Any, cast
 from .agent_loop import run_agent_loop, AgentResult
 from .api import OpenRouterClient, create_model_callable
-from .task import Task, validation_outputs
+from .task import Task, is_validation_view_for_task
 
 log = logging.getLogger(__name__)
 
@@ -45,43 +45,28 @@ MAX_RESULT_CHARS = 30_000
 
 # --- System prompt ---
 
-SYSTEM_PROMPT = """You are a SQL repair agent working in a DuckDB database.
-You are called when a task's SQL failed or produced validation warnings.
-You can read anything, but can only write views and macros within the task's namespace
-(specified per task).
+SYSTEM_PROMPT = """You are a SQL transform agent working in a DuckDB database.
+You build task output views based on the task prompt and required outputs.
+You can read anything but can only write views/macros within the task's allowed names.
 
-CONSTRAINTS:
-- Allowed statements: SELECT, SUMMARIZE, CREATE/DROP VIEW, CREATE/DROP MACRO
-- No tables, no inserts, no updates, no deletes
-- Use CREATE OR REPLACE VIEW to fix outputs
-- CREATE MACRO name(args) AS expr — reusable scalar expression
-- CREATE MACRO name(args) AS TABLE (SELECT ...) — reusable table function
+RULES:
+- Allowed: SELECT, SUMMARIZE, EXPLAIN, CREATE/DROP VIEW, CREATE/DROP MACRO. Nothing else.
+- Use CREATE OR REPLACE VIEW for outputs; namespace-prefix intermediates (task_name_*)
+- Do not create validation views (task_name__validation*); the system creates those separately
 - Batch independent run_sql calls in parallel to minimize rounds
+- When done, reply with a short message (no tool calls) to trigger validation
+- If validation fails, you get feedback — fix and reply again
 
-VALIDATION:
-- Runs automatically when you stop (no tool calls in your response).
-- If validation fails, you receive the error and can keep fixing.
-- Some tasks require validation views (named '{task}__validation' or '{task}__validation_*').
-  These must have columns: status VARCHAR ('pass'|'warn'|'fail'), message VARCHAR.
-  Any 'fail' row fails the task. No fail rows = pass.
-- 'warn' rows are acceptable — they indicate quality issues, not hard errors.
-  Try to reduce warnings by improving the output views, but if warnings reflect
-  genuine data issues that cannot be resolved, leave them in place and stop.
-- Validation views define the quality contract. When fixing issues:
-  - Preferred: fix the output views (the data-producing SQL).
-  - Allowed: fix bugs in validation views (wrong joins, bad column references,
-    incorrect counts — where the measurement itself is broken).
-  - Forbidden: weakening the contract — do not lower thresholds, add WHERE
-    exclusions to filter out failing rows, or change what is being measured.
+MACROS:
+- CREATE MACRO name(args) AS expr — reusable scalar
+- CREATE MACRO name(args) AS TABLE (SELECT ...) — reusable table function
 
-CATALOG INTROSPECTION:
+CATALOG:
   SELECT view_name, sql FROM duckdb_views() WHERE internal = false
   SELECT table_name FROM duckdb_tables()
-  SELECT function_name, macro_definition FROM duckdb_functions() WHERE function_type = 'macro'
 
-DUCKDB DIALECT REFERENCE:
-- Identifiers: double-quote ("col"), not backticks. Quote reserved words
-  (left, right, match, group, order, etc.). Always use AS for column aliases.
+DUCKDB DIALECT:
+- Identifiers: double-quote ("col"), not backticks. Quote reserved words. Always use AS for aliases.
 - Types: VARCHAR (not TEXT), DOUBLE (not REAL), BOOLEAN (not INTEGER 0/1)
 - TRY_CAST(expr AS type) returns NULL on failure. TRY(expr) wraps any expression.
 - QUALIFY — filter window results: SELECT * FROM t QUALIFY row_number() OVER (...) = 1
@@ -108,13 +93,13 @@ def _create_sql_tool() -> dict[str, Any]:
         "type": "function",
         "function": {
             "name": "run_sql",
-            "description": "Execute a SQL query against the DuckDB database. Allowed: SELECT, SUMMARIZE, CREATE/DROP VIEW, CREATE/DROP MACRO. No tables, inserts, updates, or deletes.",
+            "description": "Execute a SQL query against the DuckDB database. Allowed: SELECT, SUMMARIZE, EXPLAIN, CREATE/DROP VIEW, CREATE/DROP MACRO. No tables, inserts, updates, or deletes.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The SQL query to execute (SELECT or CREATE/DROP VIEW only)",
+                        "description": "The SQL query to execute (SELECT, SUMMARIZE, EXPLAIN, CREATE/DROP VIEW, CREATE/DROP MACRO)",
                     }
                 },
                 "required": ["query"],
@@ -247,10 +232,7 @@ def is_sql_allowed(
                 if not ok:
                     return False, err
             return True, ""
-        return (
-            False,
-            "Only CREATE VIEW and CREATE MACRO are permitted.",
-        )
+        return False, "Only CREATE VIEW and CREATE MACRO are permitted."
 
     # DROP — only VIEW and MACRO
     if st == StatementType.DROP:
@@ -267,15 +249,9 @@ def is_sql_allowed(
                 if not ok:
                     return False, err
             return True, ""
-        return (
-            False,
-            "Only DROP VIEW and DROP MACRO are permitted.",
-        )
+        return False, "Only DROP VIEW and DROP MACRO are permitted."
 
-    return (
-        False,
-        f"{st.name} is not allowed. Only SELECT, SUMMARIZE, CREATE/DROP VIEW, and CREATE/DROP MACRO are permitted.",
-    )
+    return False, f"{st.name} is not allowed."
 
 
 def _is_view_name_allowed(
@@ -496,18 +472,42 @@ def execute_sql(
             timer.cancel()
 
 
-def build_sql_repair_prompt(task: Task, issue: str) -> str:
-    """Build a prompt for the LLM to repair a failed or warned SQL task."""
-    statements = task.sql_statements()
-    sql_block_lines = []
-    for i, stmt in enumerate(statements, start=1):
-        sql_block_lines.append(f"-- statement {i}")
-        sql_block_lines.append(stmt)
-        sql_block_lines.append("")
-    sql_block = "\n".join(sql_block_lines).rstrip()
+def _format_input_schema_lines(
+    conn: duckdb.DuckDBPyConnection, inputs: list[str]
+) -> list[str]:
+    if not inputs:
+        return ["(none)"]
 
-    issue_text = _summarize_validation_issue(issue)
+    lines: list[str] = []
+    for table_name in inputs:
+        try:
+            rows = conn.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = ?
+                ORDER BY ordinal_position
+                """,
+                [table_name],
+            ).fetchall()
+        except duckdb.Error:
+            rows = []
 
+        if rows:
+            cols = ", ".join(f"{name} {dtype}" for name, dtype in rows)
+            lines.append(f"- {table_name} ({cols})")
+        else:
+            lines.append(f"- {table_name} (schema unavailable)")
+
+    return lines
+
+
+def build_transform_prompt(
+    task: Task,
+    feedback: str = "",
+    input_lines: list[str] | None = None,
+) -> str:
+    """Build a prompt for the LLM to produce task outputs."""
     has_column_rules = bool(task.output_columns)
     required_outputs: list[str] = []
     for view_name in task.outputs:
@@ -521,58 +521,77 @@ def build_sql_repair_prompt(task: Task, issue: str) -> str:
     if not required_outputs:
         required_outputs.append("(none)")
 
-    val_outputs = validation_outputs(task)
-    validation_lines: list[str] = []
-    if val_outputs:
-        validation_lines.append("VALIDATION VIEWS (must create):")
-        for v in val_outputs:
-            validation_lines.append(f"  - {v}")
-        validation_lines.append("")
-
     parts = [
         f"TASK: {task.name}",
         "",
-        "ISSUE:",
-        issue_text or "(no issue details)",
+        "PROMPT:",
+        task.prompt or "(no prompt provided)",
+        "",
+        "INPUTS:",
+        *(
+            input_lines
+            if input_lines is not None
+            else [", ".join(task.inputs) if task.inputs else "(none)"]
+        ),
         "",
         "REQUIRED OUTPUTS:",
         *required_outputs,
-        "",
-        "INTENT:",
-        task.intent or "(no intent provided)",
-        "",
-        "ORIGINAL SQL:",
-        "```sql",
-        sql_block or "-- (no statements provided)",
-        "```",
-        "",
-        *validation_lines,
-        f"ALLOWED VIEWS: {', '.join(task.outputs)} or {task.name}_*",
     ]
+
+    if task.has_validation():
+        parts.extend(
+            [
+                "",
+                f"VALIDATION SQL (runs after transform; creates {task.name}__validation* views):",
+                task.validate_sql,
+            ]
+        )
+
+    if feedback:
+        parts.extend(
+            [
+                "",
+                "VALIDATION FAILED:",
+                feedback,
+                "",
+                "Fix the issues and reply when done.",
+            ]
+        )
+
+    parts.extend(
+        [
+            "",
+            f"ALLOWED VIEWS: {', '.join(task.outputs)} or {task.name}_*",
+        ]
+    )
+
     return "\n".join(parts)
 
 
-def _summarize_validation_issue(issue: str) -> str:
-    """Summarize validation warnings/failures to view references."""
-    issue_text = (issue or "").strip()
-    if not issue_text:
-        return ""
+def _validation_view_forbidden_error(query: str, task: Task) -> str | None:
+    """Reject attempts to create/drop validation views during transform."""
+    try:
+        statements = _get_parser_conn().extract_statements(query)
+    except duckdb.Error:
+        return None
+    if not statements or len(statements) != 1:
+        return None
 
-    warning_views = re.findall(r"Warnings via '([^']+)'", issue_text)
-    if issue_text.startswith("Warnings:") and warning_views:
-        seen: set[str] = set()
-        ordered = [v for v in warning_views if not (v in seen or seen.add(v))]
-        targets = ", ".join(f"`{v}`" for v in ordered)
-        return f"Validation warnings in {targets}; refer to view for details."
+    stmt = statements[0]
+    StatementType = cast(Any, duckdb.StatementType)
+    if stmt.type == StatementType.CREATE:
+        name = _extract_name(stmt.query, _CREATE_NAME_RE)
+    elif stmt.type == StatementType.DROP:
+        name = _extract_name(stmt.query, _DROP_NAME_RE)
+    else:
+        return None
 
-    error_views = re.findall(r"Fail rows in '([^']+)'", issue_text)
-    if error_views:
-        seen: set[str] = set()
-        ordered = [v for v in error_views if not (v in seen or seen.add(v))]
-        targets = ", ".join(f"`{v}`" for v in ordered)
-        return f"Validation errors in {targets}; refer to view for details."
-
-    return issue_text
+    if name and is_validation_view_for_task(name, task.name):
+        return (
+            f"Cannot create/drop validation view '{name}' during transform. "
+            "Validation views are created in validate_sql."
+        )
+    return None
 
 
 # --- Agent entry point ---
@@ -584,7 +603,8 @@ async def run_task_agent(
     client: OpenRouterClient,
     model: str = "openai/gpt-5.2",
     max_iterations: int = 200,
-    issue: str = "",
+    feedback: str = "",
+    prior_messages: list[dict[str, Any]] | None = None,
 ) -> AgentResult:
     """Run the agent for a single Task within a shared workspace database.
 
@@ -595,10 +615,11 @@ async def run_task_agent(
     Args:
         conn: DuckDB connection (shared workspace database).
         task: Task specification.
-        issue: Failure detail or warning summary for repair context.
         client: OpenRouterClient (must be in async context).
         model: Model identifier.
         max_iterations: Maximum agent iterations.
+        feedback: Optional validation feedback for a retry.
+        prior_messages: Optional prior messages to continue a session.
     Returns:
         AgentResult with success status, final message, and usage stats.
     """
@@ -611,12 +632,22 @@ async def run_task_agent(
     namespace = task.name
 
     # Build messages
-    user_message = build_sql_repair_prompt(task, issue)
-
-    initial_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
-    ]
+    if prior_messages:
+        initial_messages = list(prior_messages)
+        if feedback:
+            initial_messages.append(
+                {
+                    "role": "user",
+                    "content": f"VALIDATION FAILED:\n{feedback}\n\nFix the issues and reply when done.",
+                }
+            )
+    else:
+        input_lines = _format_input_schema_lines(conn, task.inputs)
+        user_message = build_transform_prompt(task, feedback, input_lines)
+        initial_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
 
     # Build tool list
     tools = [_create_sql_tool()]
@@ -627,6 +658,9 @@ async def run_task_agent(
     async def tool_executor(name: str, args: dict[str, Any]) -> str:
         if name == "run_sql":
             query = args.get("query", "")
+            validation_error = _validation_view_forbidden_error(query, task)
+            if validation_error:
+                return json.dumps({"success": False, "error": validation_error})
             result = execute_sql(
                 conn,
                 query,
@@ -639,9 +673,9 @@ async def run_task_agent(
 
         return json.dumps({"success": False, "error": f"Unknown tool: {name}"})
 
-    # Validation: check declared outputs exist, schemas, and validation view
+    # Validation: check declared outputs exist and schemas
     def validation_fn() -> tuple[bool, str]:
-        errors = task.validate(conn)
+        errors = task.validate_transform(conn)
         if errors:
             return False, "\n".join(f"- {e}" for e in errors)
         return True, ""
@@ -732,7 +766,7 @@ async def run_sql_only_task(
 ) -> AgentResult:
     """Execute a deterministic SQL-only task.
 
-    The task provides a list of SQL statements (task.sql or task.sql_strict).
+    The task provides a list of SQL statements (task.sql).
     Each statement is executed with the same namespace enforcement as agent tasks.
     """
     init_trace_table(conn)
@@ -752,9 +786,32 @@ async def run_sql_only_task(
     allowed_views = set(task.outputs)
     namespace = task.name
 
-    mode_label = "sql_strict" if task.run_mode() == "sql_strict" else "sql"
+    mode_label = "sql"
 
     for q in statements:
+        validation_error = _validation_view_forbidden_error(q, task)
+        if validation_error:
+            persist_task_meta(
+                conn,
+                task.name,
+                {
+                    "model": mode_label,
+                    "outputs": task.outputs,
+                    "iterations": 0,
+                    "tool_calls": 0,
+                    "elapsed_s": round(time.time() - start_time, 1),
+                    "validation": "FAILED",
+                    "error": validation_error,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                },
+            )
+            return AgentResult(
+                success=False,
+                final_message=validation_error,
+                iterations=0,
+                messages=[],
+                tool_calls_count=0,
+            )
         ok, err = _is_sql_only_statement_allowed(q)
         if not ok:
             persist_task_meta(
@@ -810,7 +867,7 @@ async def run_sql_only_task(
                 tool_calls_count=0,
             )
 
-    errors = task.validate(conn)
+    errors = task.validate_transform(conn)
     elapsed_s = time.time() - start_time
     if errors:
         msg = "\n".join(f"- {e}" for e in errors)
@@ -856,3 +913,38 @@ async def run_sql_only_task(
         messages=[],
         tool_calls_count=0,
     )
+
+
+def run_validate_sql(
+    conn: duckdb.DuckDBPyConnection,
+    task: Task,
+) -> list[str]:
+    """Execute validate_sql statements with validation namespace restrictions.
+
+    Returns a list of error messages (empty = success).
+    """
+    init_trace_table(conn)
+
+    statements = task.validate_sql_statements()
+    if not statements:
+        return []
+
+    allowed_views = set(task.validation_view_names())
+    namespace = f"{task.name}__validation"
+
+    for q in statements:
+        ok, err = _is_sql_only_statement_allowed(q)
+        if not ok:
+            return [err]
+
+        result = execute_sql(
+            conn,
+            q,
+            allowed_views=allowed_views,
+            namespace=namespace,
+            task_name=task.name,
+        )
+        if not result.get("success", False):
+            return [str(result.get("error") or "validate_sql execution failed")]
+
+    return []

@@ -39,13 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.api import OpenRouterClient
 from src.spec import load_spec_from_module, resolve_module_path
 from src.workspace import Workspace, read_workspace_meta
-from src.task import (
-    Task,
-    resolve_dag,
-    resolve_task_deps,
-    validate_task_graph,
-    validation_outputs,
-)
+from src.task import Task, resolve_dag, resolve_task_deps, validate_task_graph
 
 log = logging.getLogger(__name__)
 
@@ -224,9 +218,9 @@ INPUTS = {
 TASKS = [
     {
         "name": "double",
-        # sql_strict: deterministic SQL, no LLM needed.
-        # Switch to "sql" + "intent" for LLM-assisted repair.
-        "sql_strict": "CREATE VIEW output AS SELECT x, x * 2 AS x2 FROM data",
+        # sql: deterministic SQL, no LLM needed.
+        # Use "prompt" for LLM-driven transforms.
+        "sql": "CREATE VIEW output AS SELECT x, x * 2 AS x2 FROM data",
         "inputs": ["data"],
         "outputs": ["output"],
         "output_columns": {"output": ["x", "x2"]},
@@ -394,9 +388,7 @@ def run(
     log.info("Model: %s", model)
     log.info("Tasks: %d\n", len(loaded["tasks"]))
 
-    needs_llm = any(
-        getattr(t, "run_mode", lambda: "sql")() == "sql" for t in loaded["tasks"]
-    )
+    needs_llm = any(t.transform_mode() == "prompt" for t in loaded["tasks"])
     if needs_llm:
         _require_openrouter_api_key()
 
@@ -526,60 +518,21 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
 
         # --- Warnings and errors (always shown) ---
         for task in tasks:
-            warn_count, warn_msgs = _collect_warnings(conn, task, views)
+            warn_count, warn_msgs = task.validation_warnings(conn, limit=20)
             if warn_count:
                 click.echo(f"\n  {task.name} warnings: {warn_count}")
                 for msg in warn_msgs:
                     click.echo(f"    - {msg}")
 
-            errors = task.validate(conn)
+            errors = task.validate_transform(conn)
+            if task.has_validation():
+                errors.extend(task.validate_validation_views(conn))
             if errors:
                 click.echo(f"\n  {task.name} errors: {len(errors)}")
                 for msg in errors:
                     click.echo(f"    - {msg}")
     finally:
         conn.close()
-
-
-def _collect_warnings(
-    conn: duckdb.DuckDBPyConnection, task: Task, views: set[str], limit: int = 20
-) -> tuple[int, list[str]]:
-    warnings: list[str] = []
-    total = 0
-    remaining = max(1, limit)
-
-    for view_name in validation_outputs(task):
-        if view_name not in views:
-            continue
-
-        try:
-            count_row = conn.execute(
-                f"SELECT COUNT(*) FROM \"{view_name}\" WHERE lower(status) = 'warn'"
-            ).fetchone()
-            view_count = int(count_row[0]) if count_row else 0
-        except duckdb.Error:
-            continue
-
-        if view_count <= 0:
-            continue
-
-        total += view_count
-        if remaining <= 0:
-            continue
-
-        try:
-            rows = conn.execute(
-                f'SELECT message FROM "{view_name}" '
-                f"WHERE lower(status) = 'warn' LIMIT {remaining}"
-            ).fetchall()
-        except duckdb.Error:
-            continue
-
-        if rows:
-            warnings.extend([str(r[0]) for r in rows])
-            remaining -= len(rows)
-
-    return total, warnings
 
 
 @main.command()
@@ -634,10 +587,10 @@ def show(target: Path | None, spec: str | None):
             for name in sorted(counts.keys()):
                 click.echo(f"  {name}: {counts[name]} rows")
 
-        contexts = _meta_json(meta, "task_intents")
-        if contexts:
-            click.echo(f"\nTasks ({len(contexts)}):")
-            for name in sorted(contexts.keys()):
+        prompts = _meta_json(meta, "task_prompts")
+        if prompts:
+            click.echo(f"\nTasks ({len(prompts)}):")
+            for name in sorted(prompts.keys()):
                 click.echo(f"  {name}")
 
         if exports:
@@ -725,7 +678,8 @@ def show(target: Path | None, spec: str | None):
         all_task_outputs.update(t.outputs)
 
     def _fmt_task_details(t: Task) -> str:
-        kind = t.run_mode()
+        kind = t.transform_mode()
+        validation = "yes" if t.has_validation() else "no"
 
         if t.inputs:
             inp_parts = []
@@ -743,7 +697,10 @@ def show(target: Path | None, spec: str | None):
             cols = t.output_columns.get(o, [])
             out_parts.append(f"{o} ({len(cols)} cols)" if cols else o)
 
-        return f"type={kind}  in={inp_s}  out={', '.join(out_parts) if out_parts else '(none)'}"
+        return (
+            f"type={kind}  validate={validation}  in={inp_s}  "
+            f"out={', '.join(out_parts) if out_parts else '(none)'}"
+        )
 
     def _emit_subtree(
         name: str, prefix: str, is_last: bool, stack: set[str], seen: set[str]
@@ -799,7 +756,7 @@ def show(target: Path | None, spec: str | None):
         if t.output_columns:
             n_schemas = len(t.output_columns)
             parts.append(f"{n_schemas} output schema{'s' if n_schemas > 1 else ''}")
-        n_val = len(validation_outputs(t))
+        n_val = len(t.validation_view_names())
         if n_val:
             parts.append(f"{n_val} validation view{'s' if n_val > 1 else ''}")
         if parts:

@@ -28,14 +28,6 @@ INPUTS = {
 TASKS = [
     {
         "name": "summarize",
-        "intent": (
-            "Summarize employees by department. Create a view 'department_summary' with:\n"
-            "- department: department name\n"
-            "- headcount: number of employees\n"
-            "- total_salary: sum of salaries\n"
-            "- avg_salary: average salary (rounded to nearest integer)\n"
-            "Order by department name.\n"
-        ),
         "sql": """
             CREATE OR REPLACE VIEW department_summary AS
             SELECT

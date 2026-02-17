@@ -1,10 +1,10 @@
 # Taskgraph
 
-Taskgraph runs deterministic SQL tasks against your data, with optional LLM repair on failure, and writes auditable DuckDB SQL views into a single workspace database.
+Taskgraph runs deterministic SQL and prompt-based transforms against your data and writes auditable DuckDB SQL views into a single workspace database.
 
 You define a "workspace spec" (a Python module) that declares:
 - `INPUTS`: how to load data into DuckDB tables
-- `TASKS`: a DAG of tasks; each task runs via `sql` (deterministic with optional LLM repair) or `sql_strict` (deterministic, no LLM) and produces one or more SQL views
+- `TASKS`: a DAG of tasks; each task runs via `sql` (deterministic SQL) or `prompt` (LLM transform) and produces one or more SQL views. Optional `validate_sql` runs after the transform to create validation views.
 - `EXPORTS` (optional): functions that materialize reports (CSV/XLSX/etc.) from the finished workspace
 
 The result is one portable `.db` file containing the raw inputs, all agent-created views, validation results, and an execution trace.

@@ -43,7 +43,7 @@ from .diff import (
     ViewChange,
 )
 from .ingest import ingest_table
-from .agent import run_task_agent, run_sql_only_task
+from .agent import run_task_agent, run_sql_only_task, run_validate_sql
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
 
 log = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ def persist_workspace_meta(
     """)
     conn.execute("DELETE FROM _workspace_meta")
 
-    task_intents = {t.name: t.intent for t in tasks}
+    task_prompts = {t.name: t.prompt for t in tasks}
 
     created_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -115,7 +115,7 @@ def persist_workspace_meta(
         ("taskgraph_version", tg_version),
         ("python_version", sys.version.split()[0]),
         ("platform", platform.platform()),
-        ("task_intents", json.dumps(task_intents, sort_keys=True)),
+        ("task_prompts", json.dumps(task_prompts, sort_keys=True)),
         ("llm_model", model),
     ]
 
@@ -408,42 +408,79 @@ class Workspace:
         max_iterations: int,
     ) -> AgentResult:
         """Execute a single task (SQL or LLM) and return its result."""
-        mode = task.run_mode()
-        if mode == "sql_strict":
-            return await run_sql_only_task(conn=conn, task=task)
+        mode = task.transform_mode()
 
         if mode == "sql":
             result = await run_sql_only_task(conn=conn, task=task)
-            if result.success:
-                if task.repair_on_warn:
-                    warnings = task.validation_warnings(conn)
-                    if warnings:
-                        log.warning(
-                            "[%s] Validation warnings; attempting LLM repair",
-                            task.name,
-                        )
-                        issue = "Warnings:\n" + "\n".join(f"- {w}" for w in warnings)
-                        return await run_task_agent(
-                            conn=conn,
-                            task=task,
-                            client=client,
-                            model=model,
-                            max_iterations=max_iterations,
-                            issue=issue,
-                        )
-                return result
-
-            log.warning("[%s] SQL failed; attempting LLM repair", task.name)
-            return await run_task_agent(
+        elif mode == "prompt":
+            result = await run_task_agent(
                 conn=conn,
                 task=task,
                 client=client,
                 model=model,
                 max_iterations=max_iterations,
-                issue=result.final_message,
+            )
+        else:
+            raise RuntimeError(f"Unknown task mode: {mode}")
+
+        if not result.success:
+            return result
+
+        if not task.has_validation():
+            return result
+
+        def validation_errors() -> list[str]:
+            errors = run_validate_sql(conn=conn, task=task)
+            if errors:
+                return errors
+            return task.validate_validation_views(conn)
+
+        errors = validation_errors()
+        if not errors:
+            return result
+
+        if mode == "prompt":
+            max_validation_retries = 3
+            current = result
+            for attempt in range(1, max_validation_retries + 1):
+                feedback = "\n".join(f"- {e}" for e in errors)
+                log.warning(
+                    "[%s] Validation failed; retry %d/%d",
+                    task.name,
+                    attempt,
+                    max_validation_retries,
+                )
+                current = await run_task_agent(
+                    conn=conn,
+                    task=task,
+                    client=client,
+                    model=model,
+                    max_iterations=max_iterations,
+                    feedback=feedback,
+                    prior_messages=current.messages,
+                )
+                if not current.success:
+                    return current
+                errors = validation_errors()
+                if not errors:
+                    return current
+            return AgentResult(
+                success=False,
+                final_message="\n".join(f"- {e}" for e in errors),
+                iterations=current.iterations,
+                messages=current.messages,
+                usage=current.usage,
+                tool_calls_count=current.tool_calls_count,
             )
 
-        raise RuntimeError(f"Unknown task mode: {mode}")
+        return AgentResult(
+            success=False,
+            final_message="\n".join(f"- {e}" for e in errors),
+            iterations=result.iterations,
+            messages=result.messages,
+            usage=result.usage,
+            tool_calls_count=result.tool_calls_count,
+        )
 
     async def run(
         self,

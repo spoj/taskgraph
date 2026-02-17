@@ -14,7 +14,7 @@ OpenRouter pricing (per million tokens):
 Single DuckDB database as shared workspace. Tasks form a DAG, each runs as an
 independent agent writing namespace-enforced SQL views.
 
-- `src/agent.py` — task agent: SQL execution, optional LLM repair, namespace enforcement
+- `src/agent.py` — task agent: prompt-based SQL transform, namespace enforcement
 - `src/agent_loop.py` — generic async agent loop with concurrent tool execution
 - `src/api.py` — OpenRouter client. Connection pooling, cache_control on last message, reasoning_effort
 - `src/diff.py` — View catalog diffing: before/after snapshots of `duckdb_views().sql`, structured change reporting (created/modified/dropped), persistence to `_changes` table
@@ -29,7 +29,10 @@ independent agent writing namespace-enforced SQL views.
 A Python module defining:
 ```python
 INPUTS     = {"table_name": callable_or_data, ...}  # callable returns DataFrame/list[dict]/dict[str,list]
-TASKS      = [{"name": ..., "intent": ..., "sql": ..., "inputs": [...], "outputs": [...]}, ...]  # or sql_strict
+TASKS      = [
+  {"name": ..., "prompt": ..., "inputs": [...], "outputs": [...], "validate_sql": "..."},
+  {"name": ..., "sql": "...", "inputs": [...], "outputs": [...]},
+]
 EXPORTS    = {"report.xlsx": fn(conn, path), ...}     # optional export functions
 ```
 
@@ -48,8 +51,9 @@ INPUTS = {
 
 At the `load_spec` boundary, if a value is a dict with a `"data"` key, `columns` and `validate_sql` are extracted per-input and passed to the Workspace as `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]`.
 
-Task `sql` or `sql_strict` must be a **string**. `intent` is required for `sql` tasks.
-`repair_on_warn` defaults to `true` — validation view warnings trigger LLM repair for `sql` tasks.
+Task `sql` or `prompt` must be a **string**. Exactly one is required per task.
+`validate_sql` (optional) is a **string** that runs after the transform to create
+`{task}__validation*` views.
 
 **Allowed libraries in spec modules**: stdlib (pathlib, csv, json, etc.), polars, openpyxl.
 No other third-party imports. Spec modules should be pure data + ingestion logic.
@@ -74,7 +78,7 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 - **Token circuit breaker** (`agent_loop.py`): `DEFAULT_MAX_TOKENS = 20_000_000` (20M). Checked after each LLM call (prompt + completion combined). Returns `AgentResult(success=False)` if exceeded. Configurable via `max_tokens` param on `run_agent_loop()`.
 - **Per-query timeout** (`agent.py`): `DEFAULT_QUERY_TIMEOUT_S = 30`. Uses `threading.Timer` + `conn.interrupt()`. Catches `duckdb.InterruptException`, connection stays usable. Configurable via `query_timeout_s` param on `execute_sql()`.
 - **Output schema validation** (`task.py`): `output_columns: dict[str, list[str]]` on `Task`. Runs after view existence check, before validation view enforcement. Queries `information_schema.columns` and checks required columns are present.
-- **Task validation views** (`task.py`): tasks can declare one or more outputs named `{task}__validation` / `{task}__validation_*` with columns `status`, `message`. Any row with status='fail' fails the task.
+- **Task validation views** (`task.py`): tasks can declare `validate_sql` that creates `{task}__validation` / `{task}__validation_*` views with columns `status`, `message`. Any row with status='fail' fails the task.
 - **Input validation** (`workspace.py`): `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]` on `Workspace`. Runs after ingestion, before tasks. Column check short-circuits before SQL checks. Callable errors caught with context. Empty tables logged as warnings.
 
 ## Justfile
@@ -94,7 +98,7 @@ Shorthand commands via [just](https://github.com/casey/just). All `recon` comman
 ## CLI Commands
 
 ### `taskgraph init`
-Initialize a Taskgraph spec in the current directory. Creates `pyproject.toml`, `specs/main.py`, `specs/__init__.py`, `SPEC_GUIDE.md`, `.env`, and `.gitignore`. Project name is derived from the directory name (slugified). Scaffold spec uses `sql_strict` so `tg run` works immediately without an API key.
+Initialize a Taskgraph spec in the current directory. Creates `pyproject.toml`, `specs/main.py`, `specs/__init__.py`, `SPEC_GUIDE.md`, `.env`, and `.gitignore`. Project name is derived from the directory name (slugified). Scaffold spec uses `sql` so `tg run` works immediately without an API key.
 ```
 tg init          # create scaffold (skip existing files)
 tg init --force  # overwrite existing files

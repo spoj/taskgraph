@@ -12,34 +12,61 @@ Example:
             name="prep",
             inputs=["raw_rows"],
             outputs=["rows_clean"],
-            intent="Clean and normalize raw rows...",
             sql="CREATE OR REPLACE VIEW rows_clean AS SELECT ...",
+            validate_sql=(
+                "CREATE OR REPLACE VIEW prep__validation AS "
+                "SELECT 'pass' AS status, 'ok' AS message"
+            ),
         ),
         Task(
             name="match",
             inputs=["rows_clean", "reference"],
-            outputs=["matches", "match_summary", "match__validation"],
-            intent="Match normalized rows against a reference table...",
-            sql="CREATE OR REPLACE VIEW matches AS SELECT ...",
-            # Create a view named 'match__validation' with status/message rows.
+            outputs=["matches", "match_summary"],
+            prompt="Match normalized rows against a reference table...",
+            validate_sql=(
+                "CREATE OR REPLACE VIEW match__validation AS "
+                "SELECT 'pass' AS status, 'ok' AS message"
+            ),
         ),
     ]
 
     deps = resolve_task_deps(tasks)
-    # deps = {"prep": set(), "t1353": {"prep"}}
+    # deps = {"prep": set(), "match": {"prep"}}
 
     layers = resolve_dag(tasks)
     # layers[0] = [prep]       (no dependencies)
-    # layers[1] = [t1353]      (depends on prep's output)
+    # layers[1] = [match]      (depends on prep's output)
 """
 
 import duckdb
+import re
 from dataclasses import dataclass, field
 
 
 _VALIDATION_VIEW_REQUIRED_COLS = ["status", "message"]
 _VALIDATION_STATUS_ALLOWED = {"pass", "warn", "fail"}
 _MAX_INLINE_MESSAGES = 20  # Cap messages shown inline in validation/warning output
+
+_CREATE_VIEW_NAME_RE = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?"
+    r"VIEW\s+"
+    r"\"?(\w+)\"?",
+    re.IGNORECASE,
+)
+
+
+def _split_sql_statements(sql_text: str) -> list[str]:
+    sql_text = (sql_text or "").strip()
+    if not sql_text:
+        return []
+    conn = duckdb.connect()
+    try:
+        statements = conn.extract_statements(sql_text)
+    except duckdb.Error:
+        return [sql_text]
+    finally:
+        conn.close()
+    return [s.query.strip() for s in statements if s.query.strip()]
 
 
 def validation_view_prefix(task_name: str) -> str:
@@ -55,13 +82,6 @@ def is_validation_view_for_task(view_name: str, task_name: str) -> bool:
     return view_name == prefix or view_name.startswith(prefix + "_")
 
 
-def validation_outputs(task: "Task") -> list[str]:
-    """Return declared validation views for a task (outputs only)."""
-    return sorted(
-        [o for o in task.outputs if is_validation_view_for_task(o, task.name)]
-    )
-
-
 @dataclass
 class Task:
     """A single unit of work in a workspace.
@@ -70,16 +90,13 @@ class Task:
         name: Unique identifier, also used as namespace prefix for intermediate views.
         inputs: Table/view names this task reads from. These must exist before the task runs.
         outputs: View names this task must produce. Other tasks can depend on these.
-        Validation views: a task may declare one or more outputs named
-            '{name}__validation' and/or '{name}__validation_*'. If present, they are
-            enforced after the task runs. Any row with lower(status)='fail' causes the
-            task to fail.
+        Validation views: optional deterministic SQL that creates one or more views
+            named '{name}__validation' and/or '{name}__validation_*'. Any row with
+            lower(status)='fail' causes the task to fail.
         output_columns: Optional schema check. Maps view_name -> list of required column
             names. Validation fails if a view is missing any declared column.
-        intent: Objective text used when repairing failed SQL tasks.
-        repair_on_warn: If True (default), warnings in validation views trigger
-            LLM repair. Set to False for monitoring-only validation views where
-            you want to log warnings without spending tokens on repair.
+        prompt: Objective text used for LLM-driven transform tasks.
+        validate_sql: Deterministic SQL to create validation views.
     """
 
     name: str
@@ -88,48 +105,53 @@ class Task:
     output_columns: dict[str, list[str]] = field(default_factory=dict)
 
     # Deterministic SQL (views/macros only). If provided, the workspace
-    # harness executes these statements directly; on failure it may
-    # optionally attempt LLM repair.
+    # harness executes these statements directly.
     sql: str = ""
 
-    # Immutable deterministic SQL (no LLM repair). Same constraints as sql.
-    sql_strict: str = ""
+    # LLM-driven transform prompt.
+    prompt: str = ""
 
-    # Objective for repair mode when sql fails.
-    intent: str = ""
+    # Deterministic SQL used to create validation views.
+    validate_sql: str = ""
 
-    # If True, validation warnings trigger LLM repair.
-    repair_on_warn: bool = True
+    def transform_mode(self) -> str:
+        """Return execution mode: 'sql' or 'prompt'.
 
-    def run_mode(self) -> str:
-        """Return execution mode: 'sql_strict' or 'sql'.
-
-        Spec parsing enforces exactly one of (sql_strict, sql) is provided.
+        Spec parsing enforces exactly one of (sql, prompt) is provided.
         """
-        return "sql_strict" if self.sql_strict else "sql"
+        return "sql" if self.sql else "prompt"
+
+    def has_validation(self) -> bool:
+        return bool(self.validate_sql and self.validate_sql.strip())
 
     def sql_statements(self) -> list[str]:
-        """Return SQL statements for sql/sql_strict tasks."""
-        sql_text = self.sql_strict or self.sql
-        sql_text = (sql_text or "").strip()
-        if not sql_text:
-            return []
-        conn = duckdb.connect()
-        try:
-            statements = conn.extract_statements(sql_text)
-        except duckdb.Error:
-            return [sql_text]
-        finally:
-            conn.close()
-        return [s.query.strip() for s in statements if s.query.strip()]
+        """Return SQL statements for sql transform tasks."""
+        return _split_sql_statements(self.sql)
 
-    def validate(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
-        """Run validation. Returns error messages (empty = pass).
+    def validate_sql_statements(self) -> list[str]:
+        """Return SQL statements for validation SQL."""
+        return _split_sql_statements(self.validate_sql)
+
+    def validation_view_names(self) -> list[str]:
+        """Return validation view names derived from validate_sql."""
+        if not self.has_validation():
+            return []
+        names: list[str] = []
+        for stmt in self.validate_sql_statements():
+            match = _CREATE_VIEW_NAME_RE.search(stmt)
+            if not match:
+                continue
+            name = match.group(1)
+            if is_validation_view_for_task(name, self.name):
+                names.append(name)
+        return sorted(set(names))
+
+    def validate_transform(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
+        """Validate transform outputs. Returns error messages (empty = pass).
 
         Checks run in order, short-circuiting on first failure:
         1. All declared output views exist.
         2. Output views have required columns (if output_columns specified).
-        3. If validation views are declared in outputs, enforce them.
         """
         # 1. Check all declared outputs exist
         existing_views = {
@@ -162,21 +184,17 @@ class Task:
 
                 missing_cols = [c for c in required_cols if c not in actual_cols]
                 if missing_cols:
+                    label = "column" if len(missing_cols) == 1 else "columns"
                     return [
-                        f"View '{view_name}' is missing required column(s): "
+                        f"View '{view_name}' is missing required {label}: "
                         f"{', '.join(missing_cols)}. "
                         f"Actual columns: {', '.join(sorted(actual_cols))}"
                     ]
 
-        # 3. Enforce validation view(s) if declared
-        validation_errors = self._validate_validation_views(conn)
-        if validation_errors:
-            return validation_errors
-
         return []
 
-    def _validate_validation_views(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
-        """Enforce declared validation view outputs.
+    def validate_validation_views(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
+        """Enforce validation views created by validate_sql.
 
         Each validation view must have columns:
         - status: pass|warn|fail (case-insensitive)
@@ -184,7 +202,11 @@ class Task:
 
         Any row with lower(status)='fail' fails the task.
         """
-        views = validation_outputs(self)
+        views = self.validation_view_names()
+        if self.has_validation() and not views:
+            return [
+                f"validate_sql did not create any '{validation_view_prefix(self.name)}' views."
+            ]
         if not views:
             return []
 
@@ -202,17 +224,18 @@ class Task:
 
     def validation_warnings(
         self, conn: duckdb.DuckDBPyConnection, limit: int | None = None
-    ) -> list[str]:
-        """Return warning messages from validation views.
+    ) -> tuple[int, list[str]]:
+        """Return (total_warning_count, warning_messages) from validation views.
 
         Assumes validation views exist and are well-formed.
         Pass limit=None for no truncation.
         """
-        views = validation_outputs(self)
+        views = self.validation_view_names()
         if not views:
-            return []
+            return 0, []
 
         warnings: list[str] = []
+        total = 0
         remaining = None if limit is None else max(1, limit)
 
         for view_name in views:
@@ -232,6 +255,21 @@ class Task:
 
             actual = {c.lower() for c in cols}
             if "status" not in actual or "message" not in actual:
+                continue
+
+            try:
+                count_row = conn.execute(
+                    f"SELECT COUNT(*) FROM \"{view_name}\" WHERE lower(status) = 'warn'"
+                ).fetchone()
+                view_count = int(count_row[0]) if count_row else 0
+            except duckdb.Error:
+                continue
+
+            if view_count <= 0:
+                continue
+
+            total += view_count
+            if remaining is not None and remaining <= 0:
                 continue
 
             has_evidence_view = "evidence_view" in actual
@@ -264,21 +302,20 @@ class Task:
                 else:
                     msgs = [str(msg) for _status, msg in rows]
 
-                count = len(msgs)
-                header = f"Warnings via '{view_name}' ({count} row(s))"
+                header = f"Warnings via '{view_name}' ({view_count} row(s))"
                 if evidence_views:
                     header += f" [evidence: {', '.join(sorted(evidence_views))}]"
 
                 sample = msgs[:_MAX_INLINE_MESSAGES]
                 detail = "\n".join(f"  {m}" for m in sample)
-                if count > _MAX_INLINE_MESSAGES:
-                    detail += f"\n  ... and {count - _MAX_INLINE_MESSAGES} more"
+                if view_count > _MAX_INLINE_MESSAGES:
+                    detail += f"\n  ... and {view_count - _MAX_INLINE_MESSAGES} more"
 
                 warnings.append(f"{header}:\n{detail}")
                 if remaining is not None:
-                    remaining -= count
+                    remaining -= len(msgs)
 
-        return warnings
+        return total, warnings
 
     def _validate_one_validation_view(
         self, conn: duckdb.DuckDBPyConnection, view_name: str
@@ -305,9 +342,10 @@ class Task:
         actual = {c.lower() for c in cols}
         missing = [c for c in _VALIDATION_VIEW_REQUIRED_COLS if c not in actual]
         if missing:
+            label = "column" if len(missing) == 1 else "columns"
             return (
                 [
-                    f"Validation view '{view_name}' is missing required column(s): "
+                    f"Validation view '{view_name}' is missing required {label}: "
                     f"{', '.join(missing)}. Actual columns: {', '.join(cols)}"
                 ],
                 True,
@@ -361,7 +399,7 @@ class Task:
                 msgs = [str(msg) for _status, msg in rows]
 
             count = len(msgs)
-            header = f"Fail rows in '{view_name}' ({count})"
+            header = f"Failures in '{view_name}' ({count})"
             if evidence_views:
                 header += f" [evidence: {', '.join(sorted(evidence_views))}]"
 

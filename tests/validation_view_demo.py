@@ -101,21 +101,6 @@ INPUTS = {
 TASKS = [
     {
         "name": "categorize",
-        "intent": (
-            "Categorize each expense line into a spending category based on the\n"
-            "vendor and description. Use these categories:\n"
-            "- 'Office' for office supplies, furniture, toner (vendor: Acme Corp)\n"
-            "- 'Technology' for hosting, certificates (vendor: CloudHost Inc)\n"
-            "- 'Travel' for flights, hotels, parking (vendor: TravelCo)\n"
-            "- 'Professional' for legal, consulting (vendor: LegalEase LLP)\n\n"
-            "Create three views:\n"
-            "1. 'categorized' — all input columns plus a 'category' column\n"
-            "2. 'category_summary' — one row per category with: category, item_count,\n"
-            "   total_amount. Include a final row with category='TOTAL' summing everything.\n"
-            "3. 'categorize__validation' — rows with columns: status, message.\n"
-            "   Add a row with status='fail' if any expense row is missing from categorized,\n"
-            "   or if the categorized total differs from expected_total by > 0.01.\n"
-        ),
         "sql": """
             CREATE OR REPLACE VIEW categorized AS
             SELECT
@@ -142,7 +127,8 @@ TASKS = [
                 COUNT(*) AS item_count,
                 SUM(amount) AS total_amount
             FROM categorized;
-
+            """,
+        "validate_sql": """
             CREATE OR REPLACE VIEW categorize__validation AS
             WITH
             exp AS (SELECT COUNT(*) AS cnt FROM expenses),
@@ -171,11 +157,10 @@ TASKS = [
               AND ABS(tot.total - sumcat.total_amount) <= 0.01
             """,
         "inputs": ["expenses", "expected_total"],
-        "outputs": ["categorized", "category_summary", "categorize__validation"],
+        "outputs": ["categorized", "category_summary"],
         "output_columns": {
             "categorized": ["category"],
             "category_summary": ["category", "item_count", "total_amount"],
-            "categorize__validation": ["status", "message"],
         },
     },
 ]

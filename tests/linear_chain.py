@@ -61,18 +61,6 @@ INPUTS = {
 
 parse = {
     "name": "parse",
-    "intent": (
-        "Parse the raw_orders table. The 'items' column contains comma-separated\n"
-        "entries in the format 'sku:quantity' (e.g. 'widget_a:2,widget_b:1').\n\n"
-        "Create a view 'order_lines' with one row per item per order:\n"
-        "- order_id: from the order\n"
-        "- customer: from the order\n"
-        "- date: from the order\n"
-        "- sku: the item SKU (e.g. 'widget_a')\n"
-        "- quantity: the integer quantity\n\n"
-        "Hint: Use string_split() and unnest() to explode the comma-separated\n"
-        "items into individual rows.\n"
-    ),
     "sql": """
         CREATE OR REPLACE VIEW order_lines AS
         SELECT
@@ -93,12 +81,6 @@ parse = {
 
 enrich = {
     "name": "enrich",
-    "intent": (
-        "Join order_lines with price_list to compute line totals.\n\n"
-        "Create a view 'enriched_lines' with all columns from order_lines plus:\n"
-        "- unit_price: from the price_list\n"
-        "- line_total: quantity * unit_price\n"
-    ),
     "sql": """
         CREATE OR REPLACE VIEW enriched_lines AS
         SELECT
@@ -115,18 +97,6 @@ enrich = {
 
 aggregate = {
     "name": "aggregate",
-    "intent": (
-        "Create two summary views from enriched_lines:\n\n"
-        "1. 'customer_totals' with columns:\n"
-        "   - customer\n"
-        "   - order_count: number of distinct orders\n"
-        "   - total_items: sum of quantities\n"
-        "   - total_spend: sum of line_total\n\n"
-        "2. 'sku_totals' with columns:\n"
-        "   - sku\n"
-        "   - total_quantity: sum of quantities across all orders\n"
-        "   - total_revenue: sum of line_total\n"
-    ),
     "sql": """
         CREATE OR REPLACE VIEW customer_totals AS
         SELECT
