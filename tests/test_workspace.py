@@ -530,3 +530,23 @@ class TestMaterializeTaskOutputs:
         assert len(rows) == 1
         assert rows[0][0] == "t__validation"
         assert "pass" in rows[0][1]
+
+    def test_leftover_tmp_table_cleaned_up(self, conn):
+        """A leftover _materialize_tmp_ table from a crashed run doesn't block."""
+        conn.execute("CREATE TABLE _materialize_tmp_out AS SELECT 999 AS stale")
+        conn.execute("CREATE VIEW out AS SELECT 1 AS x")
+        task = _make_task(name="t", outputs=["out"])
+
+        n = materialize_task_outputs(conn, task)
+
+        assert n == 1
+        # Stale tmp table replaced, final table has correct data
+        assert conn.execute("SELECT x FROM out").fetchone() == (1,)
+        # No leftover tmp table
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
+            ).fetchall()
+        }
+        assert "_materialize_tmp_out" not in tables

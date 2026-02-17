@@ -231,11 +231,22 @@ def materialize_task_outputs(
             [task.name, view_name, view_sql],
         )
 
-        # Materialize: create table from view, drop view, rename table
+        # Materialize: create table from view, drop view, rename table.
+        # Drop any leftover tmp table from a previous crashed run, then
+        # do the 3-step swap with cleanup on failure so we never leave
+        # the catalog in a broken state (view gone + tmp not renamed).
         tmp_name = f"_materialize_tmp_{view_name}"
+        conn.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
         conn.execute(f'CREATE TABLE "{tmp_name}" AS SELECT * FROM "{view_name}"')
-        conn.execute(f'DROP VIEW "{view_name}"')
-        conn.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{view_name}"')
+        try:
+            conn.execute(f'DROP VIEW "{view_name}"')
+            conn.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{view_name}"')
+        except duckdb.Error:
+            # Swap failed — drop the tmp table so we don't leak it.
+            # The original view may or may not still exist; either way
+            # downstream can still query it by name.
+            conn.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
+            raise
         materialized += 1
 
     return materialized
