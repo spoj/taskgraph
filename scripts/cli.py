@@ -32,9 +32,11 @@ if _dotenv_path:
 
 # Allow importing local spec modules (e.g. specs.main) from the CWD.
 # Console-script entrypoints don't reliably include the working directory.
-sys.path.insert(0, str(Path.cwd()))
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# CWD goes first so user's specs/ always wins over any same-named package
+# in the installed taskgraph tree (e.g. editable installs).
+_cwd = str(Path.cwd())
+if _cwd not in sys.path:
+    sys.path.insert(0, _cwd)
 
 from src.api import OpenRouterClient, DEFAULT_MODEL
 from src.agent_loop import DEFAULT_MAX_ITERATIONS

@@ -11,48 +11,9 @@ Specs are imported as modules (e.g. `my_app.specs.main`). File paths are accepte
 
 ## Recommended Layout
 
-## Project Setup (uv)
+For a new project, run `taskgraph init` to scaffold a `specs/` directory, `pyproject.toml`, and supporting files.
 
-If you're starting a new app repo, this is a good default setup.
-
-1) Initialize a Python project:
-
-```bash
-uv init my_app
-cd my_app
-```
-
-2) Add Taskgraph and any common spec dependencies:
-
-```bash
-uv add taskgraph
-uv add polars openpyxl
-```
-
-3) Create a spec module and point Taskgraph at it:
-
-```bash
-mkdir -p my_app/specs
-touch my_app/specs/__init__.py
-```
-
-Add this to `pyproject.toml`:
-
-```toml
-[tool.taskgraph]
-spec = "my_app.specs.main"
-```
-
-4) Run a workspace:
-
-```bash
-uv run taskgraph run
-```
-
-5) Ensure your LLM credential is set:
-
-Taskgraph uses OpenRouter; set `OPENROUTER_API_KEY` in your environment (or in a `.env` loaded by your app).
-If your spec only uses `sql` tasks, no LLM key is required.
+Taskgraph uses OpenRouter for LLM calls; set `OPENROUTER_API_KEY` in your environment or `.env` file. If your spec only uses `sql` tasks, no API key is required.
 
 Two common patterns:
 
@@ -286,7 +247,7 @@ The agent receives:
    - `validate_sql` (if provided)
    - Naming rules: the agent can create views/macros named either as declared outputs or prefixed with `{task_name}_` (e.g., task `match` can create `match_step1`, `match_candidates`, etc.)
     
-   If validation fails, the agent receives validation feedback and can retry once.
+   If validation fails, the agent receives validation feedback and can retry within the iteration budget (default 200).
 
 ### What the agent can do
 
@@ -564,11 +525,15 @@ SELECT key, value FROM _workspace_meta
 Keys (v2):
 - `meta_version`
 - `created_at_utc`
+- `taskgraph_version`
+- `python_version`
+- `platform`
 - `task_prompts`
 - `llm_model`, `llm_reasoning_effort`, `llm_max_iterations`
 - `inputs_row_counts`, `inputs_schema`
 - `run` (JSON: run context)
 - `spec` (JSON: module)
+- `exports` (JSON: export results, added after exports run)
 
 ### Adding provenance columns
 
@@ -579,7 +544,6 @@ TASKS = [
     {
         "name": "match",
         "prompt": "... Include a match_reason column explaining why each pair was matched ...",
-        "sql": "CREATE OR REPLACE VIEW output AS SELECT ...",
         "inputs": ["invoices", "payments"],
         "outputs": ["output"],
         "output_columns": {
@@ -674,7 +638,7 @@ Stronger validation catches issues earlier and makes prompt-task retries more ef
 
 - `fail` rows block the task.
 - `warn` rows are informational and shown by the CLI.
-- Prompt tasks get one retry when validation fails.
+- Prompt tasks can retry when validation fails, within the iteration budget (default 200).
 
 Write `warn` thresholds at the quality level you want to monitor:
 
@@ -717,10 +681,12 @@ taskgraph run -o OUTPUT_DB [options]
 
 ```
 taskgraph show --spec MODULE
+taskgraph show output.db
 taskgraph show
 ```
 
-Displays spec structure: inputs, DAG layers, per-task details, validation summary, exports.
+When given a `.db` file, displays workspace metadata: creation time, model, inputs, tasks, and export results.
+Otherwise, displays spec structure: inputs, DAG layers, per-task details, validation summary, exports.
 
 ## Appendix: Debugging a Workspace
 

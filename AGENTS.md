@@ -16,8 +16,9 @@ independent agent writing namespace-enforced SQL views.
 
 - `src/agent.py` — task agent: prompt-based SQL transform, namespace enforcement
 - `src/agent_loop.py` — generic async agent loop with concurrent tool execution
-- `src/api.py` — OpenRouter client. Connection pooling, cache_control on last message, reasoning_effort
-- `src/diff.py` — View catalog diffing: before/after snapshots of `duckdb_views().sql`, structured change reporting (created/modified/dropped), persistence to `_changes` table
+- `src/api.py` — OpenRouter client. Connection pooling, cache_control on last message (Anthropic only), reasoning_effort
+- `src/diff.py` — View catalog diffing: before/after snapshots of `duckdb_views().sql`, structured change reporting (created/modified/dropped), persistence to `_changes` table, terminal formatting
+- `src/sql_utils.py` — shared SQL utilities: parser connection, statement splitting, column schema queries, CREATE name extraction
 - `src/task.py` — Task dataclass, DAG resolution (topo-sort via Kahn's algorithm), dependency graph, graph validation
 - `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling, per-task change tracking
 - `src/ingest.py` — Ingestion: DataFrame/list[dict]/dict[str,list] -> DuckDB with _row_id PK
@@ -67,8 +68,8 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 - **Failure isolation** — a failed task only blocks its downstream dependents, not the entire layer. Unrelated branches continue.
 - **Result size cap** — SELECT results exceeding 30k chars (~20k tokens) are rejected with an error nudging the agent to use LIMIT. Configurable via `max_result_chars` on `execute_sql()`.
 - **SQL trace** in _trace table with task column for per-task filtering
-- **Per-task metadata** in _task_meta table (composite PK: task + key)
-- **Display**: `.` per SQL tool call, newline per tool round
+- **Per-task metadata** in _task_meta table (PK: task, value: meta_json JSON blob)
+- **Display**: `.` per SQL tool call at DEBUG level only
 - **Concurrency**: asyncio cooperative — true parallelism only at LLM API call level, DuckDB access naturally serialized on single thread
 - **DuckDB ingestion** uses native DataFrame scan (`CREATE TABLE AS SELECT ... FROM df`) — no row-by-row executemany
 - **DuckDB views filter** — always use `internal = false` to exclude system catalog views
@@ -80,20 +81,6 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 - **Output schema validation** (`task.py`): `output_columns: dict[str, list[str]]` on `Task`. Runs after view existence check, before validation view enforcement. Queries `information_schema.columns` and checks required columns are present.
 - **Task validation views** (`task.py`): tasks can declare `validate_sql` that creates `{task}__validation` / `{task}__validation_*` views with columns `status`, `message`. Any row with status='fail' fails the task.
 - **Input validation** (`workspace.py`): `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]` on `Workspace`. Runs after ingestion, before tasks. Column check short-circuits before SQL checks. Callable errors caught with context. Empty tables logged as warnings.
-
-## Justfile
-
-Shorthand commands via [just](https://github.com/casey/just). All `recon` commands go through `uv run`.
-
-| Command | Expands to |
-|---------|-----------|
-| `just run <args>` | `uv run taskgraph run <args>` |
-| `just show <args>` | `uv run taskgraph show <args>` |
-| `just inspect-xlsx <file> [sheet] [range]` | `uv run python scripts/inspect_xlsx.py <file> [sheet] [range]` |
-| `just test [args]` | `uv run pytest tests/ [args]` |
-| `just test-k <pattern>` | `uv run pytest tests/ -k "<pattern>" -v` |
-| `just sync` | `uv sync` |
-| `just lock` | `uv lock` |
 
 ## CLI Commands
 
@@ -120,8 +107,9 @@ After each task completes, view changes are reported inline:
 Changes are also persisted to the `_changes` table in the output `.db` for later querying.
 
 ### `taskgraph show`
-Visualize a spec's structure: inputs with column specs, DAG layers with concurrent task grouping, per-task inputs/outputs, validation summary, graph errors, exports. Accepts file paths like `run`.
+Visualize a spec's structure: inputs with column specs, DAG layers with concurrent task grouping, per-task inputs/outputs, validation summary, graph errors, exports. Accepts file paths like `run`. When given a `.db` file, displays workspace metadata instead.
 ```
 just show --spec my_app.specs.main
 just show --spec specs/main.py
+just show output.db
 ```
