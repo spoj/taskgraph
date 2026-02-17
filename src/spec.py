@@ -51,7 +51,7 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
     # Parse INPUTS: separate data from validation metadata
     inputs: dict[str, Any] = {}
     input_columns: dict[str, list[str]] = {}
-    input_validate_sql: dict[str, list[str]] = {}
+    input_validate_sql: dict[str, str] = {}
 
     def _resolve_source(source: Any) -> Any:
         if isinstance(source, FileInput):
@@ -69,7 +69,15 @@ def _parse_module(module: ModuleType) -> dict[str, Any]:
             if "columns" in value:
                 input_columns[name] = value["columns"]
             if "validate_sql" in value:
-                input_validate_sql[name] = value["validate_sql"]
+                vs = value["validate_sql"]
+                if not isinstance(vs, str):
+                    raise ValueError(
+                        f"Input '{name}' validate_sql must be a string, "
+                        f"got {type(vs).__name__}"
+                    )
+                vs = vs.strip()
+                if vs:
+                    input_validate_sql[name] = vs
             continue
 
         if isinstance(value, dict) and "data" in value:

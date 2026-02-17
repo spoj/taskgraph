@@ -49,7 +49,7 @@ from .diff import (
 from .ingest import FileInput, ingest_file, ingest_table
 from .agent import init_trace_table, run_task_agent, run_sql_only_task
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
-from .sql_utils import get_column_schema
+from .sql_utils import get_column_schema, split_sql_statements
 
 log = logging.getLogger(__name__)
 
@@ -281,9 +281,9 @@ class Workspace:
             Maps table_name -> list of required column names.
             Checked after ingestion, before tasks run.
         input_validate_sql: Optional SQL validation for input tables.
-            Maps table_name -> list of SQL queries that must each
-            return zero rows. Checked after ingestion and input_columns,
-            before tasks run.
+            Maps table_name -> SQL string (semicolon-separated statements).
+            Each statement must return zero rows. Checked after ingestion
+            and input_columns, before tasks run.
         spec_module: Module path used to load the spec.
     """
 
@@ -292,7 +292,7 @@ class Workspace:
     tasks: list[Task]
     exports: dict[str, ExportFn] = field(default_factory=dict)
     input_columns: dict[str, list[str]] = field(default_factory=dict)
-    input_validate_sql: dict[str, list[str]] = field(default_factory=dict)
+    input_validate_sql: dict[str, str] = field(default_factory=dict)
     spec_module: str | None = None
 
     def _validate_config(self) -> None:
@@ -380,7 +380,8 @@ class Workspace:
             return errors
 
         # 2. Per-input SQL validation checks
-        for table_name, sql_checks in self.input_validate_sql.items():
+        for table_name, validate_sql in self.input_validate_sql.items():
+            sql_checks = split_sql_statements(validate_sql)
             for sql in sql_checks:
                 try:
                     cursor = conn.execute(sql)

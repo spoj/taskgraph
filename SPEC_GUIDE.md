@@ -139,9 +139,7 @@ INPUTS = {
     "invoices": {
         "source": "data/invoices.xlsx#Sheet1",
         "columns": ["id", "amount", "date", "vendor"],
-        "validate_sql": [
-            "SELECT 'null amount at id=' || id FROM invoices WHERE amount IS NULL",
-        ],
+        "validate_sql": "SELECT 'null amount at id=' || id FROM invoices WHERE amount IS NULL",
     },
 }
 ```
@@ -150,7 +148,7 @@ INPUTS = {
 |-----|------|----------|-------------|
 | `source` | callable, raw data, or file path | Yes | Same as simple format, with file path support |
 | `columns` | `list[str]` | No | Required columns. Checked after ingestion, before tasks. Missing columns abort the run. |
-| `validate_sql` | `list[str]` | No | SQL queries that must return 0 rows. Each returned row is an error. Runs after column check. |
+| `validate_sql` | `str` | No | SQL statement(s) that must return 0 rows. Multiple statements separated by `;` are split by DuckDB's parser. Each returned row is an error. Runs after column check. |
 
 Detection: a dict value with a `"source"` key is treated as rich format. A dict without `"source"` is treated as raw `dict[str, list]` data.
 
@@ -162,7 +160,7 @@ Strings ending in one of the supported extensions are treated as file inputs:
 |-----------|--------------|-------|
 | `.csv` | DuckDB `read_csv_auto` | Auto-detect schema |
 | `.parquet` | DuckDB `read_parquet` | Native parquet reader |
-| `.xlsx` / `.xls` | DuckDB `read_xlsx` | Use `#SheetName` to pick a sheet |
+| `.xlsx` / `.xls` | DuckDB `read_xlsx` | `header = false`; columns named `A1`, `B1`, etc. Use `#SheetName` to pick a sheet |
 | `.pdf` | Gemini 3 Flash (OpenRouter) | Extracts tabular data into JSON (requires OPENROUTER_API_KEY) |
 
 Excel sheet selection uses a fragment:

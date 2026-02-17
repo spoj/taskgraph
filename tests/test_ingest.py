@@ -159,10 +159,11 @@ class TestIngestion:
         wb.save(path)
 
         ingest_excel(conn, path, "excel_t")
+        # header=false: columns are A1, B1; header row becomes data
         rows = conn.execute(
-            "SELECT _row_id, id, val FROM excel_t ORDER BY _row_id"
+            "SELECT _row_id, A1, B1 FROM excel_t ORDER BY _row_id"
         ).fetchall()
-        assert rows == [(1, 1, "a"), (2, 2, "b")]
+        assert rows == [(1, "id", "val"), (2, "1", "a"), (3, "2", "b")]
 
     def test_ingest_excel_specific_sheet(self, conn, tmp_path: Path):
         path = tmp_path / "data.xlsx"
@@ -177,10 +178,11 @@ class TestIngestion:
         wb.save(path)
 
         ingest_excel(conn, path, "excel_t", sheet="Budget")
+        # header=false: columns are A1, B1; header row becomes data
         rows = conn.execute(
-            "SELECT _row_id, id, val FROM excel_t ORDER BY _row_id"
+            "SELECT _row_id, A1, B1 FROM excel_t ORDER BY _row_id"
         ).fetchall()
-        assert rows == [(1, 99, "z")]
+        assert rows == [(1, "id", "val"), (2, "99", "z")]
 
     def test_ingest_pdf_file(self, conn, tmp_path: Path):
         path = tmp_path / "data.pdf"
@@ -298,7 +300,7 @@ class TestInputValidation:
         ingest_table(conn, [{"x": 1}], "t")
         ws = self._make_workspace(
             input_columns={"t": ["missing"]},
-            input_validate_sql={"t": ["SELECT 'should not run'"]},
+            input_validate_sql={"t": "SELECT 'should not run'"},
         )
         errors = ws._validate_inputs(conn)
         assert len(errors) == 1
@@ -308,7 +310,7 @@ class TestInputValidation:
         """SQL validation passes when queries return zero rows."""
         ingest_table(conn, [{"id": 1, "val": 10}, {"id": 2, "val": 20}], "data")
         ws = self._make_workspace(
-            input_validate_sql={"data": ["SELECT id FROM data WHERE val < 0"]},
+            input_validate_sql={"data": "SELECT id FROM data WHERE val < 0"},
         )
         errors = ws._validate_inputs(conn)
         assert errors == []
@@ -318,10 +320,10 @@ class TestInputValidation:
         ingest_table(conn, [{"id": 1, "val": -5}], "data")
         ws = self._make_workspace(
             input_validate_sql={
-                "data": [
+                "data": (
                     "SELECT 'negative value for id=' || CAST(id AS VARCHAR) "
                     "FROM data WHERE val < 0"
-                ]
+                )
             },
         )
         errors = ws._validate_inputs(conn)
@@ -331,7 +333,7 @@ class TestInputValidation:
     def test_input_validate_sql_error_handling(self, conn):
         """SQL validation catches query errors gracefully."""
         ws = self._make_workspace(
-            input_validate_sql={"bad": ["SELECT * FROM nonexistent_table"]},
+            input_validate_sql={"bad": "SELECT * FROM nonexistent_table"},
         )
         errors = ws._validate_inputs(conn)
         assert len(errors) == 1
@@ -342,7 +344,7 @@ class TestInputValidation:
         ingest_table(conn, [{"id": 1, "status": "bad"}], "items")
         ws = self._make_workspace(
             input_validate_sql={
-                "items": ["SELECT id, status FROM items WHERE status = 'bad'"]
+                "items": "SELECT id, status FROM items WHERE status = 'bad'"
             },
         )
         errors = ws._validate_inputs(conn)
@@ -355,10 +357,7 @@ class TestInputValidation:
         ingest_table(conn, [{"id": 1}], "t")
         ws = self._make_workspace(
             input_validate_sql={
-                "t": [
-                    "SELECT 'error1' WHERE 1=1",
-                    "SELECT 'error2' WHERE 1=1",
-                ]
+                "t": "SELECT 'error1' WHERE 1=1; SELECT 'error2' WHERE 1=1"
             },
         )
         errors = ws._validate_inputs(conn)

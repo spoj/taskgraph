@@ -213,13 +213,13 @@ def ingest_excel(
     if sheet:
         query = (
             "SELECT CAST(row_number() OVER () AS INTEGER) AS _row_id, * "
-            "FROM read_xlsx(?, sheet = ?, header = true)"
+            "FROM read_xlsx(?, sheet = ?, header = false)"
         )
         params = [str(path), sheet]
     else:
         query = (
             "SELECT CAST(row_number() OVER () AS INTEGER) AS _row_id, * "
-            "FROM read_xlsx(?, header = true)"
+            "FROM read_xlsx(?, header = false)"
         )
         params = [str(path)]
     _write_table_from_query(conn, table_name, query, params)

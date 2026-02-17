@@ -44,13 +44,13 @@ INPUTS = {
     "invoices": {
         "source": "data/invoices.xlsx#Sheet1",                   # file path or callable or raw data
         "columns": ["id", "amount", "date"],                     # optional: required columns
-        "validate_sql": ["SELECT id FROM invoices WHERE amount IS NULL"],  # optional: must return 0 rows
+        "validate_sql": "SELECT id FROM invoices WHERE amount IS NULL",  # optional: must return 0 rows
     },
     "rates": load_rates,  # simple — no validation needed
 }
 ```
 
-At the `load_spec` boundary, if a value is a dict with a `"source"` key, `columns` and `validate_sql` are extracted per-input and passed to the Workspace as `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, list[str]]`.
+At the `load_spec` boundary, if a value is a dict with a `"source"` key, `columns` and `validate_sql` are extracted per-input and passed to the Workspace as `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, str]`.
 
 Task `sql` or `prompt` must be a **string**. Exactly one is required per task.
 `validate_sql` (optional) is a **string** that runs after the transform to create
