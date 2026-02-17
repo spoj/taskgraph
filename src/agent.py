@@ -85,6 +85,15 @@ DUCKDB DIALECT:
 - arg_min(val, ordering), arg_max(val, ordering)
 - count(*) FILTER (WHERE cond), greatest(), least()
 - ASOF JOIN — nearest-match on ordered column
+- PIVOT: PIVOT t ON col USING sum(val) — wide format. UNPIVOT t ON col1, col2 INTO NAME k VALUE v
+- COLUMNS(*) — apply expression to all columns: SELECT MIN(COLUMNS(*)) FROM t
+  COLUMNS(c -> c LIKE '%amt%') — lambda filter on column names
+- Dates: date_diff('day', a, b), date_trunc('month', d), strftime(d, '%Y-%m'), make_date(y,m,d)
+  current_date, interval '3 days', d + INTERVAL 1 MONTH
+- Strings: regexp_extract(s, pattern, group), regexp_replace(s, pat, repl),
+  string_split(s, delim), string_agg(col, ', '), concat_ws('-', a, b, c)
+- JSON: col->>'key' (extract as text), col->'key' (extract as JSON),
+  json_extract_string(col, '$.path'), json_group_array(col), json_group_object(k, v)
 - Views are late-binding (store SQL text, not data). CREATE OR REPLACE propagates instantly.
 """
 

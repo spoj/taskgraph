@@ -75,6 +75,7 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 - **DuckDB ingestion** uses native DataFrame scan (`CREATE TABLE AS SELECT ... FROM df`) — no row-by-row executemany
 - **DuckDB views filter** — always use `internal = false` to exclude system catalog views
 - **DuckDB tables filter** — `duckdb_tables() WHERE internal = false` for materialized outputs; `validate_transform()` checks both views and tables
+- **Agent system prompt DuckDB dialect** — covers: QUALIFY, GROUP BY ALL, UNION BY NAME, SUMMARIZE, lists/lambdas, fuzzy matching, EXCLUDE/REPLACE, ASOF JOIN, PIVOT/UNPIVOT, COLUMNS() expressions, date functions (date_diff, date_trunc, strftime, make_date), string functions (regexp_extract, regexp_replace, string_split, string_agg, concat_ws), JSON arrow syntax (->>, json_extract_string, json_group_array)
 
 ## Robustness Features
 
