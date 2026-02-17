@@ -473,12 +473,17 @@ The `.db` is a queryable audit trail. After a run, you can open it and trace how
 
 ### Inspect the database
 
+After a run, task outputs and validation views are **materialized as tables** (frozen). Intermediate `{task}_*` views stay as views for debuggability. The original view SQL definitions are preserved in `_view_definitions`.
+
 ```bash
-# Show all user-created views
+# Show all user-created tables (materialized outputs + inputs)
+duckdb output.db "SELECT table_name FROM duckdb_tables() WHERE internal = false"
+
+# Show intermediate views (still live)
 duckdb output.db "SELECT view_name FROM duckdb_views() WHERE internal = false"
 
-# Read a view's SQL definition
-duckdb output.db "SELECT sql FROM duckdb_views() WHERE view_name = 'output'"
+# Read a materialized output's original SQL definition
+duckdb output.db "SELECT sql FROM _view_definitions WHERE view_name = 'output'"
 
 # Query the output
 duckdb output.db "SELECT * FROM output LIMIT 10"
@@ -487,14 +492,18 @@ duckdb output.db "SELECT * FROM output LIMIT 10"
 duckdb output.db "SELECT * FROM invoices WHERE _row_id = 42"
 ```
 
-### View chain as lineage
+### Lineage via `_view_definitions`
 
-Views reference other views. The chain is the lineage:
-```
-output → match_scored → match_candidates → match_legs → input_left, input_right
+After materialization, output views become tables. Their original SQL is preserved in `_view_definitions`:
+
+```sql
+SELECT task, view_name, sql FROM _view_definitions ORDER BY task, view_name
 ```
 
-Because views are late-binding, you can modify input data and re-query to see the effect.
+Intermediate views (still live) reference materialized tables. The chain is the lineage:
+```
+intermediate_view → materialized_table → ... → input_table
+```
 
 ### SQL execution trace
 
@@ -693,11 +702,14 @@ Otherwise, displays spec structure: inputs, DAG layers, per-task details, valida
 When a spec isn't doing what you expect, treat `output.db` as the ground truth:
 
 ```bash
-# What views exist?
+# What tables exist? (materialized outputs + inputs)
+duckdb output.db "SELECT table_name FROM duckdb_tables() WHERE internal = false ORDER BY 1"
+
+# What intermediate views exist?
 duckdb output.db "SELECT view_name FROM duckdb_views() WHERE internal = false ORDER BY 1"
 
-# What's the SQL for a view?
-duckdb output.db "SELECT sql FROM duckdb_views() WHERE view_name = 'matches'"
+# What's the original SQL for a materialized output?
+duckdb output.db "SELECT sql FROM _view_definitions WHERE view_name = 'matches'"
 
 # What did the agent try?
 duckdb output.db "SELECT id, task, success, row_count, elapsed_ms, query FROM _trace ORDER BY id"

@@ -2,12 +2,17 @@
 
 A workspace is a single DuckDB database containing:
 - Ingested input tables (from user-provided functions or data)
-- Per-task output views (created by agents)
+- Per-task output views (created by agents, materialized as tables after task completion)
 - Metadata and trace tables
 
 Tasks are scheduled greedily: each task starts as soon as all its
 dependencies complete (not layer-by-layer). A failed task only blocks
 its downstream dependents; unrelated branches continue.
+
+After a task passes validation, its declared output views are
+materialized as tables (frozen). The original SQL definitions are
+preserved in the ``_view_definitions`` table for lineage queries.
+Intermediate views (``{task}_*``) are left as views for debuggability.
 
 Usage:
 
@@ -159,6 +164,81 @@ def upsert_workspace_meta(
         """,
         rows,
     )
+
+
+# --- View materialization ---
+
+
+def materialize_task_outputs(
+    conn: duckdb.DuckDBPyConnection,
+    task: Task,
+) -> int:
+    """Materialize a task's declared output views as tables.
+
+    After a task completes and passes validation, its output views and
+    validation views are converted to tables so downstream tasks read
+    pre-computed data instead of re-evaluating the entire upstream view
+    chain on every query.
+
+    The original view SQL definitions are preserved in ``_view_definitions``
+    for lineage and audit queries.
+
+    What gets materialized:
+    - Declared task outputs (``task.outputs``)
+    - Validation views (``{task}__validation*``)
+
+    What stays as views:
+    - Intermediate ``{task}_*`` views (for debuggability)
+
+    Returns the number of views materialized.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS _view_definitions (
+            task VARCHAR NOT NULL,
+            view_name VARCHAR NOT NULL,
+            sql VARCHAR NOT NULL,
+            PRIMARY KEY (task, view_name)
+        )
+    """)
+
+    # Collect all views to materialize: declared outputs + validation views
+    view_names = list(task.outputs) + task.validation_view_names()
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_names: list[str] = []
+    for name in view_names:
+        if name not in seen:
+            seen.add(name)
+            unique_names.append(name)
+
+    materialized = 0
+    for view_name in unique_names:
+        # Get the view's SQL definition before converting
+        rows = conn.execute(
+            "SELECT sql FROM duckdb_views() WHERE internal = false AND view_name = ?",
+            [view_name],
+        ).fetchall()
+        if not rows:
+            continue  # View doesn't exist (task may have failed or already materialized)
+
+        view_sql = rows[0][0]
+
+        # Preserve the SQL definition for lineage
+        conn.execute(
+            "INSERT INTO _view_definitions (task, view_name, sql) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT (task, view_name) DO UPDATE SET sql = excluded.sql",
+            [task.name, view_name, view_sql],
+        )
+
+        # Materialize: create table from view, drop view, rename table
+        tmp_name = f"_materialize_tmp_{view_name}"
+        conn.execute(f'CREATE TABLE "{tmp_name}" AS SELECT * FROM "{view_name}"')
+        conn.execute(f'DROP VIEW "{view_name}"')
+        conn.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{view_name}"')
+        materialized += 1
+
+    return materialized
 
 
 @dataclass
@@ -505,6 +585,12 @@ class Workspace:
                 change_summary = format_changes(task.name, changes)
                 if change_summary:
                     log.info("%s", change_summary)
+            # Materialize successful task outputs as tables so downstream
+            # tasks read pre-computed data instead of re-evaluating view chains.
+            if result.success:
+                n = materialize_task_outputs(conn, task)
+                if n:
+                    log.debug("[%s] Materialized %d output(s)", task.name, n)
             return task.name, result
 
         task_results, all_success = await self._run_task_dag(self.tasks, run_one)

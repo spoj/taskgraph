@@ -20,7 +20,7 @@ independent agent writing namespace-enforced SQL views.
 - `src/diff.py` — View catalog diffing: before/after snapshots of `duckdb_views().sql`, structured change reporting (created/modified/dropped), persistence to `_changes` table, terminal formatting
 - `src/sql_utils.py` — shared SQL utilities: parser connection, statement splitting, column schema queries, CREATE name extraction
 - `src/task.py` — Task dataclass, DAG resolution (topo-sort via Kahn's algorithm), dependency graph, graph validation
-- `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling, per-task change tracking
+- `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling, per-task change tracking, view materialization
 - `src/ingest.py` — Ingestion: DataFrame/list[dict]/dict[str,list] -> DuckDB with _row_id PK
 - `src/spec.py` — shared spec loader, spec module resolution
 - `scripts/cli.py` — CLI entry point: `tg init`, `tg run`, `tg show`
@@ -62,17 +62,19 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 ## Key Design Decisions
 
 - **Workspace = single .db** — all data, views, metadata, trace in one file (DuckDB format).
-- **Agents only write SQL views and macros** — no tables, no inserts. Views auditable via `duckdb_views() WHERE internal = false`.
+- **Agents only write SQL views and macros** — no tables, no inserts. After task completion, declared outputs and validation views are materialized as tables. Original SQL preserved in `_view_definitions` table. Intermediate `{task}_*` views stay as views for debuggability.
 - **Namespace enforcement** — DuckDB `extract_statements` for statement type classification + regex for name extraction; each task can only CREATE/DROP views and macros with its declared outputs or `{name}_*` prefixed names
 - **DAG is static** — declared upfront, deps resolved from output->input edges. Each task starts as soon as all its dependencies complete (greedy scheduling, not layer-by-layer). Layers still computed for display via `resolve_dag()`.
 - **Failure isolation** — a failed task only blocks its downstream dependents, not the entire layer. Unrelated branches continue.
 - **Result size cap** — SELECT results exceeding 30k chars (~20k tokens) are rejected with an error nudging the agent to use LIMIT. Configurable via `max_result_chars` on `execute_sql()`.
 - **SQL trace** in _trace table with task column for per-task filtering
+- **View materialization** — after task success, declared outputs + validation views are converted from views to tables via `materialize_task_outputs()`. Original SQL saved to `_view_definitions` table. Downstream tasks read pre-computed tables. Intermediate `{task}_*` views stay as views.
 - **Per-task metadata** in _task_meta table (PK: task, value: meta_json JSON blob)
 - **Display**: `.` per SQL tool call at DEBUG level only
 - **Concurrency**: asyncio cooperative — true parallelism only at LLM API call level, DuckDB access naturally serialized on single thread
 - **DuckDB ingestion** uses native DataFrame scan (`CREATE TABLE AS SELECT ... FROM df`) — no row-by-row executemany
 - **DuckDB views filter** — always use `internal = false` to exclude system catalog views
+- **DuckDB tables filter** — `duckdb_tables() WHERE internal = false` for materialized outputs; `validate_transform()` checks both views and tables
 
 ## Robustness Features
 

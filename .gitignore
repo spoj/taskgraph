@@ -18,8 +18,9 @@ __pycache__/
 dist/
 build/
 
-# Output databases
-output*.db
+# Output databases and run artifacts
+*.db
+*_report.xlsx
 
 # Test artifacts
 report.csv

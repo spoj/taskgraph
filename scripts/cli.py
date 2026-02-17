@@ -531,6 +531,14 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
         ).fetchall()
         views = {row[0] for row in view_rows}
 
+        # Also check materialized tables (outputs are converted to tables
+        # after task completion for performance).
+        table_rows = conn.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE internal = false"
+        ).fetchall()
+        tables = {row[0] for row in table_rows}
+        all_outputs = views | tables
+
         # --- Change report from _changes table ---
         has_changes = False
         try:
@@ -548,7 +556,9 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
             pass
         else:
             # Fallback: no _changes table, show basic view listing
-            click.echo(f"\nViews: {len(views)}")
+            click.echo(
+                f"\nOutputs: {len(all_outputs)} ({len(tables)} materialized, {len(views)} views)"
+            )
 
             for task in tasks:
                 if not task.outputs:
@@ -556,7 +566,7 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
 
                 click.echo(f"\n  {task.name}:")
                 for output_name in task.outputs:
-                    if output_name in views:
+                    if output_name in all_outputs:
                         try:
                             count = conn.execute(
                                 f'SELECT COUNT(*) FROM "{output_name}"'

@@ -133,29 +133,39 @@ class Task:
         """Validate transform outputs. Returns error messages (empty = pass).
 
         Checks run in order, short-circuiting on first failure:
-        1. All declared output views exist.
-        2. Output views have required columns (if output_columns specified).
+        1. All declared output views/tables exist.
+        2. Output views/tables have required columns (if output_columns specified).
+
+        Outputs may be views (during task execution) or tables (after
+        materialization), so both catalogs are checked.
         """
-        # 1. Check all declared outputs exist
+        # 1. Check all declared outputs exist (views or materialized tables)
         existing_views = {
             row[0]
             for row in conn.execute(
                 "SELECT view_name FROM duckdb_views() WHERE internal = false"
             ).fetchall()
         }
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
+            ).fetchall()
+        }
+        existing = existing_views | existing_tables
 
-        missing = [o for o in self.outputs if o not in existing_views]
+        missing = [o for o in self.outputs if o not in existing]
         if missing:
             return [f"Required output view '{o}' was not created." for o in missing]
 
         # 2. Check output columns
         if self.output_columns:
             for view_name, required_cols in self.output_columns.items():
-                if view_name not in existing_views:
+                if view_name not in existing:
                     continue  # Already caught in step 1
                 actual_cols = get_column_names(conn, view_name)
                 if not actual_cols:
-                    # This shouldn't happen if it's in existing_views but stay safe
+                    # This shouldn't happen if it's in existing but stay safe
                     continue
 
                 missing_cols = [c for c in required_cols if c not in actual_cols]
