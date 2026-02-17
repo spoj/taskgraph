@@ -50,7 +50,7 @@ from .sql_utils import (
 
 _VALIDATION_VIEW_REQUIRED_COLS = ["status", "message"]
 _VALIDATION_STATUS_ALLOWED = {"pass", "warn", "fail"}
-_MAX_INLINE_MESSAGES = 20  # Cap messages shown inline in validation/warning output
+MAX_INLINE_MESSAGES = 20  # Cap on messages shown inline in validation/warning output
 
 # Constants and parser helpers moved to sql_utils.py
 
@@ -272,10 +272,10 @@ class Task:
                 if evidence_views:
                     header += f" [evidence: {', '.join(sorted(evidence_views))}]"
 
-                sample = msgs[:_MAX_INLINE_MESSAGES]
+                sample = msgs[:MAX_INLINE_MESSAGES]
                 detail = "\n".join(f"  {m}" for m in sample)
-                if view_count > _MAX_INLINE_MESSAGES:
-                    detail += f"\n  ... and {view_count - _MAX_INLINE_MESSAGES} more"
+                if view_count > MAX_INLINE_MESSAGES:
+                    detail += f"\n  ... and {view_count - MAX_INLINE_MESSAGES} more"
 
                 warnings.append(f"{header}:\n{detail}")
                 if remaining is not None:
@@ -362,10 +362,10 @@ class Task:
             if evidence_views:
                 header += f" [evidence: {', '.join(sorted(evidence_views))}]"
 
-            sample = msgs[:_MAX_INLINE_MESSAGES]
+            sample = msgs[:MAX_INLINE_MESSAGES]
             detail = "\n".join(f"  {m}" for m in sample)
-            if count > _MAX_INLINE_MESSAGES:
-                detail += f"\n  ... and {count - _MAX_INLINE_MESSAGES} more"
+            if count > MAX_INLINE_MESSAGES:
+                detail += f"\n  ... and {count - MAX_INLINE_MESSAGES} more"
 
             return ([f"{header}:\n{detail}"], False)
 

@@ -19,7 +19,7 @@ from .sql_utils import get_column_schema
 log = logging.getLogger(__name__)
 
 # Maximum changed lines to show inline per modified view
-_MAX_DIFF_LINES = 10
+MAX_DIFF_LINES = 10
 
 
 @dataclass
@@ -151,7 +151,7 @@ def _compact_sql_diff(sql_before: str, sql_after: str) -> list[str]:
     """Produce a compact diff of two SQL definitions.
 
     Returns only the changed lines (prefixed with - / +), capped at
-    _MAX_DIFF_LINES. If more lines changed, appends a summary.
+    MAX_DIFF_LINES. If more lines changed, appends a summary.
     """
     before_lines = sql_before.splitlines(keepends=False)
     after_lines = sql_after.splitlines(keepends=False)
@@ -174,9 +174,9 @@ def _compact_sql_diff(sql_before: str, sql_after: str) -> list[str]:
         if line.startswith("+") or line.startswith("-"):
             changed.append(line)
 
-    if len(changed) > _MAX_DIFF_LINES:
-        truncated = changed[:_MAX_DIFF_LINES]
-        remaining = len(changed) - _MAX_DIFF_LINES
+    if len(changed) > MAX_DIFF_LINES:
+        truncated = changed[:MAX_DIFF_LINES]
+        remaining = len(changed) - MAX_DIFF_LINES
         truncated.append(f"  ... {remaining} more lines changed")
         return truncated
 

@@ -40,7 +40,13 @@ from src.api import OpenRouterClient, DEFAULT_MODEL
 from src.agent_loop import DEFAULT_MAX_ITERATIONS
 from src.spec import load_spec_from_module, resolve_module_path
 from src.workspace import Workspace, read_workspace_meta
-from src.task import Task, resolve_dag, resolve_task_deps, validate_task_graph
+from src.task import (
+    Task,
+    resolve_dag,
+    resolve_task_deps,
+    validate_task_graph,
+    MAX_INLINE_MESSAGES,
+)
 
 log = logging.getLogger(__name__)
 
@@ -562,7 +568,9 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
 
         # --- Warnings and errors (always shown) ---
         for task in tasks:
-            warn_count, warn_msgs = task.validation_warnings(conn, limit=20)
+            warn_count, warn_msgs = task.validation_warnings(
+                conn, limit=MAX_INLINE_MESSAGES
+            )
             if warn_count:
                 click.echo(f"\n  {task.name} warnings: {warn_count}")
                 for msg in warn_msgs:
@@ -706,8 +714,6 @@ def show(target: Path | None, spec: str | None):
     for line in _format_task_tree(tasks):
         click.echo(line)
     click.echo()
-
-    # --- Validation summary ---
 
     # --- Validation summary ---
     has_validation = False

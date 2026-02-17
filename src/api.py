@@ -24,6 +24,9 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 DEFAULT_MODEL = "openai/gpt-5.2"
+MAX_ERROR_DETAIL_CHARS = (
+    500  # Truncation limit for error details in log/exception messages
+)
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 log = logging.getLogger(__name__)
@@ -203,14 +206,14 @@ class OpenRouterClient:
                         attempt + 1,
                         self.max_retries,
                         response.status_code,
-                        response_text[:200],
+                        response_text[:MAX_ERROR_DETAIL_CHARS],
                     )
                     await asyncio.sleep(backoff + jitter)
                     backoff = min(backoff * 2, max_backoff)
                     attempt += 1
                     continue
                 raise RuntimeError(
-                    f"Invalid JSON response (status {response.status_code}): {response_text[:500]}"
+                    f"Invalid JSON response (status {response.status_code}): {response_text[:MAX_ERROR_DETAIL_CHARS]}"
                 )
 
             # Success
@@ -227,7 +230,7 @@ class OpenRouterClient:
             # Don't retry certain client errors
             if response.status_code in self.no_retry_codes:
                 error_detail = response_data.get("error", {}).get(
-                    "message", response_text[:500]
+                    "message", response_text[:MAX_ERROR_DETAIL_CHARS]
                 )
                 raise RuntimeError(
                     f"OpenRouter API error: {response.status_code} - {response.reason_phrase}: {error_detail}"
@@ -236,7 +239,7 @@ class OpenRouterClient:
             # Retry all other errors
             if attempt < self.max_retries:
                 error_detail = response_data.get("error", {}).get(
-                    "message", response_text[:200]
+                    "message", response_text[:MAX_ERROR_DETAIL_CHARS]
                 )
 
                 # Respect Retry-After header for 429
@@ -267,7 +270,7 @@ class OpenRouterClient:
 
             # Exhausted retries
             error_detail = response_data.get("error", {}).get(
-                "message", response_text[:500]
+                "message", response_text[:MAX_ERROR_DETAIL_CHARS]
             )
             raise RuntimeError(
                 f"OpenRouter API error after {self.max_retries} retries: {response.status_code}: {error_detail}"
