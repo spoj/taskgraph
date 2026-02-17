@@ -520,7 +520,7 @@ duckdb output.db "SELECT * FROM invoices WHERE _row_id = 42"
 
 ### Lineage via `_view_definitions`
 
-After materialization, output views become tables. Their original SQL is available via `_view_definitions` (a view derived from `_trace`):
+After materialization, output views become tables. Their original SQL is available via `_view_definitions` (a view derived from `_trace`). Views that were dropped are automatically excluded:
 
 ```sql
 SELECT task, view_name, sql FROM _view_definitions ORDER BY task, view_name
@@ -533,9 +533,9 @@ intermediate_view → materialized_table → ... → input_table
 
 ### SQL execution trace
 
-Every SQL query executed — by task agents, SQL-only tasks, and input validation — is logged in `_trace`:
+Every SQL query executed — by task agents, SQL-only tasks, task validation, and input validation — is logged in `_trace` with a `source` column indicating the origin (`agent`, `sql_task`, `task_validation`, `input_validation`):
 ```sql
-SELECT task, query, success, error, row_count, elapsed_ms
+SELECT task, source, query, success, error, row_count, elapsed_ms
 FROM _trace
 WHERE task = 'match'
 ORDER BY id
@@ -738,5 +738,5 @@ duckdb output.db "SELECT view_name FROM duckdb_views() WHERE internal = false OR
 duckdb output.db "SELECT sql FROM _view_definitions WHERE view_name = 'matches'"
 
 # What did the agent try?
-duckdb output.db "SELECT id, task, success, row_count, elapsed_ms, query FROM _trace ORDER BY id"
+duckdb output.db "SELECT id, task, source, success, row_count, elapsed_ms, query FROM _trace ORDER BY id"
 ```

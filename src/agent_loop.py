@@ -92,17 +92,12 @@ def accumulate_usage(total: dict[str, int], usage: dict[str, Any]) -> None:
 
 
 async def run_agent_loop(
-    call_model: Callable[
-        [list[dict[str, Any]]], Awaitable[tuple[dict[str, Any], dict[str, Any]]]
-    ],
-    tool_executor: Callable[[str, dict[str, Any]], Awaitable[str]],
+    call_model: ModelCallable,
+    tool_executor: ToolExecutor,
     initial_messages: list[dict[str, Any]],
-    validation_fn: Callable[[], tuple[bool, str]] | None = None,
+    validation_fn: ValidationFn | None = None,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
-    on_iteration: Callable[
-        [int, dict[str, Any] | None, list[dict[str, Any]] | None], None
-    ]
-    | None = None,
+    on_iteration: OnIterationFn | None = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> AgentResult:
     """

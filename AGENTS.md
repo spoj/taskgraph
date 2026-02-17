@@ -14,13 +14,14 @@ OpenRouter pricing (per million tokens):
 Single DuckDB database as shared workspace. Tasks form a DAG, each runs as an
 independent agent writing namespace-enforced SQL views.
 
-- `src/agent.py` — task agent: prompt-based SQL transform, namespace enforcement
+- `src/agent.py` — task agent: prompt-based SQL transform, SQL execution with namespace enforcement
 - `src/agent_loop.py` — generic async agent loop with concurrent tool execution
 - `src/api.py` — OpenRouter client. Connection pooling, cache_control on last message (Anthropic only), reasoning_effort
 - `src/diff.py` — View catalog diffing: before/after snapshots of `duckdb_views().sql`, structured change reporting (created/modified/dropped), persistence to `_changes` table, terminal formatting
+- `src/namespace.py` — `Namespace` class: DDL name enforcement for tasks, validation, and input validation. Factory methods `for_task()`, `for_validation()`, `for_input()` encode naming conventions. Single `check_name()` entry point used by `is_sql_allowed()`.
 - `src/sql_utils.py` — shared SQL utilities: parser connection, statement splitting, column schema queries, CREATE name extraction
 - `src/task.py` — Task dataclass, DAG resolution (topo-sort via Kahn's algorithm), dependency graph, graph validation
-- `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling, per-task change tracking, view materialization
+- `src/workspace.py` — Workspace orchestrator: ingest inputs, resolve DAG, run tasks with greedy scheduling, per-task change tracking, view materialization, input validation (via `InputValidator`)
 - `src/ingest.py` — Ingestion: DataFrame/list[dict]/dict[str,list] or file paths -> DuckDB with _row_id PK
 - `src/spec.py` — shared spec loader, spec module resolution
 - `scripts/cli.py` — CLI entry point: `tg init`, `tg run`, `tg show`
@@ -63,12 +64,12 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 
 - **Workspace = single .db** — all data, views, metadata, trace in one file (DuckDB format).
 - **Agents only write SQL views and macros** — no tables, no inserts. After task completion, declared outputs and validation views are materialized as tables. Original SQL is in `_trace`; the `_view_definitions` view (derived from `_trace`) provides lineage queries. Intermediate `{task}_*` views stay as views for debuggability.
-- **Namespace enforcement** — DuckDB `extract_statements` for statement type classification + regex for name extraction; each task can only CREATE/DROP views and macros with its declared outputs or `{name}_*` prefixed names
+- **Namespace enforcement** — `Namespace` class (`src/namespace.py`) owns DDL name rules. Factory methods: `for_task(task)` (outputs + `{name}_*` prefix, validation views forbidden), `for_validation(task)` (`{name}__validation*`), `for_input(input_name)` (`{input}__validation*`). `is_sql_allowed()` uses DuckDB `extract_statements` for statement type classification + regex for name extraction, then delegates to `namespace.check_name()`. Name extraction failure (None) is blocked when namespace is set.
 - **DAG is static** — declared upfront, deps resolved from output->input edges. Each task starts as soon as all its dependencies complete (greedy scheduling, not layer-by-layer). Layers still computed for display via `resolve_dag()`.
 - **Failure isolation** — a failed task only blocks its downstream dependents, not the entire layer. Unrelated branches continue.
 - **Result size cap** — SELECT results exceeding 30k chars (~20k tokens) are rejected with an error nudging the agent to use LIMIT. Configurable via `max_result_chars` on `execute_sql()`.
-- **SQL trace** in _trace table with task column for per-task filtering
-- **View materialization** — after task success, declared outputs + validation views are converted from views to tables via `materialize_task_outputs()` (which delegates to `materialize_views()`). Input validation views are also materialized on success via the same `materialize_views()` core function. Original CREATE VIEW SQL is already in `_trace` (logged during execution); `_view_definitions` is a derived view on `_trace`. Downstream tasks read pre-computed tables. Intermediate `{task}_*` views stay as views.
+- **SQL trace** in _trace table with task and source columns for per-task/per-origin filtering. Source values: `agent`, `sql_task`, `task_validation`, `input_validation`.
+- **View materialization** — after task success, declared outputs + validation views are converted from views to tables via `materialize_task_outputs()` (which delegates to `materialize_views()`). Input validation views are also materialized on success via the same `materialize_views()` core function. Original CREATE VIEW SQL is already in `_trace` (logged during execution); `_view_definitions` is a derived view on `_trace` that is DROP-aware (a view whose last trace action is DROP is excluded). Downstream tasks read pre-computed tables. Intermediate `{task}_*` views stay as views.
 - **Per-task metadata** in _task_meta table (PK: task, value: meta_json JSON blob)
 - **Display**: `.` per SQL tool call at DEBUG level only
 - **Concurrency**: asyncio cooperative — true parallelism only at LLM API call level, DuckDB access naturally serialized on single thread
@@ -83,7 +84,7 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 - **Per-query timeout** (`agent.py`): `DEFAULT_QUERY_TIMEOUT_S = 30`. Uses `threading.Timer` + `conn.interrupt()`. Catches `duckdb.InterruptException`, connection stays usable. Configurable via `query_timeout_s` param on `execute_sql()`.
 - **Output schema validation** (`task.py`): `output_columns: dict[str, list[str]]` on `Task`. Runs after view existence check, before validation view enforcement. Queries `information_schema.columns` and checks required columns are present.
 - **Task validation views** (`task.py`): tasks can declare `validate_sql` that creates `{task}__validation` / `{task}__validation_*` views with columns `status`, `message`. Any row with status='fail' fails the task.
-- **Input validation** (`workspace.py`): `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, str]` on `Workspace`. Runs after ingestion, before tasks. Column check short-circuits before SQL checks. Callable errors caught with context. Empty tables logged as warnings. Input validation SQL is logged to `_trace` (with `task` = input table name). Passing input validation views are materialized as tables (same as task validation views); failing views are dropped.
+- **Input validation** (`workspace.py`): `input_columns: dict[str, list[str]]` and `input_validate_sql: dict[str, str]` on `Workspace`. Runs after ingestion, before tasks. Column check short-circuits before SQL checks. Callable errors caught with context. Empty tables logged as warnings. Input validation SQL is namespace-enforced via `execute_sql()` + `Namespace.for_input()` with `ddl_only=True` — each input's SQL can only create `{input}__validation*` views. SQL is logged to `_trace` (with `task` = input table name). Passing input validation views are materialized as tables (same as task validation views); failing views are dropped.
 
 ## CLI Commands
 

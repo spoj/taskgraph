@@ -12,6 +12,12 @@ from src.agent import (
     DEFAULT_QUERY_TIMEOUT_S,
     MAX_RESULT_CHARS,
 )
+from src.namespace import Namespace
+
+
+def _ns(allowed: set[str], prefix: str) -> Namespace:
+    """Shorthand for creating a Namespace in tests."""
+    return Namespace(frozenset(allowed), prefix)
 
 
 class TestNamespaceEnforcement:
@@ -19,14 +25,14 @@ class TestNamespaceEnforcement:
 
     def test_select_always_allowed(self):
         """SELECT queries are always allowed regardless of namespace."""
-        ok, err = is_sql_allowed("SELECT 1", allowed_views={"x"}, namespace="t")
+        ok, err = is_sql_allowed("SELECT 1", namespace=_ns({"x"}, "t"))
         assert ok
         assert err == ""
 
     def test_select_from_any_table(self):
         """SELECT FROM any table is allowed."""
         ok, err = is_sql_allowed(
-            "SELECT * FROM other_task_output", allowed_views={"x"}, namespace="t"
+            "SELECT * FROM other_task_output", namespace=_ns({"x"}, "t")
         )
         assert ok
 
@@ -39,8 +45,7 @@ class TestNamespaceEnforcement:
         """CREATE VIEW for a declared output is allowed."""
         ok, err = is_sql_allowed(
             "CREATE VIEW output AS SELECT 1",
-            allowed_views={"output", "summary"},
-            namespace="task1",
+            namespace=_ns({"output", "summary"}, "task1"),
         )
         assert ok
 
@@ -48,8 +53,7 @@ class TestNamespaceEnforcement:
         """CREATE VIEW with task name prefix is allowed."""
         ok, err = is_sql_allowed(
             "CREATE VIEW task1_intermediate AS SELECT 1",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert ok
 
@@ -57,8 +61,7 @@ class TestNamespaceEnforcement:
         """CREATE VIEW outside namespace is blocked."""
         ok, err = is_sql_allowed(
             "CREATE VIEW other_output AS SELECT 1",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert not ok
         assert "other_output" in err
@@ -67,8 +70,7 @@ class TestNamespaceEnforcement:
         """DROP VIEW for a declared output is allowed."""
         ok, err = is_sql_allowed(
             "DROP VIEW IF EXISTS output",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert ok
 
@@ -76,8 +78,7 @@ class TestNamespaceEnforcement:
         """DROP VIEW with task name prefix is allowed."""
         ok, err = is_sql_allowed(
             "DROP VIEW task1_temp",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert ok
 
@@ -85,8 +86,7 @@ class TestNamespaceEnforcement:
         """DROP VIEW outside namespace is blocked."""
         ok, err = is_sql_allowed(
             "DROP VIEW other_task_view",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert not ok
         assert "other_task_view" in err
@@ -136,7 +136,7 @@ class TestNamespaceEnforcement:
 
     def test_no_namespace_no_restriction(self):
         """Without namespace, any view name is rejected (neither in allowed nor prefixed)."""
-        # When both are None, no check is done — CREATE VIEW is always allowed
+        # When namespace is None, no check is done — CREATE VIEW is always allowed
         ok, err = is_sql_allowed("CREATE VIEW anything AS SELECT 1")
         assert ok
 
@@ -144,8 +144,7 @@ class TestNamespaceEnforcement:
         """CREATE MACRO with namespace prefix is allowed."""
         ok, err = is_sql_allowed(
             "CREATE MACRO task1_clean(s) AS lower(trim(s))",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert ok
 
@@ -153,8 +152,7 @@ class TestNamespaceEnforcement:
         """CREATE MACRO outside namespace is blocked."""
         ok, err = is_sql_allowed(
             "CREATE MACRO other_clean(s) AS lower(trim(s))",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert not ok
         assert "other_clean" in err
@@ -163,8 +161,7 @@ class TestNamespaceEnforcement:
         """CREATE MACRO ... AS TABLE with namespace prefix is allowed."""
         ok, err = is_sql_allowed(
             "CREATE MACRO task1_best(t) AS TABLE SELECT * FROM t",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert ok
 
@@ -172,8 +169,7 @@ class TestNamespaceEnforcement:
         """CREATE MACRO ... AS TABLE outside namespace is blocked."""
         ok, err = is_sql_allowed(
             "CREATE MACRO other_best(t) AS TABLE SELECT * FROM t",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert not ok
         assert "other_best" in err
@@ -182,8 +178,7 @@ class TestNamespaceEnforcement:
         """DROP MACRO with namespace prefix is allowed."""
         ok, err = is_sql_allowed(
             "DROP MACRO task1_clean",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert ok
 
@@ -191,8 +186,7 @@ class TestNamespaceEnforcement:
         """DROP MACRO outside namespace is blocked."""
         ok, err = is_sql_allowed(
             "DROP MACRO other_clean",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert not ok
         assert "other_clean" in err
@@ -201,8 +195,7 @@ class TestNamespaceEnforcement:
         """DROP MACRO IF EXISTS is allowed within namespace."""
         ok, err = is_sql_allowed(
             "DROP MACRO IF EXISTS task1_helper",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
         )
         assert ok
 
@@ -226,8 +219,7 @@ class TestNamespaceEnforcement:
         result = execute_sql(
             conn,
             "CREATE VIEW forbidden AS SELECT 1",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
             query_timeout_s=0,
         )
         assert not result["success"]
@@ -238,8 +230,7 @@ class TestNamespaceEnforcement:
         result = execute_sql(
             conn,
             "CREATE VIEW output AS SELECT 1 AS x",
-            allowed_views={"output"},
-            namespace="task1",
+            namespace=_ns({"output"}, "task1"),
             query_timeout_s=0,
         )
         assert result["success"]
@@ -262,6 +253,18 @@ class TestNamespaceEnforcement:
         ).fetchall()
         assert len(rows) == 1
         assert rows[0] == ("test_task", True)
+
+    def test_execute_sql_logs_source(self, conn):
+        """execute_sql() records the source column in _trace."""
+        execute_sql(conn, "SELECT 1", task_name="t", query_timeout_s=0, source="agent")
+        rows = conn.execute("SELECT source FROM _trace WHERE task = 't'").fetchall()
+        assert rows == [("agent",)]
+
+    def test_execute_sql_source_none_by_default(self, conn):
+        """source defaults to NULL when not provided."""
+        execute_sql(conn, "SELECT 1", task_name="t", query_timeout_s=0)
+        rows = conn.execute("SELECT source FROM _trace WHERE task = 't'").fetchall()
+        assert rows == [(None,)]
 
     def test_execute_sql_logs_error_trace(self, conn):
         """execute_sql() logs failed queries to _trace."""
@@ -622,8 +625,7 @@ class TestResultSizeCap:
         result = execute_sql(
             conn,
             "CREATE VIEW v AS SELECT 1",
-            allowed_views={"v"},
-            namespace="test",
+            namespace=_ns({"v"}, "test"),
             max_result_chars=10,  # Extremely small
         )
         assert result["success"] is True
@@ -664,3 +666,127 @@ class TestTransformPrompt:
         )
         msg = build_transform_prompt(task)
         assert "- result: id, score" in msg
+
+
+class TestNamespace:
+    """Tests for the Namespace class — factory methods, check_name, edge cases."""
+
+    def test_for_task_allows_declared_outputs(self):
+        """for_task() allows creating declared output views."""
+        task = _make_task(name="match", outputs=["result", "summary"])
+        ns = Namespace.for_task(task)
+        assert ns.is_name_allowed("result")
+        assert ns.is_name_allowed("summary")
+
+    def test_for_task_allows_prefixed_intermediates(self):
+        """for_task() allows creating {task_name}_* intermediates."""
+        task = _make_task(name="match", outputs=["result"])
+        ns = Namespace.for_task(task)
+        assert ns.is_name_allowed("match_temp")
+        assert ns.is_name_allowed("match_staging")
+
+    def test_for_task_blocks_validation_views(self):
+        """for_task() blocks validation views via forbidden check."""
+        task = _make_task(name="match", outputs=["result"])
+        ns = Namespace.for_task(task)
+        ok, err = ns.check_name("match__validation", "view", "create")
+        assert not ok
+        assert "Validation views" in err
+
+    def test_for_task_blocks_validation_prefixed(self):
+        """for_task() blocks validation-prefixed views."""
+        task = _make_task(name="match", outputs=["result"])
+        ns = Namespace.for_task(task)
+        ok, err = ns.check_name("match__validation_extra", "view", "create")
+        assert not ok
+        assert "Validation views" in err
+
+    def test_for_task_blocks_unrelated_names(self):
+        """for_task() blocks names outside outputs and prefix."""
+        task = _make_task(name="match", outputs=["result"])
+        ns = Namespace.for_task(task)
+        ok, err = ns.check_name("other_view", "view", "create")
+        assert not ok
+        assert "other_view" in err
+
+    def test_for_validation_allows_base_name(self):
+        """for_validation() allows {task}__validation."""
+        task = _make_task(name="match", outputs=["result"])
+        ns = Namespace.for_validation(task)
+        assert ns.is_name_allowed("match__validation")
+
+    def test_for_validation_allows_prefixed(self):
+        """for_validation() allows {task}__validation_* names."""
+        task = _make_task(name="match", outputs=["result"])
+        ns = Namespace.for_validation(task)
+        assert ns.is_name_allowed("match__validation_extra")
+        assert ns.is_name_allowed("match__validation_nulls")
+
+    def test_for_validation_blocks_task_outputs(self):
+        """for_validation() blocks task outputs."""
+        task = _make_task(name="match", outputs=["result"])
+        ns = Namespace.for_validation(task)
+        assert not ns.is_name_allowed("result")
+
+    def test_for_input_allows_base_name(self):
+        """for_input() allows {input}__validation."""
+        ns = Namespace.for_input("invoices")
+        assert ns.is_name_allowed("invoices__validation")
+
+    def test_for_input_allows_prefixed(self):
+        """for_input() allows {input}__validation_* names."""
+        ns = Namespace.for_input("invoices")
+        assert ns.is_name_allowed("invoices__validation_amounts")
+
+    def test_for_input_blocks_unrelated(self):
+        """for_input() blocks names outside its validation prefix."""
+        ns = Namespace.for_input("invoices")
+        assert not ns.is_name_allowed("invoices")
+        assert not ns.is_name_allowed("other__validation")
+
+    def test_check_name_none_blocked(self):
+        """check_name(None) is always blocked (tightened GAP 7)."""
+        ns = Namespace.for_input("invoices")
+        ok, err = ns.check_name(None, "view", "create")
+        assert not ok
+        assert "Could not extract" in err
+
+    def test_check_name_returns_ok_for_valid(self):
+        """check_name returns (True, '') for valid names."""
+        ns = Namespace.for_input("invoices")
+        ok, err = ns.check_name("invoices__validation", "view", "create")
+        assert ok
+        assert err == ""
+
+    def test_format_allowed(self):
+        """format_allowed() includes both explicit names and prefix."""
+        ns = Namespace(frozenset({"a", "b"}), "task1")
+        formatted = ns.format_allowed()
+        assert "a" in formatted
+        assert "b" in formatted
+        assert "task1_*" in formatted
+
+    def test_repr(self):
+        """__repr__ includes allowed_names and prefix."""
+        ns = Namespace(frozenset({"out"}), "t")
+        r = repr(ns)
+        assert "Namespace" in r
+        assert "out" in r
+        assert "t" in r
+
+    def test_eq(self):
+        """Two Namespaces with same names/prefix/msg are equal."""
+        a = Namespace(frozenset({"x"}), "p")
+        b = Namespace(frozenset({"x"}), "p")
+        assert a == b
+
+    def test_neq_different_names(self):
+        """Namespaces with different allowed_names are not equal."""
+        a = Namespace(frozenset({"x"}), "p")
+        b = Namespace(frozenset({"y"}), "p")
+        assert a != b
+
+    def test_neq_different_type(self):
+        """Namespace compared to non-Namespace returns NotImplemented."""
+        ns = Namespace(frozenset({"x"}), "p")
+        assert ns != "not a namespace"

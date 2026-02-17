@@ -17,7 +17,6 @@ import os
 import json
 import asyncio
 import random
-import sys
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -232,21 +231,18 @@ class OpenRouterClient:
                     "usage": usage,
                 }
 
+            error_detail = response_data.get("error", {}).get(
+                "message", response_text[:MAX_ERROR_DETAIL_CHARS]
+            )
+
             # Don't retry certain client errors
             if response.status_code in self.no_retry_codes:
-                error_detail = response_data.get("error", {}).get(
-                    "message", response_text[:MAX_ERROR_DETAIL_CHARS]
-                )
                 raise RuntimeError(
                     f"OpenRouter API error: {response.status_code} - {response.reason_phrase}: {error_detail}"
                 )
 
             # Retry all other errors
             if attempt < self.max_retries:
-                error_detail = response_data.get("error", {}).get(
-                    "message", response_text[:MAX_ERROR_DETAIL_CHARS]
-                )
-
                 # Respect Retry-After header for 429
                 if response.status_code == 429:
                     retry_after = response.headers.get("retry-after")
@@ -274,9 +270,6 @@ class OpenRouterClient:
                 continue
 
             # Exhausted retries
-            error_detail = response_data.get("error", {}).get(
-                "message", response_text[:MAX_ERROR_DETAIL_CHARS]
-            )
             raise RuntimeError(
                 f"OpenRouter API error after {self.max_retries} retries: {response.status_code}: {error_detail}"
             )

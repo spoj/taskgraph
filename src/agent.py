@@ -13,10 +13,11 @@ import time
 import datetime
 import decimal
 import uuid
-from typing import Any, Callable, cast
+from typing import Any, cast
 from .agent_loop import run_agent_loop, AgentResult, DEFAULT_MAX_ITERATIONS
 from .api import OpenRouterClient, create_model_callable, DEFAULT_MODEL
-from .task import Task, is_validation_view_for_task
+from .namespace import Namespace
+from .task import Task
 from .sql_utils import (
     get_parser_conn,
     get_column_schema,
@@ -127,7 +128,6 @@ def _create_sql_tool() -> dict[str, Any]:
 # Regex to extract the object name from CREATE/DROP statements.
 # Handles: CREATE [OR REPLACE] [TEMP] VIEW|MACRO "name" ...
 #          DROP VIEW|MACRO [IF EXISTS] "name" ...
-from .sql_utils import CREATE_NAME_RE
 
 _DROP_NAME_RE = re.compile(
     r"DROP\s+(?:MACRO\s+TABLE|VIEW|MACRO)\s+"
@@ -148,40 +148,15 @@ _DROP_KIND_RE = re.compile(
 )
 
 
-def _extract_name(query: str, pattern: re.Pattern[str]) -> str | None:
-    """Extract the object name from a SQL statement using regex."""
-    if pattern is CREATE_NAME_RE:
-        return extract_create_name(query)
-    m = pattern.search(query)
+def _extract_drop_name(query: str) -> str | None:
+    """Extract the object name from a DROP VIEW/MACRO statement."""
+    m = _DROP_NAME_RE.search(query)
     return m.group(1) if m else None
-
-
-def _check_name_allowed(
-    kind_label: str,
-    action: str,
-    name: str | None,
-    allowed_views: set[str] | None,
-    namespace: str | None,
-) -> tuple[bool, str]:
-    """Check if a view/macro name is allowed by namespace rules."""
-    if name and not _is_view_name_allowed(name, allowed_views, namespace):
-        allowed_str = _format_allowed_names(allowed_views, namespace)
-        return (
-            False,
-            f"Cannot {action} {kind_label} '{name}'. Allowed names: {allowed_str}",
-        )
-    return True, ""
-
-
-# Connection used solely for extract_statements (lightweight, never writes)
-# Removed local _parser_conn and _get_parser_conn, now using sql_utils.get_parser_conn
 
 
 def is_sql_allowed(
     query: str,
-    allowed_views: set[str] | None = None,
-    namespace: str | None = None,
-    forbidden_names: Callable[[str], bool] | None = None,
+    namespace: Namespace | None = None,
     ddl_only: bool = False,
 ) -> tuple[bool, str]:
     """Check if a SQL query is allowed.
@@ -191,10 +166,8 @@ def is_sql_allowed(
 
     Args:
         query: SQL query string.
-        allowed_views: If set, only these view/macro names can be created/dropped
-            (in addition to namespace-prefixed names).
-        namespace: If set, names starting with "{namespace}_" are also allowed.
-        forbidden_names: Optional function that returns True for disallowed names.
+        namespace: If set, name enforcement is delegated to
+            ``namespace.check_name()``.  If None, any name is allowed.
         ddl_only: If True, only allow CREATE/DROP VIEW|MACRO statements.
     """
     try:
@@ -234,19 +207,9 @@ def is_sql_allowed(
         if kind_match:
             kind = kind_match.group(1).upper()
             label = "view" if kind == "VIEW" else "macro"
-            name = _extract_name(sql, CREATE_NAME_RE)
-            if name and forbidden_names and forbidden_names(name):
-                return (
-                    False,
-                    (
-                        f"Cannot create/drop validation view '{name}' during transform. "
-                        "Validation views are created in validate_sql."
-                    ),
-                )
-            if allowed_views is not None or namespace is not None:
-                ok, err = _check_name_allowed(
-                    label, "create", name, allowed_views, namespace
-                )
+            name = extract_create_name(sql)
+            if namespace is not None:
+                ok, err = namespace.check_name(name, label, "create")
                 if not ok:
                     return False, err
             return True, ""
@@ -259,48 +222,15 @@ def is_sql_allowed(
         if kind_match:
             kind = kind_match.group(1).upper()
             label = "view" if kind == "VIEW" else "macro"
-            name = _extract_name(sql, _DROP_NAME_RE)
-            if name and forbidden_names and forbidden_names(name):
-                return (
-                    False,
-                    (
-                        f"Cannot create/drop validation view '{name}' during transform. "
-                        "Validation views are created in validate_sql."
-                    ),
-                )
-            if allowed_views is not None or namespace is not None:
-                ok, err = _check_name_allowed(
-                    label, "drop", name, allowed_views, namespace
-                )
+            name = _extract_drop_name(sql)
+            if namespace is not None:
+                ok, err = namespace.check_name(name, label, "drop")
                 if not ok:
                     return False, err
             return True, ""
         return False, "Only DROP VIEW and DROP MACRO are permitted."
 
     return False, f"{st.name} is not allowed."
-
-
-def _is_view_name_allowed(
-    view_name: str,
-    allowed_views: set[str] | None,
-    namespace: str | None,
-) -> bool:
-    """Check if a view name is allowed given constraints."""
-    if allowed_views and view_name in allowed_views:
-        return True
-    if namespace and view_name.startswith(f"{namespace}_"):
-        return True
-    return False
-
-
-def _format_allowed_names(allowed_views: set[str] | None, namespace: str | None) -> str:
-    """Format allowed view names for error messages."""
-    parts = []
-    if allowed_views:
-        parts.append(", ".join(sorted(allowed_views)))
-    if namespace:
-        parts.append(f"{namespace}_* (prefix)")
-    return " | ".join(parts) if parts else "(none)"
 
 
 # --- Metadata persistence ---
@@ -345,6 +275,7 @@ def init_trace_table(conn: duckdb.DuckDBPyConnection) -> None:
             id INTEGER DEFAULT nextval('_trace_seq'),
             timestamp TIMESTAMP DEFAULT current_timestamp,
             task VARCHAR,
+            source VARCHAR,
             query VARCHAR NOT NULL,
             success BOOLEAN NOT NULL,
             error VARCHAR,
@@ -352,22 +283,38 @@ def init_trace_table(conn: duckdb.DuckDBPyConnection) -> None:
             elapsed_ms DOUBLE
         )
     """)
+    # Add source column to existing databases that lack it.
+    try:
+        conn.execute("ALTER TABLE _trace ADD COLUMN source VARCHAR")
+    except duckdb.Error:
+        pass  # column already exists
     conn.execute(r"""
         CREATE OR REPLACE VIEW _view_definitions AS
-        SELECT task, view_name, query AS sql
-        FROM (
-            SELECT task,
-                   regexp_extract(query, 'VIEW\s+"?(\w+)"?', 1) AS view_name,
-                   query,
-                   row_number() OVER (
-                       PARTITION BY regexp_extract(query, 'VIEW\s+"?(\w+)"?', 1)
-                       ORDER BY id DESC
-                   ) AS rn
+        WITH actions AS (
+            SELECT id, task, query,
+                   regexp_extract(
+                       query,
+                       '(?i)VIEW\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?"?(\w+)"?',
+                       1
+                   ) AS view_name,
+                   CASE WHEN regexp_matches(query, '(?i)^\s*DROP\s')
+                        THEN 'drop' ELSE 'create' END AS action
             FROM _trace
             WHERE success = true
-              AND regexp_matches(query, '(?i)^\s*CREATE\s+(OR\s+REPLACE\s+)?VIEW\s')
+              AND (regexp_matches(query, '(?i)^\s*CREATE\s+(OR\s+REPLACE\s+)?VIEW\s')
+                   OR regexp_matches(query, '(?i)^\s*DROP\s+VIEW\s'))
+        ),
+        latest AS (
+            SELECT *,
+                   row_number() OVER (
+                       PARTITION BY view_name ORDER BY id DESC
+                   ) AS rn
+            FROM actions
+            WHERE view_name IS NOT NULL
         )
-        WHERE rn = 1
+        SELECT task, view_name, query AS sql
+        FROM latest
+        WHERE rn = 1 AND action = 'create'
     """)
 
 
@@ -379,14 +326,20 @@ def log_trace(
     row_count: int | None = None,
     elapsed_ms: float | None = None,
     task_name: str | None = None,
+    source: str | None = None,
 ) -> None:
-    """Log a SQL query execution to the _trace table."""
+    """Log a SQL query execution to the _trace table.
+
+    Args:
+        source: Origin of the query — ``'agent'``, ``'sql_task'``,
+            ``'task_validation'``, or ``'input_validation'``.
+    """
     conn.execute(
         """
-        INSERT INTO _trace (task, query, success, error, row_count, elapsed_ms)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO _trace (task, source, query, success, error, row_count, elapsed_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        [task_name, query, success, error, row_count, elapsed_ms],
+        [task_name, source, query, success, error, row_count, elapsed_ms],
     )
 
 
@@ -396,13 +349,12 @@ def log_trace(
 def execute_sql(
     conn: duckdb.DuckDBPyConnection,
     query: str,
-    allowed_views: set[str] | None = None,
-    namespace: str | None = None,
+    namespace: Namespace | None = None,
     task_name: str | None = None,
     query_timeout_s: int = DEFAULT_QUERY_TIMEOUT_S,
     max_result_chars: int = MAX_RESULT_CHARS,
-    forbidden_names: Callable[[str], bool] | None = None,
     ddl_only: bool = False,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Execute SQL query and return results.
 
@@ -410,19 +362,20 @@ def execute_sql(
     with an error asking the caller to add LIMIT or narrow the query.
 
     Args:
+        namespace: If set, DDL name enforcement is applied via
+            ``namespace.check_name()``.  If None, no name restrictions.
         query_timeout_s: Maximum seconds a query can run before being
             interrupted. Uses conn.interrupt() via a background timer thread.
             Set to 0 to disable.
         max_result_chars: Maximum characters in the JSON-serialized result.
             Set to 0 to disable.
+        source: Origin of the query (passed through to ``log_trace``).
     """
     start_time = time.perf_counter()
 
     allowed, error_msg = is_sql_allowed(
         query,
-        allowed_views=allowed_views,
         namespace=namespace,
-        forbidden_names=forbidden_names,
         ddl_only=ddl_only,
     )
     if not allowed:
@@ -434,6 +387,7 @@ def execute_sql(
             error=error_msg,
             elapsed_ms=elapsed_ms,
             task_name=task_name,
+            source=source,
         )
         return {"success": False, "error": error_msg}
 
@@ -451,33 +405,31 @@ def execute_sql(
         timer = threading.Timer(query_timeout_s, _interrupt)
         timer.start()
 
+    success = False
+    error_str: str | None = None
+    row_count: int | None = None
+    result: dict[str, Any] = {}
+
     try:
         cursor = conn.execute(query)
 
         if cursor.description:
             columns = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            log_trace(
-                conn,
-                query,
-                success=True,
-                row_count=len(rows),
-                elapsed_ms=elapsed_ms,
-                task_name=task_name,
-            )
+            success = True
+            row_count = len(rows)
             result = {
                 "success": True,
                 "columns": columns,
                 "rows": rows,
-                "row_count": len(rows),
+                "row_count": row_count,
             }
             # Check serialized size — reject oversized results so the
             # model learns to use LIMIT or narrow its query.
             if max_result_chars > 0 and len(rows) > 0:
                 serialized = json.dumps(result, default=_json_default)
                 if len(serialized) > max_result_chars:
-                    return {
+                    result = {
                         "success": False,
                         "error": (
                             f"Result too large ({len(rows)} rows, "
@@ -485,49 +437,36 @@ def execute_sql(
                             "Add LIMIT or narrow your query."
                         ),
                     }
-            return result
         else:
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            log_trace(
-                conn,
-                query,
-                success=True,
-                row_count=0,
-                elapsed_ms=elapsed_ms,
-                task_name=task_name,
-            )
-            return {"success": True, "message": "OK"}
+            success = True
+            row_count = 0
+            result = {"success": True, "message": "OK"}
     except duckdb.InterruptException:
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-        error_msg = f"Query timed out after {query_timeout_s}s"
-        log.warning("[%s] %s", task_name or "?", error_msg)
-        log_trace(
-            conn,
-            query,
-            success=False,
-            error=error_msg,
-            elapsed_ms=elapsed_ms,
-            task_name=task_name,
-        )
-        return {"success": False, "error": error_msg}
+        error_str = f"Query timed out after {query_timeout_s}s"
+        log.warning("[%s] %s", task_name or "?", error_str)
+        result = {"success": False, "error": error_str}
     except Exception as e:
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
         error_str = str(e)
         # If we timed out but got a different exception type, label it clearly
         if timed_out:
             error_str = f"Query timed out after {query_timeout_s}s ({error_str})"
-        log_trace(
-            conn,
-            query,
-            success=False,
-            error=error_str,
-            elapsed_ms=elapsed_ms,
-            task_name=task_name,
-        )
-        return {"success": False, "error": error_str}
+        result = {"success": False, "error": error_str}
     finally:
         if timer is not None:
             timer.cancel()
+
+    elapsed_ms = (time.perf_counter() - start_time) * 1000
+    log_trace(
+        conn,
+        query,
+        success=success,
+        error=error_str,
+        row_count=row_count,
+        elapsed_ms=elapsed_ms,
+        task_name=task_name,
+        source=source,
+    )
+    return result
 
 
 def _format_input_schema_lines(
@@ -632,10 +571,7 @@ async def run_task_agent(
         AgentResult with success status, final message, and usage stats.
     """
     start_time = time.time()
-
-    # Namespace enforcement
-    allowed_views = set(task.outputs)
-    namespace = task.name
+    ns = Namespace.for_task(task)
 
     # Build messages
     input_lines = _format_input_schema_lines(conn, task.inputs)
@@ -654,16 +590,8 @@ async def run_task_agent(
     async def tool_executor(name: str, args: dict[str, Any]) -> str:
         if name == "run_sql":
             query = args.get("query", "")
-            forbidden_names = lambda view_name: is_validation_view_for_task(
-                view_name, task.name
-            )
             result = execute_sql(
-                conn,
-                query,
-                allowed_views=allowed_views,
-                namespace=namespace,
-                task_name=task.name,
-                forbidden_names=forbidden_names,
+                conn, query, namespace=ns, task_name=task.name, source="agent"
             )
             log.debug(".")
             return json.dumps(result, default=_json_default)
@@ -685,8 +613,6 @@ async def run_task_agent(
     ) -> None:
         if not tool_results:
             log.debug("(done)")
-
-    # Agent loop starting log moved to workspace to avoid double-logging
 
     # Run the agent loop
     result = await run_agent_loop(
@@ -750,24 +676,12 @@ async def run_sql_only_task(
             tool_calls_count=0,
         )
 
-    allowed_views = set(task.outputs)
-    namespace = task.name
-
-    mode_label = "sql"
-    forbidden_names = lambda view_name: is_validation_view_for_task(
-        view_name, task.name
-    )
+    ns = Namespace.for_task(task)
     execution_error: str | None = None
 
     for q in statements:
         result = execute_sql(
-            conn,
-            q,
-            allowed_views=allowed_views,
-            namespace=namespace,
-            task_name=task.name,
-            forbidden_names=forbidden_names,
-            ddl_only=True,
+            conn, q, namespace=ns, task_name=task.name, ddl_only=True, source="sql_task"
         )
         if not result.get("success", False):
             execution_error = str(result.get("error") or "SQL execution failed")
@@ -780,7 +694,7 @@ async def run_sql_only_task(
     elapsed_s = time.time() - start_time
     validation_status = "FAILED" if execution_error or validation_errors else "PASSED"
     meta: dict[str, Any] = {
-        "model": mode_label,
+        "model": "sql",
         "outputs": task.outputs,
         "iterations": 0,
         "tool_calls": 0,
@@ -824,17 +738,16 @@ def run_validate_sql(
     if not statements:
         return []
 
-    allowed_views = set(task.validation_view_names())
-    namespace = f"{task.name}__validation"
+    vns = Namespace.for_validation(task)
 
     for q in statements:
         result = execute_sql(
             conn,
             q,
-            allowed_views=allowed_views,
-            namespace=namespace,
+            namespace=vns,
             task_name=task.name,
             ddl_only=True,
+            source="task_validation",
         )
         if not result.get("success", False):
             return [str(result.get("error") or "validate_sql execution failed")]

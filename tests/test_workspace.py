@@ -535,6 +535,27 @@ class TestMaterializeTaskOutputs:
         assert rows[0][0] == "t__validation"
         assert "pass" in rows[0][1]
 
+    def test_view_definitions_excludes_dropped_views(self, conn):
+        """_view_definitions omits views whose last trace action is DROP."""
+        create_sql = "CREATE VIEW dropped_v AS SELECT 1 AS x"
+        drop_sql = "DROP VIEW dropped_v"
+        keep_sql = "CREATE VIEW kept_v AS SELECT 2 AS x"
+        conn.execute(create_sql)
+        log_trace(conn, create_sql, success=True, task_name="t")
+        conn.execute(drop_sql)
+        log_trace(conn, drop_sql, success=True, task_name="t")
+        conn.execute(keep_sql)
+        log_trace(conn, keep_sql, success=True, task_name="t")
+
+        names = [
+            r[0]
+            for r in conn.execute(
+                "SELECT view_name FROM _view_definitions ORDER BY view_name"
+            ).fetchall()
+        ]
+        assert "dropped_v" not in names
+        assert "kept_v" in names
+
     def test_leftover_tmp_table_cleaned_up(self, conn):
         """A leftover _materialize_tmp_ table from a crashed run doesn't block."""
         conn.execute("CREATE TABLE _materialize_tmp_out AS SELECT 999 AS stale")

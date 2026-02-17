@@ -39,7 +39,6 @@ Example:
 """
 
 import duckdb
-import re
 from dataclasses import dataclass, field
 from .sql_utils import (
     get_parser_conn,

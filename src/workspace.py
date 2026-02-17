@@ -48,7 +48,13 @@ from .diff import (
     persist_changes,
 )
 from .ingest import FileInput, ingest_file, ingest_table
-from .agent import init_trace_table, log_trace, run_task_agent, run_sql_only_task
+from .agent import (
+    init_trace_table,
+    execute_sql,
+    run_task_agent,
+    run_sql_only_task,
+)
+from .namespace import Namespace
 from .task import (
     Task,
     resolve_dag,
@@ -288,6 +294,183 @@ class WorkspaceResult:
     export_errors: dict[str, str] = field(default_factory=dict)
 
 
+class InputValidator:
+    """Validates input tables after ingestion.
+
+    Owns the lifecycle state for validation view tracking and cleanup.
+    Runs two phases:
+    1. Column checks — each declared table has all required columns.
+    2. SQL validation — per-input CREATE VIEW statements producing
+       {input_name}__validation* views with status/message columns.
+
+    Input validation SQL is namespace-enforced: each input's SQL can
+    only create views matching ``{input_name}__validation*``.  Statements
+    go through ``execute_sql()`` with ``ddl_only=True`` and a
+    ``Namespace.for_input()`` — the same enforcement pipeline used by
+    task agents and SQL-only tasks.
+
+    On success, validation views are materialized as tables (same pattern
+    as task validation views) with SQL preserved in ``_view_definitions``.
+    On failure, all created views are dropped for cleanup.
+    """
+
+    __slots__ = (
+        "conn",
+        "input_columns",
+        "input_validate_sql",
+        "_created_views",
+        "_per_input_views",
+    )
+
+    def __init__(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        input_columns: dict[str, list[str]],
+        input_validate_sql: dict[str, str],
+    ) -> None:
+        self.conn = conn
+        self.input_columns = input_columns
+        self.input_validate_sql = input_validate_sql
+        self._created_views: list[str] = []
+        self._per_input_views: dict[str, list[str]] = {}
+
+    def _cleanup(self) -> None:
+        """Drop all created validation views (error path)."""
+        _drop_views(self.conn, self._created_views)
+
+    def _check_columns(self) -> list[str]:
+        """Phase 1: Check required columns exist in input tables."""
+        errors: list[str] = []
+
+        for table_name, required_cols in self.input_columns.items():
+            try:
+                actual_cols = {
+                    row[0]
+                    for row in self.conn.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = ?",
+                        [table_name],
+                    ).fetchall()
+                }
+            except duckdb.Error as e:
+                errors.append(f"Schema check error for input '{table_name}': {e}")
+                continue
+
+            if not actual_cols:
+                errors.append(f"Input table '{table_name}' not found.")
+                continue
+
+            missing = [c for c in required_cols if c not in actual_cols]
+            if missing:
+                errors.append(
+                    f"Input '{table_name}' is missing required column(s): "
+                    f"{', '.join(missing)}. "
+                    f"Actual columns: {', '.join(sorted(actual_cols - {'_row_id'}))}"
+                )
+
+        return errors
+
+    def _execute_validation_sql(
+        self, table_name: str, sql: str, ns: Namespace
+    ) -> str | None:
+        """Execute a single input validation SQL statement.
+
+        Routes through ``execute_sql()`` for namespace enforcement and
+        tracing (GAP 6 fix — previously called raw ``conn.execute()``).
+
+        Returns an error message on failure, or None on success.
+        """
+        result = execute_sql(
+            self.conn,
+            sql,
+            namespace=ns,
+            task_name=table_name,
+            ddl_only=True,
+            source="input_validation",
+        )
+        if not result.get("success", False):
+            error = result.get("error", "SQL execution failed")
+            return f"Input validation SQL error for '{table_name}': {error}"
+        return None
+
+    def _run_validation_sql(self) -> list[str]:
+        """Phase 2: Execute per-input validation SQL and check results."""
+        errors: list[str] = []
+
+        for table_name, validate_sql in self.input_validate_sql.items():
+            stmts = split_sql_statements(validate_sql)
+            ns = Namespace.for_input(table_name)
+
+            # Execute all statements (CREATE VIEW etc.)
+            for sql in stmts:
+                err = self._execute_validation_sql(table_name, sql, ns)
+                if err:
+                    errors.append(err)
+                    self._cleanup()
+                    return errors
+
+            # Discover created validation views for this input
+            input_views: list[str] = []
+            prefix = validation_view_prefix(table_name)
+            for stmt in stmts:
+                name = extract_create_name(stmt)
+                if name and is_validation_view_for_task(name, table_name):
+                    input_views.append(name)
+                    self._created_views.append(name)
+
+            if not input_views:
+                errors.append(
+                    f"Input '{table_name}' validate_sql did not create any "
+                    f"'{prefix}' views."
+                )
+                self._cleanup()
+                return errors
+
+            self._per_input_views[table_name] = input_views
+
+            # Validate the views
+            for view_name in input_views:
+                view_errors, fatal = validate_one_validation_view(self.conn, view_name)
+                if view_errors:
+                    errors.extend(view_errors)
+                if fatal:
+                    self._cleanup()
+                    return errors
+
+            if errors:
+                self._cleanup()
+                return errors
+
+        return errors
+
+    def _materialize(self) -> None:
+        """Materialize all passing validation views as tables."""
+        for table_name, view_names in self._per_input_views.items():
+            n = materialize_views(self.conn, view_names, label=table_name)
+            if n:
+                log.debug(
+                    "Materialized %d input validation view(s) for '%s'",
+                    n,
+                    table_name,
+                )
+
+    def run(self) -> list[str]:
+        """Run all validation checks.
+
+        Returns list of error messages (empty = pass).
+        """
+        errors = self._check_columns()
+        if errors:
+            return errors
+
+        errors = self._run_validation_sql()
+        if errors:
+            return errors
+
+        self._materialize()
+        return []
+
+
 @dataclass
 class Workspace:
     """A multi-task workspace backed by a single DuckDB database.
@@ -369,128 +552,12 @@ class Workspace:
     def _validate_inputs(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
         """Validate input tables after ingestion.
 
-        Checks run in order:
-        1. input_columns: each declared table has all required columns.
-        2. input_validate_sql: per-input CREATE VIEW statements producing
-           {input_name}__validation* views with status/message columns.
-
-        On success, validation views are materialized as tables (same
-        pattern as task validation views) with SQL preserved in
-        ``_view_definitions``. On failure, views are dropped for cleanup.
+        Delegates to InputValidator which owns the lifecycle state for
+        validation view tracking and cleanup.
 
         Returns list of error messages (empty = pass).
         """
-        errors: list[str] = []
-
-        # 1. Column checks
-        for table_name, required_cols in self.input_columns.items():
-            try:
-                actual_cols = {
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_name = ?",
-                        [table_name],
-                    ).fetchall()
-                }
-            except duckdb.Error as e:
-                errors.append(f"Schema check error for input '{table_name}': {e}")
-                continue
-
-            if not actual_cols:
-                errors.append(f"Input table '{table_name}' not found.")
-                continue
-
-            missing = [c for c in required_cols if c not in actual_cols]
-            if missing:
-                errors.append(
-                    f"Input '{table_name}' is missing required column(s): "
-                    f"{', '.join(missing)}. "
-                    f"Actual columns: {', '.join(sorted(actual_cols - {'_row_id'}))}"
-                )
-
-        if errors:
-            return errors
-
-        # 2. Per-input validation views (same contract as task validation)
-        # Track views per input for materialization labeling
-        all_created_views: list[str] = []  # flat list for cleanup on error
-        per_input_views: dict[str, list[str]] = {}  # input_name -> view names
-
-        for table_name, validate_sql in self.input_validate_sql.items():
-            stmts = split_sql_statements(validate_sql)
-            input_views: list[str] = []
-
-            # Execute all statements (CREATE VIEW etc.)
-            for sql in stmts:
-                start = time.perf_counter()
-                try:
-                    conn.execute(sql)
-                    elapsed_ms = (time.perf_counter() - start) * 1000
-                    log_trace(
-                        conn,
-                        sql,
-                        success=True,
-                        elapsed_ms=elapsed_ms,
-                        task_name=table_name,
-                    )
-                except duckdb.Error as e:
-                    elapsed_ms = (time.perf_counter() - start) * 1000
-                    log_trace(
-                        conn,
-                        sql,
-                        success=False,
-                        error=str(e),
-                        elapsed_ms=elapsed_ms,
-                        task_name=table_name,
-                    )
-                    errors.append(f"Input validation SQL error for '{table_name}': {e}")
-                    # Clean up any views created so far
-                    _drop_views(conn, all_created_views)
-                    return errors
-
-            # Discover created validation views for this input
-            prefix = validation_view_prefix(table_name)
-            for stmt in stmts:
-                name = extract_create_name(stmt)
-                if name and is_validation_view_for_task(name, table_name):
-                    input_views.append(name)
-                    all_created_views.append(name)
-
-            if not input_views:
-                errors.append(
-                    f"Input '{table_name}' validate_sql did not create any "
-                    f"'{prefix}' views."
-                )
-                _drop_views(conn, all_created_views)
-                return errors
-
-            per_input_views[table_name] = input_views
-
-            # Validate the views
-            for view_name in input_views:
-                view_errors, fatal = validate_one_validation_view(conn, view_name)
-                if view_errors:
-                    errors.extend(view_errors)
-                if fatal:
-                    _drop_views(conn, all_created_views)
-                    return errors
-
-            if errors:
-                _drop_views(conn, all_created_views)
-                return errors
-
-        # All validation passed — materialize input validation views
-        for table_name, view_names in per_input_views.items():
-            n = materialize_views(conn, view_names, label=table_name)
-            if n:
-                log.debug(
-                    "Materialized %d input validation view(s) for '%s'",
-                    n,
-                    table_name,
-                )
-
-        return errors
+        return InputValidator(conn, self.input_columns, self.input_validate_sql).run()
 
     @staticmethod
     async def _run_task_dag(
