@@ -14,6 +14,7 @@ import json
 import logging
 import duckdb
 from dataclasses import dataclass
+from .sql_utils import get_column_schema
 
 log = logging.getLogger(__name__)
 
@@ -58,15 +59,7 @@ def snapshot_views(conn: duckdb.DuckDBPyConnection) -> dict[str, ViewSnapshot]:
 
     for view_name, sql in views:
         # Get column info
-        try:
-            cols = conn.execute(
-                "SELECT column_name, data_type FROM information_schema.columns "
-                "WHERE table_name = ? ORDER BY ordinal_position",
-                [view_name],
-            ).fetchall()
-            columns = [(str(c[0]), str(c[1])) for c in cols]
-        except duckdb.Error:
-            columns = []
+        columns = get_column_schema(conn, view_name)
 
         # Get row count (cheap — DuckDB optimizes COUNT(*) on views)
         try:

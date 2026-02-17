@@ -33,8 +33,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .agent_loop import AgentResult
-from .api import OpenRouterClient
+from .agent_loop import AgentResult, DEFAULT_MAX_ITERATIONS
+from .api import OpenRouterClient, DEFAULT_MODEL
 from .diff import (
     snapshot_views,
     diff_snapshots,
@@ -45,6 +45,7 @@ from .diff import (
 from .ingest import ingest_table
 from .agent import init_trace_table, run_task_agent, run_sql_only_task
 from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
+from .sql_utils import get_column_schema
 
 log = logging.getLogger(__name__)
 
@@ -90,19 +91,8 @@ def persist_workspace_meta(
     input_schemas: dict[str, list[dict[str, str]]] = {}
     if input_tables:
         for table in input_tables:
-            try:
-                rows_cols = conn.execute(
-                    """
-                    SELECT column_name, data_type
-                    FROM information_schema.columns
-                    WHERE table_name = ?
-                    ORDER BY ordinal_position
-                    """,
-                    [table],
-                ).fetchall()
-                input_schemas[table] = [{"name": r[0], "type": r[1]} for r in rows_cols]
-            except duckdb.Error:
-                input_schemas[table] = []
+            rows_cols = get_column_schema(conn, table)
+            input_schemas[table] = [{"name": r[0], "type": r[1]} for r in rows_cols]
 
     try:
         tg_version = importlib.metadata.version("taskgraph")
@@ -436,8 +426,8 @@ class Workspace:
     async def run(
         self,
         client: OpenRouterClient | None = None,
-        model: str = "openai/gpt-5.2",
-        max_iterations: int = 200,
+        model: str = DEFAULT_MODEL,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
     ) -> WorkspaceResult:
         """Run the full workspace: ingest, resolve DAG, execute tasks, export.
 
@@ -455,9 +445,8 @@ class Workspace:
         layers = resolve_dag(self.tasks)
         dag_layer_names = [[t.name for t in layer] for layer in layers]
 
-        log.info("Workspace: %d tasks, %d DAG layers", len(self.tasks), len(layers))
-        for i, layer_names in enumerate(dag_layer_names):
-            log.info("  Layer %d: %s", i, ", ".join(layer_names))
+        # Workspace task display is now handled by the CLI for tree formatting.
+        # This keeps the workspace focused on execution.
 
         # Create fresh database
         db_path = Path(self.db_path)
@@ -499,7 +488,7 @@ class Workspace:
         task_changes: list[tuple[str, list[ViewChange]]] = []
 
         async def run_one(task: Task) -> tuple[str, AgentResult]:
-            log.info("[%s] Starting", task.name)
+            log.info("[%s] Starting (outputs: %s)", task.name, ", ".join(task.outputs))
             before = snapshot_views(conn)
             result = await self._execute_task(
                 conn=conn,

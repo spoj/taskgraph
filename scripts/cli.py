@@ -36,7 +36,8 @@ sys.path.insert(0, str(Path.cwd()))
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.api import OpenRouterClient
+from src.api import OpenRouterClient, DEFAULT_MODEL
+from src.agent_loop import DEFAULT_MAX_ITERATIONS
 from src.spec import load_spec_from_module, resolve_module_path
 from src.workspace import Workspace, read_workspace_meta
 from src.task import Task, resolve_dag, resolve_task_deps, validate_task_graph
@@ -282,6 +283,90 @@ TASKS = [
     click.echo("  tg run")
 
 
+def _format_task_tree(tasks: list[Task]) -> list[str]:
+    """Format task DAG as a list of tree lines."""
+    if not tasks:
+        return ["  (no tasks)"]
+
+    deps = resolve_task_deps(tasks)
+    task_by_name = {t.name: t for t in tasks}
+    # parent -> sorted children
+    children: dict[str, list[str]] = {t.name: [] for t in tasks}
+    for name, parents in deps.items():
+        for p in parents:
+            children[p].append(name)
+    for p in children:
+        children[p] = sorted(set(children[p]))
+
+    roots = sorted([name for name, parents in deps.items() if not parents])
+    all_task_outputs: set[str] = set()
+    for t in tasks:
+        all_task_outputs.update(t.outputs)
+
+    def _fmt_details(t: Task) -> str:
+        kind = t.transform_mode()
+        validation = "yes" if t.has_validation() else "no"
+        if t.inputs:
+            inp_parts = []
+            for inp in t.inputs:
+                if inp in all_task_outputs:
+                    inp_parts.append(inp)
+                else:
+                    inp_parts.append(f"{inp} (table)")
+            inp_s = ", ".join(inp_parts)
+        else:
+            inp_s = "(none)"
+
+        out_parts = []
+        for o in t.outputs:
+            cols = t.output_columns.get(o, [])
+            out_parts.append(f"{o} ({len(cols)} cols)" if cols else o)
+
+        return (
+            f"type={kind}  validate={validation}  in={inp_s}  "
+            f"out={', '.join(out_parts) if out_parts else '(none)'}"
+        )
+
+    lines: list[str] = []
+
+    def _emit(name: str, prefix: str, is_last: bool, stack: set[str], seen: set[str]):
+        t = task_by_name[name]
+        branch = "`- " if is_last else "|- "
+        lines.append(f"{prefix}{branch}{name}  {_fmt_details(t)}")
+
+        if name in stack:
+            lines.append(f"{prefix}{'   ' if is_last else '|  '}[cycle]")
+            return
+        if name in seen:
+            lines.append(f"{prefix}{'   ' if is_last else '|  '}[shared]")
+            return
+
+        seen.add(name)
+        stack.add(name)
+        kids = children.get(name, [])
+        next_prefix = prefix + ("   " if is_last else "|  ")
+        for i, child in enumerate(kids):
+            _emit(
+                child,
+                prefix=next_prefix,
+                is_last=(i == len(kids) - 1),
+                stack=stack,
+                seen=seen,
+            )
+        stack.remove(name)
+
+    seen_all: set[str] = set()
+    for i, r in enumerate(roots):
+        _emit(
+            r,
+            prefix="  ",
+            is_last=(i == len(roots) - 1),
+            stack=set(),
+            seen=seen_all,
+        )
+    return lines
+
+
 @main.command()
 @click.option(
     "--spec",
@@ -300,14 +385,14 @@ TASKS = [
 @click.option(
     "--model",
     "-m",
-    default="openai/gpt-5.2",
-    help="Model to use (default: openai/gpt-5.2)",
+    default=DEFAULT_MODEL,
+    help=f"Model to use (default: {DEFAULT_MODEL})",
 )
 @click.option(
     "--max-iterations",
-    default=200,
+    default=DEFAULT_MAX_ITERATIONS,
     type=int,
-    help="Maximum agent iterations per task (default: 200)",
+    help=f"Maximum agent iterations per task (default: {DEFAULT_MAX_ITERATIONS})",
 )
 @click.option("--quiet", "-q", is_flag=True, help="Suppress verbose output")
 @click.option(
@@ -338,6 +423,7 @@ def run(
         level=level,
         format="%(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,
     )
 
     if spec is None:
@@ -386,7 +472,15 @@ def run(
     log.info("Spec: %s", spec)
     log.info("Output: %s", output)
     log.info("Model: %s", model)
-    log.info("Tasks: %d\n", len(loaded["tasks"]))
+    log.info("Tasks: %d", len(loaded["tasks"]))
+
+    # Show task tree before running
+    tree_lines = _format_task_tree(loaded["tasks"])
+    if tree_lines:
+        log.info("\nDAG (tree):")
+        for line in tree_lines:
+            log.info(line)
+        log.info("")
 
     needs_llm = any(t.transform_mode() == "prompt" for t in loaded["tasks"])
     if needs_llm:
@@ -407,7 +501,7 @@ def run(
 
     result = asyncio.run(_run())
 
-    log.info("\nSaved to: %s", output)
+    log.info("Saved to: %s", output)
     log.info("Task metadata: SELECT task, meta_json FROM _task_meta")
     log.info("SQL trace: SELECT * FROM _trace")
 
@@ -442,47 +536,8 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
             change_rows = []
 
         if has_changes:
-            from src.diff import ViewChange, format_all_changes
-
-            # Group by task, preserving insertion order
-            task_changes: dict[str, list[ViewChange]] = {}
-            for row in change_rows:
-                (
-                    task_name,
-                    view_name,
-                    kind,
-                    sql_before,
-                    sql_after,
-                    cols_before_json,
-                    cols_after_json,
-                    rows_before,
-                    rows_after,
-                ) = row
-                cols_before = (
-                    [tuple(c) for c in json.loads(cols_before_json)]
-                    if cols_before_json
-                    else None
-                )
-                cols_after = (
-                    [tuple(c) for c in json.loads(cols_after_json)]
-                    if cols_after_json
-                    else None
-                )
-                change = ViewChange(
-                    view_name=view_name,
-                    kind=kind,
-                    sql_before=sql_before,
-                    sql_after=sql_after,
-                    cols_before=cols_before,
-                    cols_after=cols_after,
-                    rows_before=rows_before,
-                    rows_after=rows_after,
-                )
-                task_changes.setdefault(task_name, []).append(change)
-
-            formatted = format_all_changes(list(task_changes.items()))
-            if formatted:
-                click.echo(f"\n{formatted}")
+            # Changes are now reported real-time by the workspace
+            pass
         else:
             # Fallback: no _changes table, show basic view listing
             click.echo(f"\nViews: {len(views)}")
@@ -642,100 +697,17 @@ def show(target: Path | None, spec: str | None):
     # uses a dependency tree view instead of execution layers.
     try:
         resolve_dag(tasks)
-        deps = resolve_task_deps(tasks)
     except ValueError as e:
         click.echo(f"\nDAG error: {e}")
         sys.exit(1)
 
     total_tasks = len(tasks)
-    click.echo(f"\nDAG (tree, {total_tasks} tasks):\n")
-
-    task_by_name = {t.name: t for t in tasks}
-    # parent -> sorted children
-    children: dict[str, list[str]] = {t.name: [] for t in tasks}
-    for name, parents in deps.items():
-        for p in parents:
-            children[p].append(name)
-    for p in children:
-        children[p] = sorted(set(children[p]))
-
-    roots = sorted([name for name, parents in deps.items() if not parents])
-
-    # Collect all task outputs for showing which inputs are external vs task-produced
-    all_task_outputs: set[str] = set()
-    for t in tasks:
-        all_task_outputs.update(t.outputs)
-
-    def _fmt_task_details(t: Task) -> str:
-        kind = t.transform_mode()
-        validation = "yes" if t.has_validation() else "no"
-
-        if t.inputs:
-            inp_parts = []
-            for inp in t.inputs:
-                if inp in all_task_outputs:
-                    inp_parts.append(inp)
-                else:
-                    inp_parts.append(f"{inp} (table)")
-            inp_s = ", ".join(inp_parts)
-        else:
-            inp_s = "(none)"
-
-        out_parts = []
-        for o in t.outputs:
-            cols = t.output_columns.get(o, [])
-            out_parts.append(f"{o} ({len(cols)} cols)" if cols else o)
-
-        return (
-            f"type={kind}  validate={validation}  in={inp_s}  "
-            f"out={', '.join(out_parts) if out_parts else '(none)'}"
-        )
-
-    def _emit_subtree(
-        name: str, prefix: str, is_last: bool, stack: set[str], seen: set[str]
-    ):
-        t = task_by_name[name]
-        branch = "`- " if is_last else "|- "
-        click.echo(f"{prefix}{branch}{name}  {_fmt_task_details(t)}")
-
-        # Avoid infinite recursion (shouldn't happen if resolve_dag passed) and
-        # reduce noise for shared downstream tasks in DAGs.
-        if name in stack:
-            click.echo(f"{prefix}{'   ' if is_last else '|  '}[cycle]")
-            return
-        if name in seen:
-            click.echo(f"{prefix}{'   ' if is_last else '|  '}[shared]")
-            return
-
-        seen.add(name)
-        stack.add(name)
-
-        kids = children.get(name, [])
-        next_prefix = prefix + ("   " if is_last else "|  ")
-        for i, child in enumerate(kids):
-            _emit_subtree(
-                child,
-                prefix=next_prefix,
-                is_last=(i == len(kids) - 1),
-                stack=stack,
-                seen=seen,
-            )
-
-        stack.remove(name)
-
-    if not roots:
-        click.echo("  (no tasks)")
-    else:
-        seen: set[str] = set()
-        for i, r in enumerate(roots):
-            _emit_subtree(
-                r,
-                prefix="  ",
-                is_last=(i == len(roots) - 1),
-                stack=set(),
-                seen=seen,
-            )
+    click.echo(f"\nDAG (tree, {total_tasks} tasks):")
+    for line in _format_task_tree(tasks):
+        click.echo(line)
     click.echo()
+
+    # --- Validation summary ---
 
     # --- Validation summary ---
     has_validation = False

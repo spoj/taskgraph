@@ -18,11 +18,15 @@ import json
 import asyncio
 import random
 import sys
+import logging
 from typing import Any, Awaitable, Callable
 
 import httpx
 
+DEFAULT_MODEL = "openai/gpt-5.2"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+log = logging.getLogger(__name__)
 
 
 def get_headers() -> dict[str, str]:
@@ -175,9 +179,12 @@ class OpenRouterClient:
             except (httpx.TimeoutException, httpx.RequestError) as e:
                 if attempt < self.max_retries:
                     jitter = random.uniform(0, 3)
-                    print(
-                        f"[Retry {attempt + 1}/{self.max_retries}] Network error: {type(e).__name__}: {e}",
-                        file=sys.stderr,
+                    log.warning(
+                        "[Retry %d/%d] Network error: %s: %s",
+                        attempt + 1,
+                        self.max_retries,
+                        type(e).__name__,
+                        e,
                     )
                     await asyncio.sleep(backoff + jitter)
                     backoff = min(backoff * 2, max_backoff)
@@ -190,10 +197,13 @@ class OpenRouterClient:
                 response_data = json.loads(response_text) if response_text else {}
             except json.JSONDecodeError:
                 if attempt < self.max_retries:
-                    jitter = random.uniform(0, 5)
-                    print(
-                        f"[Retry {attempt + 1}/{self.max_retries}] Invalid JSON (status {response.status_code}): {response_text[:200]}",
-                        file=sys.stderr,
+                    jitter = random.uniform(0, 3)
+                    log.warning(
+                        "[Retry %d/%d] Invalid JSON (status %d): %s",
+                        attempt + 1,
+                        self.max_retries,
+                        response.status_code,
+                        response_text[:200],
                     )
                     await asyncio.sleep(backoff + jitter)
                     backoff = min(backoff * 2, max_backoff)
@@ -243,9 +253,12 @@ class OpenRouterClient:
                     wait = backoff
 
                 jitter = random.uniform(0, 3)
-                print(
-                    f"[Retry {attempt + 1}/{self.max_retries}] HTTP {response.status_code}: {error_detail}",
-                    file=sys.stderr,
+                log.warning(
+                    "[Retry %d/%d] HTTP %d: %s",
+                    attempt + 1,
+                    self.max_retries,
+                    response.status_code,
+                    error_detail,
                 )
                 await asyncio.sleep(wait + jitter)
                 backoff = min(backoff * 2, max_backoff)

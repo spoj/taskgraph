@@ -41,40 +41,18 @@ Example:
 import duckdb
 import re
 from dataclasses import dataclass, field
-
+from .sql_utils import (
+    get_parser_conn,
+    split_sql_statements,
+    extract_create_name,
+    get_column_names,
+)
 
 _VALIDATION_VIEW_REQUIRED_COLS = ["status", "message"]
 _VALIDATION_STATUS_ALLOWED = {"pass", "warn", "fail"}
 _MAX_INLINE_MESSAGES = 20  # Cap messages shown inline in validation/warning output
 
-_CREATE_VIEW_NAME_RE = re.compile(
-    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?"
-    r"VIEW\s+"
-    r"\"?(\w+)\"?",
-    re.IGNORECASE,
-)
-
-# Connection used solely for extract_statements (lightweight, never writes)
-_parser_conn: duckdb.DuckDBPyConnection | None = None
-
-
-def _get_parser_conn() -> duckdb.DuckDBPyConnection:
-    """Lazy singleton in-memory connection for SQL parsing."""
-    global _parser_conn
-    if _parser_conn is None:
-        _parser_conn = duckdb.connect(":memory:")
-    return _parser_conn
-
-
-def _split_sql_statements(sql_text: str) -> list[str]:
-    sql_text = (sql_text or "").strip()
-    if not sql_text:
-        return []
-    try:
-        statements = _get_parser_conn().extract_statements(sql_text)
-    except duckdb.Error:
-        return [sql_text]
-    return [s.query.strip() for s in statements if s.query.strip()]
+# Constants and parser helpers moved to sql_utils.py
 
 
 def validation_view_prefix(task_name: str) -> str:
@@ -134,11 +112,11 @@ class Task:
 
     def sql_statements(self) -> list[str]:
         """Return SQL statements for sql transform tasks."""
-        return _split_sql_statements(self.sql)
+        return split_sql_statements(self.sql)
 
     def validate_sql_statements(self) -> list[str]:
         """Return SQL statements for validation SQL."""
-        return _split_sql_statements(self.validate_sql)
+        return split_sql_statements(self.validate_sql)
 
     def validation_view_names(self) -> list[str]:
         """Return validation view names derived from validate_sql."""
@@ -146,11 +124,8 @@ class Task:
             return []
         names: list[str] = []
         for stmt in self.validate_sql_statements():
-            match = _CREATE_VIEW_NAME_RE.search(stmt)
-            if not match:
-                continue
-            name = match.group(1)
-            if is_validation_view_for_task(name, self.name):
+            name = extract_create_name(stmt)
+            if name and is_validation_view_for_task(name, self.name):
                 names.append(name)
         return sorted(set(names))
 
@@ -178,17 +153,10 @@ class Task:
             for view_name, required_cols in self.output_columns.items():
                 if view_name not in existing_views:
                     continue  # Already caught in step 1
-                try:
-                    actual_cols = {
-                        row[0]
-                        for row in conn.execute(
-                            "SELECT column_name FROM information_schema.columns "
-                            "WHERE table_name = ?",
-                            [view_name],
-                        ).fetchall()
-                    }
-                except duckdb.Error as e:
-                    return [f"Schema check error for '{view_name}': {e}"]
+                actual_cols = get_column_names(conn, view_name)
+                if not actual_cols:
+                    # This shouldn't happen if it's in existing_views but stay safe
+                    continue
 
                 missing_cols = [c for c in required_cols if c not in actual_cols]
                 if missing_cols:
@@ -247,22 +215,12 @@ class Task:
         remaining = None if limit is None else max(1, limit)
 
         for view_name in views:
-            if remaining is not None and remaining <= 0:
-                break
-
-            try:
-                cols = [
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
-                        [view_name],
-                    ).fetchall()
-                ]
-            except duckdb.Error:
+            actual = get_column_names(conn, view_name)
+            if not actual:
                 continue
 
-            actual = {c.lower() for c in cols}
-            if "status" not in actual or "message" not in actual:
+            actual_lower = {c.lower() for c in actual}
+            if "status" not in actual_lower or "message" not in actual_lower:
                 continue
 
             try:
@@ -280,7 +238,7 @@ class Task:
             if remaining is not None and remaining <= 0:
                 continue
 
-            has_evidence_view = "evidence_view" in actual
+            has_evidence_view = "evidence_view" in actual_lower
 
             try:
                 if has_evidence_view:
@@ -333,28 +291,21 @@ class Task:
         Returns (errors, fatal).
         - fatal=True indicates a schema/query/contract problem that should stop immediately.
         """
-        try:
-            cols = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
-                    [view_name],
-                ).fetchall()
-            ]
-        except duckdb.Error as e:
+        actual_cols = get_column_names(conn, view_name)
+        if not actual_cols:
             return (
-                [f"Validation view schema check error for '{view_name}': {e}"],
+                [f"Validation view '{view_name}' not found."],
                 True,
             )
 
-        actual = {c.lower() for c in cols}
-        missing = [c for c in _VALIDATION_VIEW_REQUIRED_COLS if c not in actual]
+        actual_lower = {c.lower() for c in actual_cols}
+        missing = [c for c in _VALIDATION_VIEW_REQUIRED_COLS if c not in actual_lower]
         if missing:
             label = "column" if len(missing) == 1 else "columns"
             return (
                 [
                     f"Validation view '{view_name}' is missing required {label}: "
-                    f"{', '.join(missing)}. Actual columns: {', '.join(cols)}"
+                    f"{', '.join(missing)}. Actual columns: {', '.join(sorted(actual_cols))}"
                 ],
                 True,
             )
@@ -379,7 +330,7 @@ class Task:
                 True,
             )
 
-        has_evidence_view = "evidence_view" in actual
+        has_evidence_view = "evidence_view" in actual_lower
 
         try:
             if has_evidence_view:

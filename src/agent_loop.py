@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 
 # Default token budget per task (prompt + completion combined)
 DEFAULT_MAX_TOKENS = 20_000_000
+DEFAULT_MAX_ITERATIONS = 200
 
 
 @dataclass
@@ -91,13 +92,18 @@ def accumulate_usage(total: dict[str, int], usage: dict[str, Any]) -> None:
 
 
 async def run_agent_loop(
-    call_model: ModelCallable,
-    tool_executor: ToolExecutor,
+    call_model: Callable[
+        [list[dict[str, Any]]], Awaitable[tuple[dict[str, Any], dict[str, Any]]]
+    ],
+    tool_executor: Callable[[str, dict[str, Any]], Awaitable[str]],
     initial_messages: list[dict[str, Any]],
-    validation_fn: ValidationFn | None = None,
-    max_iterations: int = 200,
+    validation_fn: Callable[[], tuple[bool, str]] | None = None,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    on_iteration: Callable[
+        [int, dict[str, Any] | None, list[dict[str, Any]] | None], None
+    ]
+    | None = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    on_iteration: OnIterationFn | None = None,
 ) -> AgentResult:
     """
     Run an agent loop until completion or max iterations.

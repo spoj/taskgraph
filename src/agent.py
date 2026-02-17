@@ -14,9 +14,14 @@ import datetime
 import decimal
 import uuid
 from typing import Any, Callable, cast
-from .agent_loop import run_agent_loop, AgentResult
-from .api import OpenRouterClient, create_model_callable
+from .agent_loop import run_agent_loop, AgentResult, DEFAULT_MAX_ITERATIONS
+from .api import OpenRouterClient, create_model_callable, DEFAULT_MODEL
 from .task import Task, is_validation_view_for_task
+from .sql_utils import (
+    get_parser_conn,
+    get_column_schema,
+    extract_create_name,
+)
 
 log = logging.getLogger(__name__)
 
@@ -113,12 +118,8 @@ def _create_sql_tool() -> dict[str, Any]:
 # Regex to extract the object name from CREATE/DROP statements.
 # Handles: CREATE [OR REPLACE] [TEMP] VIEW|MACRO "name" ...
 #          DROP VIEW|MACRO [IF EXISTS] "name" ...
-_CREATE_NAME_RE = re.compile(
-    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?"
-    r"(?:VIEW|MACRO)\s+"
-    r'"?(\w+)"?',
-    re.IGNORECASE,
-)
+from .sql_utils import CREATE_NAME_RE
+
 _DROP_NAME_RE = re.compile(
     r"DROP\s+(?:MACRO\s+TABLE|VIEW|MACRO)\s+"
     r"(?:IF\s+EXISTS\s+)?"
@@ -140,6 +141,8 @@ _DROP_KIND_RE = re.compile(
 
 def _extract_name(query: str, pattern: re.Pattern[str]) -> str | None:
     """Extract the object name from a SQL statement using regex."""
+    if pattern is CREATE_NAME_RE:
+        return extract_create_name(query)
     m = pattern.search(query)
     return m.group(1) if m else None
 
@@ -162,15 +165,7 @@ def _check_name_allowed(
 
 
 # Connection used solely for extract_statements (lightweight, never writes)
-_parser_conn: duckdb.DuckDBPyConnection | None = None
-
-
-def _get_parser_conn() -> duckdb.DuckDBPyConnection:
-    """Lazy singleton in-memory connection for SQL parsing."""
-    global _parser_conn
-    if _parser_conn is None:
-        _parser_conn = duckdb.connect(":memory:")
-    return _parser_conn
+# Removed local _parser_conn and _get_parser_conn, now using sql_utils.get_parser_conn
 
 
 def is_sql_allowed(
@@ -194,9 +189,7 @@ def is_sql_allowed(
         ddl_only: If True, only allow CREATE/DROP VIEW|MACRO statements.
     """
     try:
-        statements = _get_parser_conn().extract_statements(query)
-    except duckdb.ParserException as e:
-        return False, f"SQL parse error: {e}"
+        statements = get_parser_conn().extract_statements(query)
     except Exception as e:
         return False, f"SQL parse error: {e}"
 
@@ -232,7 +225,7 @@ def is_sql_allowed(
         if kind_match:
             kind = kind_match.group(1).upper()
             label = "view" if kind == "VIEW" else "macro"
-            name = _extract_name(sql, _CREATE_NAME_RE)
+            name = _extract_name(sql, CREATE_NAME_RE)
             if name and forbidden_names and forbidden_names(name):
                 return (
                     False,
@@ -512,19 +505,7 @@ def _format_input_schema_lines(
 
     lines: list[str] = []
     for table_name in inputs:
-        try:
-            rows = conn.execute(
-                """
-                SELECT column_name, data_type
-                FROM information_schema.columns
-                WHERE table_name = ?
-                ORDER BY ordinal_position
-                """,
-                [table_name],
-            ).fetchall()
-        except duckdb.Error:
-            rows = []
-
+        rows = get_column_schema(conn, table_name)
         if rows:
             cols = ", ".join(f"{name} {dtype}" for name, dtype in rows)
             lines.append(f"- {table_name} ({cols})")
@@ -595,8 +576,8 @@ async def run_task_agent(
     conn: duckdb.DuckDBPyConnection,
     task: Task,
     client: OpenRouterClient,
-    model: str = "openai/gpt-5.2",
-    max_iterations: int = 200,
+    model: str = DEFAULT_MODEL,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> AgentResult:
     """Run the agent for a single Task within a shared workspace database.
 
@@ -672,7 +653,7 @@ async def run_task_agent(
         if not tool_results:
             log.debug("(done)")
 
-    log.info("[%s] Starting (outputs: %s)", task.name, ", ".join(task.outputs))
+    # Agent loop starting log moved to workspace to avoid double-logging
 
     # Run the agent loop
     result = await run_agent_loop(
