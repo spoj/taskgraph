@@ -68,6 +68,100 @@ def is_validation_view_for_task(view_name: str, task_name: str) -> bool:
     return view_name == prefix or view_name.startswith(prefix + "_")
 
 
+def validate_one_validation_view(
+    conn: duckdb.DuckDBPyConnection, view_name: str
+) -> tuple[list[str], bool]:
+    """Validate a single validation view.
+
+    Returns (errors, fatal).
+    - fatal=True indicates a schema/query/contract problem that should stop immediately.
+    - fatal=False with errors means validation 'fail' rows were found.
+
+    The view must have columns 'status' and 'message'.
+    Allowed status values: 'pass', 'warn', 'fail' (case-insensitive).
+    Any row with lower(status)='fail' is reported as an error.
+    """
+    actual_cols = get_column_names(conn, view_name)
+    if not actual_cols:
+        return (
+            [f"Validation view '{view_name}' not found."],
+            True,
+        )
+
+    actual_lower = {c.lower() for c in actual_cols}
+    missing = [c for c in _VALIDATION_VIEW_REQUIRED_COLS if c not in actual_lower]
+    if missing:
+        label = "column" if len(missing) == 1 else "columns"
+        return (
+            [
+                f"Validation view '{view_name}' is missing required {label}: "
+                f"{', '.join(missing)}. Actual columns: {', '.join(sorted(actual_cols))}"
+            ],
+            True,
+        )
+
+    # Enforce status domain
+    try:
+        bad = conn.execute(
+            f'SELECT DISTINCT lower(status) AS status FROM "{view_name}" '
+            "WHERE status IS NOT NULL AND lower(status) NOT IN ('pass','warn','fail')"
+        ).fetchall()
+    except duckdb.Error as e:
+        return ([f"Validation view query error for '{view_name}': {e}"], True)
+
+    if bad:
+        bad_vals = ", ".join(sorted({str(r[0]) for r in bad}))
+        allowed = ", ".join(sorted(_VALIDATION_STATUS_ALLOWED))
+        return (
+            [
+                f"Validation view '{view_name}' has invalid status value(s): {bad_vals}. "
+                f"Allowed: {allowed}"
+            ],
+            True,
+        )
+
+    has_evidence_view = "evidence_view" in actual_lower
+
+    try:
+        if has_evidence_view:
+            rows = conn.execute(
+                f'SELECT status, message, evidence_view FROM "{view_name}" '
+                "WHERE lower(status) = 'fail'"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f'SELECT status, message FROM "{view_name}" '
+                "WHERE lower(status) = 'fail'"
+            ).fetchall()
+    except duckdb.Error as e:
+        return ([f"Validation view query error for '{view_name}': {e}"], True)
+
+    if rows:
+        msgs: list[str] = []
+        evidence_views: set[str] = set()
+        if has_evidence_view:
+            for _status, msg, ev in rows:
+                msgs.append(str(msg))
+                if ev:
+                    evidence_views.add(str(ev))
+        else:
+            msgs = [str(msg) for _status, msg in rows]
+
+        count = len(msgs)
+        header = f"Failures in '{view_name}' ({count})"
+        if evidence_views:
+            header += f" [evidence: {', '.join(sorted(evidence_views))}]"
+
+        sample = msgs[:MAX_INLINE_MESSAGES]
+        detail = "\n".join(f"  {m}" for m in sample)
+        if count > MAX_INLINE_MESSAGES:
+            detail += f"\n  ... and {count - MAX_INLINE_MESSAGES} more"
+
+        return ([f"{header}:\n{detail}"], False)
+
+    return ([], False)
+
+
 @dataclass
 class Task:
     """A single unit of work in a workspace.
@@ -296,90 +390,8 @@ class Task:
     def _validate_one_validation_view(
         self, conn: duckdb.DuckDBPyConnection, view_name: str
     ) -> tuple[list[str], bool]:
-        """Validate a single validation view.
-
-        Returns (errors, fatal).
-        - fatal=True indicates a schema/query/contract problem that should stop immediately.
-        """
-        actual_cols = get_column_names(conn, view_name)
-        if not actual_cols:
-            return (
-                [f"Validation view '{view_name}' not found."],
-                True,
-            )
-
-        actual_lower = {c.lower() for c in actual_cols}
-        missing = [c for c in _VALIDATION_VIEW_REQUIRED_COLS if c not in actual_lower]
-        if missing:
-            label = "column" if len(missing) == 1 else "columns"
-            return (
-                [
-                    f"Validation view '{view_name}' is missing required {label}: "
-                    f"{', '.join(missing)}. Actual columns: {', '.join(sorted(actual_cols))}"
-                ],
-                True,
-            )
-
-        # Enforce status domain
-        try:
-            bad = conn.execute(
-                f'SELECT DISTINCT lower(status) AS status FROM "{view_name}" '
-                "WHERE status IS NOT NULL AND lower(status) NOT IN ('pass','warn','fail')"
-            ).fetchall()
-        except duckdb.Error as e:
-            return ([f"Validation view query error for '{view_name}': {e}"], True)
-
-        if bad:
-            bad_vals = ", ".join(sorted({str(r[0]) for r in bad}))
-            allowed = ", ".join(sorted(_VALIDATION_STATUS_ALLOWED))
-            return (
-                [
-                    f"Validation view '{view_name}' has invalid status value(s): {bad_vals}. "
-                    f"Allowed: {allowed}"
-                ],
-                True,
-            )
-
-        has_evidence_view = "evidence_view" in actual_lower
-
-        try:
-            if has_evidence_view:
-                rows = conn.execute(
-                    f'SELECT status, message, evidence_view FROM "{view_name}" '
-                    "WHERE lower(status) = 'fail'"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    f'SELECT status, message FROM "{view_name}" '
-                    "WHERE lower(status) = 'fail'"
-                ).fetchall()
-        except duckdb.Error as e:
-            return ([f"Validation view query error for '{view_name}': {e}"], True)
-
-        if rows:
-            msgs: list[str] = []
-            evidence_views: set[str] = set()
-            if has_evidence_view:
-                for _status, msg, ev in rows:
-                    msgs.append(str(msg))
-                    if ev:
-                        evidence_views.add(str(ev))
-            else:
-                msgs = [str(msg) for _status, msg in rows]
-
-            count = len(msgs)
-            header = f"Failures in '{view_name}' ({count})"
-            if evidence_views:
-                header += f" [evidence: {', '.join(sorted(evidence_views))}]"
-
-            sample = msgs[:MAX_INLINE_MESSAGES]
-            detail = "\n".join(f"  {m}" for m in sample)
-            if count > MAX_INLINE_MESSAGES:
-                detail += f"\n  ... and {count - MAX_INLINE_MESSAGES} more"
-
-            return ([f"{header}:\n{detail}"], False)
-
-        return ([], False)
+        """Validate a single validation view. Delegates to module-level function."""
+        return validate_one_validation_view(conn, view_name)
 
 
 def resolve_task_deps(tasks: list[Task]) -> dict[str, set[str]]:

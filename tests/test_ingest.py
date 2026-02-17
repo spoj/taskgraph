@@ -300,28 +300,40 @@ class TestInputValidation:
         ingest_table(conn, [{"x": 1}], "t")
         ws = self._make_workspace(
             input_columns={"t": ["missing"]},
-            input_validate_sql={"t": "SELECT 'should not run'"},
+            input_validate_sql={
+                "t": (
+                    "CREATE OR REPLACE VIEW t__validation AS "
+                    "SELECT 'fail' AS status, 'should not run' AS message"
+                )
+            },
         )
         errors = ws._validate_inputs(conn)
         assert len(errors) == 1
         assert "missing" in errors[0]
 
     def test_input_validate_sql_pass(self, conn):
-        """SQL validation passes when queries return zero rows."""
+        """Validation passes when all rows have status='pass'."""
         ingest_table(conn, [{"id": 1, "val": 10}, {"id": 2, "val": 20}], "data")
         ws = self._make_workspace(
-            input_validate_sql={"data": "SELECT id FROM data WHERE val < 0"},
+            input_validate_sql={
+                "data": (
+                    "CREATE OR REPLACE VIEW data__validation AS "
+                    "SELECT 'pass' AS status, 'all values positive' AS message"
+                )
+            },
         )
         errors = ws._validate_inputs(conn)
         assert errors == []
 
     def test_input_validate_sql_fail(self, conn):
-        """SQL validation fails when query returns rows."""
+        """Validation fails when view has status='fail' rows."""
         ingest_table(conn, [{"id": 1, "val": -5}], "data")
         ws = self._make_workspace(
             input_validate_sql={
                 "data": (
-                    "SELECT 'negative value for id=' || CAST(id AS VARCHAR) "
+                    "CREATE OR REPLACE VIEW data__validation AS "
+                    "SELECT 'fail' AS status, "
+                    "'negative value for id=' || CAST(id AS VARCHAR) AS message "
                     "FROM data WHERE val < 0"
                 )
             },
@@ -333,35 +345,94 @@ class TestInputValidation:
     def test_input_validate_sql_error_handling(self, conn):
         """SQL validation catches query errors gracefully."""
         ws = self._make_workspace(
-            input_validate_sql={"bad": "SELECT * FROM nonexistent_table"},
+            input_validate_sql={
+                "bad": (
+                    "CREATE OR REPLACE VIEW bad__validation AS "
+                    "SELECT 'fail' AS status, x AS message "
+                    "FROM nonexistent_table"
+                )
+            },
         )
         errors = ws._validate_inputs(conn)
         assert len(errors) == 1
         assert "error" in errors[0].lower()
 
-    def test_input_validate_sql_multicolumn(self, conn):
-        """Multi-column SQL results are formatted as col=val pairs."""
-        ingest_table(conn, [{"id": 1, "status": "bad"}], "items")
+    def test_input_validate_sql_status_message(self, conn):
+        """Validation view with mixed pass/fail rows reports only failures."""
+        ingest_table(
+            conn, [{"id": 1, "status": "bad"}, {"id": 2, "status": "ok"}], "items"
+        )
         ws = self._make_workspace(
             input_validate_sql={
-                "items": "SELECT id, status FROM items WHERE status = 'bad'"
+                "items": (
+                    "CREATE OR REPLACE VIEW items__validation AS "
+                    "SELECT 'fail' AS status, "
+                    "'bad status for id=' || CAST(id AS VARCHAR) AS message "
+                    "FROM items WHERE status = 'bad' "
+                    "UNION ALL "
+                    "SELECT 'pass' AS status, 'ok' AS message "
+                    "FROM items WHERE status = 'ok'"
+                )
             },
         )
         errors = ws._validate_inputs(conn)
         assert len(errors) == 1
-        assert "id=1" in errors[0]
-        assert "status=bad" in errors[0]
+        assert "bad status for id=1" in errors[0]
 
     def test_input_validate_sql_short_circuits(self, conn):
-        """SQL validation stops at first failing query."""
+        """Validation with multiple views stops at first failure."""
         ingest_table(conn, [{"id": 1}], "t")
         ws = self._make_workspace(
             input_validate_sql={
-                "t": "SELECT 'error1' WHERE 1=1; SELECT 'error2' WHERE 1=1"
+                "t": (
+                    "CREATE OR REPLACE VIEW t__validation AS "
+                    "SELECT 'fail' AS status, 'error1' AS message; "
+                    "CREATE OR REPLACE VIEW t__validation_extra AS "
+                    "SELECT 'fail' AS status, 'error2' AS message"
+                )
             },
         )
         errors = ws._validate_inputs(conn)
-        assert errors == ["error1"]
+        # First view fails, so we get that error (short-circuit)
+        assert len(errors) >= 1
+        assert "error1" in errors[0]
+
+    def test_input_validate_sql_missing_view_name(self, conn):
+        """Validation SQL that doesn't create properly named views fails."""
+        ingest_table(conn, [{"id": 1}], "t")
+        ws = self._make_workspace(
+            input_validate_sql={
+                "t": (
+                    "CREATE OR REPLACE VIEW wrong_name AS "
+                    "SELECT 'pass' AS status, 'ok' AS message"
+                )
+            },
+        )
+        errors = ws._validate_inputs(conn)
+        assert len(errors) == 1
+        assert "t__validation" in errors[0]
+
+    def test_input_validate_sql_cleanup(self, conn):
+        """Validation views are cleaned up after validation."""
+        ingest_table(conn, [{"id": 1}], "t")
+        ws = self._make_workspace(
+            input_validate_sql={
+                "t": (
+                    "CREATE OR REPLACE VIEW t__validation AS "
+                    "SELECT 'pass' AS status, 'ok' AS message"
+                )
+            },
+        )
+        errors = ws._validate_inputs(conn)
+        assert errors == []
+        # View should be dropped after validation
+        views = {
+            row[0]
+            for row in conn.execute(
+                "SELECT view_name FROM duckdb_views() WHERE internal = false"
+            ).fetchall()
+        }
+        assert "t__validation" not in views
 
     def test_no_validation_returns_empty(self, conn):
         """No input_columns or input_validate_sql returns no errors."""

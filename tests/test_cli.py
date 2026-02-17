@@ -71,7 +71,7 @@ class TestLoadSpec:
             '    "tbl": {\n'
             '        "source": [{"a": 1, "b": 2}],\n'
             '        "columns": ["a", "b"],\n'
-            '        "validate_sql": "SELECT 1 FROM tbl WHERE a IS NULL",\n'
+            "        \"validate_sql\": \"CREATE OR REPLACE VIEW tbl__validation AS SELECT CASE WHEN COUNT(*) > 0 THEN 'fail' ELSE 'pass' END AS status, 'null a' AS message FROM tbl WHERE a IS NULL\",\n"
             "    }\n"
             "}\n"
             'TASKS = [{"name": "t", '
@@ -82,7 +82,7 @@ class TestLoadSpec:
         result = load_spec_from_module(module_path)
         assert result["input_columns"] == {"tbl": ["a", "b"]}
         assert result["input_validate_sql"] == {
-            "tbl": "SELECT 1 FROM tbl WHERE a IS NULL"
+            "tbl": "CREATE OR REPLACE VIEW tbl__validation AS SELECT CASE WHEN COUNT(*) > 0 THEN 'fail' ELSE 'pass' END AS status, 'null a' AS message FROM tbl WHERE a IS NULL"
         }
         # The actual data is the list, not the dict
         assert result["inputs"]["tbl"] == [{"a": 1, "b": 2}]

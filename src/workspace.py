@@ -48,8 +48,16 @@ from .diff import (
 )
 from .ingest import FileInput, ingest_file, ingest_table
 from .agent import init_trace_table, run_task_agent, run_sql_only_task
-from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
-from .sql_utils import get_column_schema, split_sql_statements
+from .task import (
+    Task,
+    resolve_dag,
+    resolve_task_deps,
+    validate_task_graph,
+    validation_view_prefix,
+    is_validation_view_for_task,
+    validate_one_validation_view,
+)
+from .sql_utils import get_column_schema, split_sql_statements, extract_create_name
 
 log = logging.getLogger(__name__)
 
@@ -281,9 +289,10 @@ class Workspace:
             Maps table_name -> list of required column names.
             Checked after ingestion, before tasks run.
         input_validate_sql: Optional SQL validation for input tables.
-            Maps table_name -> SQL string (semicolon-separated statements).
-            Each statement must return zero rows. Checked after ingestion
-            and input_columns, before tasks run.
+            Maps table_name -> SQL string that creates
+            {input_name}__validation* views with status/message columns.
+            Same contract as task validate_sql. Views are cleaned up
+            after validation. Checked after input_columns, before tasks.
         spec_module: Module path used to load the spec.
     """
 
@@ -343,7 +352,8 @@ class Workspace:
 
         Checks run in order:
         1. input_columns: each declared table has all required columns.
-        2. input_validate_sql: per-input SQL queries must return zero rows.
+        2. input_validate_sql: per-input CREATE VIEW statements producing
+           {input_name}__validation* views with status/message columns.
 
         Returns list of error messages (empty = pass).
         """
@@ -379,30 +389,67 @@ class Workspace:
         if errors:
             return errors
 
-        # 2. Per-input SQL validation checks
+        # 2. Per-input validation views (same contract as task validation)
+        created_views: list[str] = []
         for table_name, validate_sql in self.input_validate_sql.items():
-            sql_checks = split_sql_statements(validate_sql)
-            for sql in sql_checks:
+            stmts = split_sql_statements(validate_sql)
+
+            # Execute all statements (CREATE VIEW etc.)
+            for sql in stmts:
                 try:
-                    cursor = conn.execute(sql)
-                    rows = cursor.fetchall()
+                    conn.execute(sql)
                 except duckdb.Error as e:
-                    errors.append(
-                        f"Input validation query error for '{table_name}': {e}"
-                    )
-                    return errors
-                if rows:
-                    cols = [d[0] for d in cursor.description]
-                    for row in rows:
-                        if len(cols) == 1:
-                            errors.append(str(row[0]))
-                        else:
-                            errors.append(
-                                ", ".join(f"{c}={v}" for c, v in zip(cols, row))
-                            )
+                    errors.append(f"Input validation SQL error for '{table_name}': {e}")
+                    # Clean up any views created so far
+                    self._drop_input_validation_views(conn, created_views)
                     return errors
 
+            # Discover created validation views for this input
+            prefix = validation_view_prefix(table_name)
+            for stmt in stmts:
+                name = extract_create_name(stmt)
+                if name and is_validation_view_for_task(name, table_name):
+                    created_views.append(name)
+
+            if not created_views or not any(
+                is_validation_view_for_task(v, table_name) for v in created_views
+            ):
+                errors.append(
+                    f"Input '{table_name}' validate_sql did not create any "
+                    f"'{prefix}' views."
+                )
+                self._drop_input_validation_views(conn, created_views)
+                return errors
+
+            # Validate the views
+            for view_name in created_views:
+                if not is_validation_view_for_task(view_name, table_name):
+                    continue
+                view_errors, fatal = validate_one_validation_view(conn, view_name)
+                if view_errors:
+                    errors.extend(view_errors)
+                if fatal:
+                    self._drop_input_validation_views(conn, created_views)
+                    return errors
+
+            if errors:
+                self._drop_input_validation_views(conn, created_views)
+                return errors
+
+        # Clean up all input validation views
+        self._drop_input_validation_views(conn, created_views)
         return errors
+
+    @staticmethod
+    def _drop_input_validation_views(
+        conn: duckdb.DuckDBPyConnection, view_names: list[str]
+    ) -> None:
+        """Drop input validation views (cleanup after validation)."""
+        for name in view_names:
+            try:
+                conn.execute(f'DROP VIEW IF EXISTS "{name}"')
+            except duckdb.Error:
+                pass
 
     @staticmethod
     async def _run_task_dag(

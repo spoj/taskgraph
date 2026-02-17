@@ -139,7 +139,15 @@ INPUTS = {
     "invoices": {
         "source": "data/invoices.xlsx#Sheet1",
         "columns": ["id", "amount", "date", "vendor"],
-        "validate_sql": "SELECT 'null amount at id=' || id FROM invoices WHERE amount IS NULL",
+        "validate_sql": """
+            CREATE OR REPLACE VIEW invoices__validation AS
+            SELECT 'fail' AS status,
+                   'null amount at id=' || CAST(id AS VARCHAR) AS message
+            FROM invoices WHERE amount IS NULL
+            UNION ALL
+            SELECT 'pass' AS status, 'ok' AS message
+            WHERE NOT EXISTS (SELECT 1 FROM invoices WHERE amount IS NULL)
+        """,
     },
 }
 ```
@@ -148,7 +156,7 @@ INPUTS = {
 |-----|------|----------|-------------|
 | `source` | callable, raw data, or file path | Yes | Same as simple format, with file path support |
 | `columns` | `list[str]` | No | Required columns. Checked after ingestion, before tasks. Missing columns abort the run. |
-| `validate_sql` | `str` | No | SQL statement(s) that must return 0 rows. Multiple statements separated by `;` are split by DuckDB's parser. Each returned row is an error. Runs after column check. |
+| `validate_sql` | `str` | No | SQL that creates `{input_name}__validation*` views with `status` and `message` columns. Same contract as task `validate_sql`. Views are cleaned up after validation. |
 
 Detection: a dict value with a `"source"` key is treated as rich format. A dict without `"source"` is treated as raw `dict[str, list]` data.
 

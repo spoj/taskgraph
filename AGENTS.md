@@ -44,7 +44,7 @@ INPUTS = {
     "invoices": {
         "source": "data/invoices.xlsx#Sheet1",                   # file path or callable or raw data
         "columns": ["id", "amount", "date"],                     # optional: required columns
-        "validate_sql": "SELECT id FROM invoices WHERE amount IS NULL",  # optional: must return 0 rows
+        "validate_sql": "CREATE OR REPLACE VIEW invoices__validation AS SELECT 'fail' AS status, 'null' AS message FROM invoices WHERE amount IS NULL",  # optional: creates validation views
     },
     "rates": load_rates,  # simple — no validation needed
 }
