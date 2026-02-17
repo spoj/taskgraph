@@ -413,7 +413,7 @@ class TestInputValidation:
         assert "t__validation" in errors[0]
 
     def test_input_validate_sql_cleanup(self, conn):
-        """Validation views are cleaned up after validation."""
+        """Validation views are materialized as tables after passing validation."""
         ingest_table(conn, [{"id": 1}], "t")
         ws = self._make_workspace(
             input_validate_sql={
@@ -425,7 +425,7 @@ class TestInputValidation:
         )
         errors = ws._validate_inputs(conn)
         assert errors == []
-        # View should be dropped after validation
+        # View should be gone (materialized into a table)
         views = {
             row[0]
             for row in conn.execute(
@@ -433,6 +433,92 @@ class TestInputValidation:
             ).fetchall()
         }
         assert "t__validation" not in views
+        # Table should exist with same data
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
+            ).fetchall()
+        }
+        assert "t__validation" in tables
+        row = conn.execute("SELECT status, message FROM t__validation").fetchone()
+        assert row == ("pass", "ok")
+
+    def test_input_validate_sql_preserves_definition(self, conn):
+        """Materialized input validation views have SQL preserved in _view_definitions."""
+        ingest_table(conn, [{"id": 1}], "data")
+        ws = self._make_workspace(
+            input_validate_sql={
+                "data": (
+                    "CREATE OR REPLACE VIEW data__validation AS "
+                    "SELECT 'pass' AS status, 'all good' AS message"
+                )
+            },
+        )
+        errors = ws._validate_inputs(conn)
+        assert errors == []
+        # SQL definition should be stored with input table name as label
+        rows = conn.execute(
+            "SELECT task, view_name, sql FROM _view_definitions"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "data"  # label = input table name
+        assert rows[0][1] == "data__validation"
+        assert "all good" in rows[0][2]
+
+    def test_input_validate_sql_multiple_views_materialized(self, conn):
+        """Multiple input validation views are all materialized."""
+        ingest_table(conn, [{"id": 1}], "t")
+        ws = self._make_workspace(
+            input_validate_sql={
+                "t": (
+                    "CREATE OR REPLACE VIEW t__validation AS "
+                    "SELECT 'pass' AS status, 'ok' AS message; "
+                    "CREATE OR REPLACE VIEW t__validation_extra AS "
+                    "SELECT 'pass' AS status, 'also ok' AS message"
+                )
+            },
+        )
+        errors = ws._validate_inputs(conn)
+        assert errors == []
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
+            ).fetchall()
+        }
+        assert "t__validation" in tables
+        assert "t__validation_extra" in tables
+
+    def test_input_validate_sql_failure_drops_views(self, conn):
+        """On validation failure, views are dropped (not materialized)."""
+        ingest_table(conn, [{"id": 1, "val": -1}], "data")
+        ws = self._make_workspace(
+            input_validate_sql={
+                "data": (
+                    "CREATE OR REPLACE VIEW data__validation AS "
+                    "SELECT 'fail' AS status, 'bad value' AS message "
+                    "FROM data WHERE val < 0"
+                )
+            },
+        )
+        errors = ws._validate_inputs(conn)
+        assert len(errors) == 1
+        # View should be dropped on failure, NOT materialized
+        views = {
+            row[0]
+            for row in conn.execute(
+                "SELECT view_name FROM duckdb_views() WHERE internal = false"
+            ).fetchall()
+        }
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
+            ).fetchall()
+        }
+        assert "data__validation" not in views
+        assert "data__validation" not in tables
 
     def test_no_validation_returns_empty(self, conn):
         """No input_columns or input_validate_sql returns no errors."""

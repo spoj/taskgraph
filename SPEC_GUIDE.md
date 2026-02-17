@@ -156,7 +156,7 @@ INPUTS = {
 |-----|------|----------|-------------|
 | `source` | callable, raw data, or file path | Yes | Same as simple format, with file path support |
 | `columns` | `list[str]` | No | Required columns. Checked after ingestion, before tasks. Missing columns abort the run. |
-| `validate_sql` | `str` | No | SQL that creates `{input_name}__validation*` views with `status` and `message` columns. Same contract as task `validate_sql`. Views are cleaned up after validation. |
+| `validate_sql` | `str` | No | SQL that creates `{input_name}__validation*` views with `status` and `message` columns. Same contract as task `validate_sql`. Passing views are materialized as tables; failing views are dropped. |
 
 Detection: a dict value with a `"source"` key is treated as rich format. A dict without `"source"` is treated as raw `dict[str, list]` data.
 

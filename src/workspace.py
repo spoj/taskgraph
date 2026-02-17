@@ -176,29 +176,8 @@ def upsert_workspace_meta(
 # --- View materialization ---
 
 
-def materialize_task_outputs(
-    conn: duckdb.DuckDBPyConnection,
-    task: Task,
-) -> int:
-    """Materialize a task's declared output views as tables.
-
-    After a task completes and passes validation, its output views and
-    validation views are converted to tables so downstream tasks read
-    pre-computed data instead of re-evaluating the entire upstream view
-    chain on every query.
-
-    The original view SQL definitions are preserved in ``_view_definitions``
-    for lineage and audit queries.
-
-    What gets materialized:
-    - Declared task outputs (``task.outputs``)
-    - Validation views (``{task}__validation*``)
-
-    What stays as views:
-    - Intermediate ``{task}_*`` views (for debuggability)
-
-    Returns the number of views materialized.
-    """
+def _ensure_view_definitions_table(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the _view_definitions table if it doesn't exist."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _view_definitions (
             task VARCHAR NOT NULL,
@@ -208,8 +187,40 @@ def materialize_task_outputs(
         )
     """)
 
-    # Collect all views to materialize: declared outputs + validation views
-    view_names = list(task.outputs) + task.validation_view_names()
+
+def _drop_views(conn: duckdb.DuckDBPyConnection, view_names: list[str]) -> None:
+    """Drop a list of views (best-effort cleanup)."""
+    for name in view_names:
+        try:
+            conn.execute(f'DROP VIEW IF EXISTS "{name}"')
+        except duckdb.Error:
+            pass
+
+
+def materialize_views(
+    conn: duckdb.DuckDBPyConnection,
+    view_names: list[str],
+    label: str,
+) -> int:
+    """Materialize a list of views as tables.
+
+    Core materialization logic shared by task outputs and input validation
+    views. For each view that exists:
+
+    1. Saves the SQL definition to ``_view_definitions`` (keyed by *label*).
+    2. Does a 3-step swap: CREATE TABLE from view, DROP VIEW, RENAME TABLE.
+
+    Args:
+        conn: DuckDB connection.
+        view_names: View names to materialize. Duplicates are ignored.
+            Missing views are silently skipped.
+        label: Label stored in the ``task`` column of ``_view_definitions``
+            (task name for task outputs, input table name for input validation).
+
+    Returns the number of views materialized.
+    """
+    _ensure_view_definitions_table(conn)
+
     # Deduplicate while preserving order
     seen: set[str] = set()
     unique_names: list[str] = []
@@ -235,7 +246,7 @@ def materialize_task_outputs(
             "INSERT INTO _view_definitions (task, view_name, sql) "
             "VALUES (?, ?, ?) "
             "ON CONFLICT (task, view_name) DO UPDATE SET sql = excluded.sql",
-            [task.name, view_name, view_sql],
+            [label, view_name, view_sql],
         )
 
         # Materialize: create table from view, drop view, rename table.
@@ -257,6 +268,33 @@ def materialize_task_outputs(
         materialized += 1
 
     return materialized
+
+
+def materialize_task_outputs(
+    conn: duckdb.DuckDBPyConnection,
+    task: Task,
+) -> int:
+    """Materialize a task's declared output views as tables.
+
+    After a task completes and passes validation, its output views and
+    validation views are converted to tables so downstream tasks read
+    pre-computed data instead of re-evaluating the entire upstream view
+    chain on every query.
+
+    The original view SQL definitions are preserved in ``_view_definitions``
+    for lineage and audit queries.
+
+    What gets materialized:
+    - Declared task outputs (``task.outputs``)
+    - Validation views (``{task}__validation*``)
+
+    What stays as views:
+    - Intermediate ``{task}_*`` views (for debuggability)
+
+    Returns the number of views materialized.
+    """
+    view_names = list(task.outputs) + task.validation_view_names()
+    return materialize_views(conn, view_names, label=task.name)
 
 
 @dataclass
@@ -291,8 +329,9 @@ class Workspace:
         input_validate_sql: Optional SQL validation for input tables.
             Maps table_name -> SQL string that creates
             {input_name}__validation* views with status/message columns.
-            Same contract as task validate_sql. Views are cleaned up
-            after validation. Checked after input_columns, before tasks.
+            Same contract as task validate_sql. Passing views are
+            materialized as tables; failing views are dropped.
+            Checked after input_columns, before tasks.
         spec_module: Module path used to load the spec.
     """
 
@@ -355,6 +394,10 @@ class Workspace:
         2. input_validate_sql: per-input CREATE VIEW statements producing
            {input_name}__validation* views with status/message columns.
 
+        On success, validation views are materialized as tables (same
+        pattern as task validation views) with SQL preserved in
+        ``_view_definitions``. On failure, views are dropped for cleanup.
+
         Returns list of error messages (empty = pass).
         """
         errors: list[str] = []
@@ -390,9 +433,13 @@ class Workspace:
             return errors
 
         # 2. Per-input validation views (same contract as task validation)
-        created_views: list[str] = []
+        # Track views per input for materialization labeling
+        all_created_views: list[str] = []  # flat list for cleanup on error
+        per_input_views: dict[str, list[str]] = {}  # input_name -> view names
+
         for table_name, validate_sql in self.input_validate_sql.items():
             stmts = split_sql_statements(validate_sql)
+            input_views: list[str] = []
 
             # Execute all statements (CREATE VIEW etc.)
             for sql in stmts:
@@ -401,7 +448,7 @@ class Workspace:
                 except duckdb.Error as e:
                     errors.append(f"Input validation SQL error for '{table_name}': {e}")
                     # Clean up any views created so far
-                    self._drop_input_validation_views(conn, created_views)
+                    _drop_views(conn, all_created_views)
                     return errors
 
             # Discover created validation views for this input
@@ -409,47 +456,43 @@ class Workspace:
             for stmt in stmts:
                 name = extract_create_name(stmt)
                 if name and is_validation_view_for_task(name, table_name):
-                    created_views.append(name)
+                    input_views.append(name)
+                    all_created_views.append(name)
 
-            if not created_views or not any(
-                is_validation_view_for_task(v, table_name) for v in created_views
-            ):
+            if not input_views:
                 errors.append(
                     f"Input '{table_name}' validate_sql did not create any "
                     f"'{prefix}' views."
                 )
-                self._drop_input_validation_views(conn, created_views)
+                _drop_views(conn, all_created_views)
                 return errors
 
+            per_input_views[table_name] = input_views
+
             # Validate the views
-            for view_name in created_views:
-                if not is_validation_view_for_task(view_name, table_name):
-                    continue
+            for view_name in input_views:
                 view_errors, fatal = validate_one_validation_view(conn, view_name)
                 if view_errors:
                     errors.extend(view_errors)
                 if fatal:
-                    self._drop_input_validation_views(conn, created_views)
+                    _drop_views(conn, all_created_views)
                     return errors
 
             if errors:
-                self._drop_input_validation_views(conn, created_views)
+                _drop_views(conn, all_created_views)
                 return errors
 
-        # Clean up all input validation views
-        self._drop_input_validation_views(conn, created_views)
-        return errors
+        # All validation passed — materialize input validation views
+        for table_name, view_names in per_input_views.items():
+            n = materialize_views(conn, view_names, label=table_name)
+            if n:
+                log.debug(
+                    "Materialized %d input validation view(s) for '%s'",
+                    n,
+                    table_name,
+                )
 
-    @staticmethod
-    def _drop_input_validation_views(
-        conn: duckdb.DuckDBPyConnection, view_names: list[str]
-    ) -> None:
-        """Drop input validation views (cleanup after validation)."""
-        for name in view_names:
-            try:
-                conn.execute(f'DROP VIEW IF EXISTS "{name}"')
-            except duckdb.Error:
-                pass
+        return errors
 
     @staticmethod
     async def _run_task_dag(
