@@ -162,7 +162,7 @@ NODES = [
 | `name` | `str` | Yes | Table name in DuckDB |
 | `source` | callable, raw data, or file path | Yes | Data source |
 | `columns` | `list[str]` | No | Required columns. Checked after ingestion, before tasks. Missing columns abort the run. |
-| `validate_sql` | `str` | No | SQL that creates `{input_name}__validation*` views with `status` and `message` columns. Same contract as task `validate_sql`. Passing views are materialized as tables; failing views are dropped. |
+| `validate_sql` | `str` | No | SQL that creates `{input_name}__validation*` views with `status` and `message` columns. Same contract as task `validate_sql`. On success, validation views are materialized as tables; on failure, validation views remain as views for debugging. |
 
 Node type is determined by the presence of `source` vs `sql`/`prompt` keys.
 
@@ -215,6 +215,10 @@ Task nodes are part of the same `NODES` list. Each task has exactly one transfor
 All views created by a task must be namespaced as `{name}_*` (underscore required — bare `{name}` is NOT a valid view name).
 
 Validation is optional and deterministic via `validate_sql`, which runs after the transform to create `{task_name}__validation*` views. Validation views are not listed in `output_columns`.
+
+Taskgraph treats `validate_sql` as a definition step: it runs once per node (after required outputs exist) to create `{name}__validation*` views, then re-evaluates those views on subsequent validation attempts.
+
+If `validate_sql` must be retried due to an execution error, Taskgraph clears any existing `{name}__validation*` views first so plain `CREATE VIEW ...__validation AS ...` is safe (you do not need to remember `OR REPLACE`).
 
 ```python
 NODES = [

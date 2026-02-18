@@ -264,6 +264,14 @@ class Node:
     # Validation SQL (all node types)
     validate_sql: str = ""
 
+    # Runtime-only state (not part of spec contract)
+    _validation_sql_ready: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
     def node_type(self) -> str:
         """Return ``'source'``, ``'sql'``, or ``'prompt'``."""
         if self.source is not _NO_SOURCE:

@@ -15,7 +15,7 @@ import uuid
 from typing import Any, cast
 from .agent_loop import run_agent_loop, AgentResult, DEFAULT_MAX_ITERATIONS
 from .api import OpenRouterClient, create_model_callable, DEFAULT_MODEL
-from .catalog import list_tables
+from .catalog import list_tables, list_views
 from .infra import log_trace, persist_node_meta, ensure_trace as init_trace_table
 from .namespace import Namespace
 from .task import Node
@@ -535,6 +535,27 @@ def run_validate_sql(
 
     vns = Namespace.for_validation(node)
 
+    # Idempotency: validate_sql is frequently executed multiple times within a
+    # single node run (agent-loop validation retries + workspace post-check).
+    # To avoid leaking "CREATE OR REPLACE" requirements into specs, we clear
+    # any prior {name}__validation* views before running validate_sql.
+    base = f"{node.name}__validation"
+    prefix = base + "_"
+    existing = [
+        v
+        for v in list_views(conn, exclude_prefixes=())
+        if v == base or v.startswith(prefix)
+    ]
+    for view_name in existing:
+        execute_sql(
+            conn,
+            f'DROP VIEW IF EXISTS "{view_name}"',
+            namespace=vns,
+            node_name=node.name,
+            ddl_only=True,
+            source="node_validation",
+        )
+
     for q in statements:
         result = execute_sql(
             conn,
@@ -559,9 +580,13 @@ def validate_node_complete(
     if errors:
         return errors
     if node.has_validation():
-        errors = run_validate_sql(conn=conn, node=node)
-        if errors:
-            return errors
+        # validate_sql defines views; once created successfully, we can re-evaluate
+        # them without re-running the DDL on every validation attempt.
+        if not node._validation_sql_ready:
+            errors = run_validate_sql(conn=conn, node=node)
+            if errors:
+                return errors
+            node._validation_sql_ready = True
         errors = node.validate_validation_views(conn)
         if errors:
             return errors
