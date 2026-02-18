@@ -3,7 +3,7 @@ import json
 import duckdb
 import pytest
 
-from tests.conftest import _make_task
+from tests.conftest import _make_node
 from src.agent import (
     build_transform_prompt,
     execute_sql,
@@ -247,23 +247,23 @@ class TestNamespaceEnforcement:
 
     def test_execute_sql_logs_trace(self, conn):
         """execute_sql() logs to _trace table."""
-        execute_sql(conn, "SELECT 42", task_name="test_task", query_timeout_s=0)
+        execute_sql(conn, "SELECT 42", node_name="test_task", query_timeout_s=0)
         rows = conn.execute(
-            "SELECT task, success FROM _trace WHERE task = 'test_task'"
+            "SELECT node, success FROM _trace WHERE node = 'test_task'"
         ).fetchall()
         assert len(rows) == 1
         assert rows[0] == ("test_task", True)
 
     def test_execute_sql_logs_source(self, conn):
         """execute_sql() records the source column in _trace."""
-        execute_sql(conn, "SELECT 1", task_name="t", query_timeout_s=0, source="agent")
-        rows = conn.execute("SELECT source FROM _trace WHERE task = 't'").fetchall()
+        execute_sql(conn, "SELECT 1", node_name="t", query_timeout_s=0, source="agent")
+        rows = conn.execute("SELECT source FROM _trace WHERE node = 't'").fetchall()
         assert rows == [("agent",)]
 
     def test_execute_sql_source_none_by_default(self, conn):
         """source defaults to NULL when not provided."""
-        execute_sql(conn, "SELECT 1", task_name="t", query_timeout_s=0)
-        rows = conn.execute("SELECT source FROM _trace WHERE task = 't'").fetchall()
+        execute_sql(conn, "SELECT 1", node_name="t", query_timeout_s=0)
+        rows = conn.execute("SELECT source FROM _trace WHERE node = 't'").fetchall()
         assert rows == [(None,)]
 
     def test_execute_sql_logs_error_trace(self, conn):
@@ -271,11 +271,11 @@ class TestNamespaceEnforcement:
         execute_sql(
             conn,
             "CREATE TABLE bad (id INT)",
-            task_name="test_task",
+            node_name="test_task",
             query_timeout_s=0,
         )
         rows = conn.execute(
-            "SELECT task, success, error FROM _trace WHERE task = 'test_task'"
+            "SELECT node, success, error FROM _trace WHERE node = 'test_task'"
         ).fetchall()
         assert len(rows) == 1
         assert rows[0][1] is False  # success = False
@@ -331,11 +331,11 @@ class TestQueryTimeout:
         execute_sql(
             conn,
             "SELECT COUNT(*) FROM range(100000000) a, range(100000) b",
-            task_name="timeout_test",
+            node_name="timeout_test",
             query_timeout_s=1,
         )
         rows = conn.execute(
-            "SELECT success, error FROM _trace WHERE task = 'timeout_test'"
+            "SELECT success, error FROM _trace WHERE node = 'timeout_test'"
         ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] is False
@@ -459,17 +459,17 @@ class TestIsAnthropicModel:
         assert _is_anthropic_model("Anthropic/Claude-Opus-4.5") is True
 
 
-class TestPersistTaskMeta:
-    """Tests for persist_task_meta: per-task metadata persistence."""
+class TestPersistNodeMeta:
+    """Tests for persist_node_meta: per-node metadata persistence."""
 
     def test_basic_write_and_read(self, conn):
         """Writes metadata and reads it back."""
-        from src.agent import persist_task_meta
+        from src.agent import persist_node_meta
 
-        persist_task_meta(conn, "task1", {"model": "gpt-5", "iterations": 3})
+        persist_node_meta(conn, "task1", {"model": "gpt-5", "iterations": 3})
 
         row = conn.execute(
-            "SELECT meta_json FROM _task_meta WHERE task = 'task1'"
+            "SELECT meta_json FROM _node_meta WHERE node = 'task1'"
         ).fetchone()
         assert row is not None
         meta = json.loads(row[0])
@@ -478,13 +478,13 @@ class TestPersistTaskMeta:
 
     def test_overwrites_previous(self, conn):
         """Writing meta for the same task overwrites previous values."""
-        from src.agent import persist_task_meta
+        from src.agent import persist_node_meta
 
-        persist_task_meta(conn, "task1", {"v": 1})
-        persist_task_meta(conn, "task1", {"v": 2, "extra": "new"})
+        persist_node_meta(conn, "task1", {"v": 1})
+        persist_node_meta(conn, "task1", {"v": 2, "extra": "new"})
 
         row = conn.execute(
-            "SELECT meta_json FROM _task_meta WHERE task = 'task1'"
+            "SELECT meta_json FROM _node_meta WHERE node = 'task1'"
         ).fetchone()
         assert row is not None
         meta = json.loads(row[0])
@@ -492,18 +492,18 @@ class TestPersistTaskMeta:
         assert meta["extra"] == "new"
         assert set(meta.keys()) == {"v", "extra"}
 
-    def test_multiple_tasks_isolated(self, conn):
-        """Different tasks have independent metadata."""
-        from src.agent import persist_task_meta
+    def test_multiple_nodes_isolated(self, conn):
+        """Different nodes have independent metadata."""
+        from src.agent import persist_node_meta
 
-        persist_task_meta(conn, "a", {"x": 1})
-        persist_task_meta(conn, "b", {"x": 2})
+        persist_node_meta(conn, "a", {"x": 1})
+        persist_node_meta(conn, "b", {"x": 2})
 
         a_row = conn.execute(
-            "SELECT meta_json FROM _task_meta WHERE task = 'a'"
+            "SELECT meta_json FROM _node_meta WHERE node = 'a'"
         ).fetchone()
         b_row = conn.execute(
-            "SELECT meta_json FROM _task_meta WHERE task = 'b'"
+            "SELECT meta_json FROM _node_meta WHERE node = 'b'"
         ).fetchone()
         assert a_row is not None
         assert b_row is not None
@@ -512,12 +512,12 @@ class TestPersistTaskMeta:
 
     def test_json_serialization(self, conn):
         """Complex values are JSON-serialized."""
-        from src.agent import persist_task_meta
+        from src.agent import persist_node_meta
 
-        persist_task_meta(conn, "t", {"list_val": [1, 2, 3], "dict_val": {"a": "b"}})
+        persist_node_meta(conn, "t", {"list_val": [1, 2, 3], "dict_val": {"a": "b"}})
 
         row = conn.execute(
-            "SELECT meta_json FROM _task_meta WHERE task = 't'"
+            "SELECT meta_json FROM _node_meta WHERE node = 't'"
         ).fetchone()
         assert row is not None
         meta = json.loads(row[0])
@@ -526,12 +526,12 @@ class TestPersistTaskMeta:
 
     def test_creates_table_if_not_exists(self):
         """Works on a fresh connection without pre-existing table."""
-        from src.agent import persist_task_meta
+        from src.agent import persist_node_meta
 
         fresh_conn = duckdb.connect(":memory:")
-        persist_task_meta(fresh_conn, "t", {"k": "v"})
+        persist_node_meta(fresh_conn, "t", {"k": "v"})
 
-        rows = fresh_conn.execute("SELECT * FROM _task_meta").fetchall()
+        rows = fresh_conn.execute("SELECT * FROM _node_meta").fetchall()
         assert len(rows) == 1
         fresh_conn.close()
 
@@ -639,121 +639,120 @@ class TestTransformPrompt:
     """Tests for build_transform_prompt — the user message sent to the transform agent."""
 
     def test_basic_structure(self):
-        """Transform prompt has TASK, PROMPT, INPUTS, REQUIRED OUTPUTS, ALLOWED VIEWS."""
-        task = _make_task(
+        """Transform prompt has TASK, PROMPT, REQUIRED OUTPUTS, ALLOWED VIEWS."""
+        node = _make_node(
             name="match",
-            inputs=["data"],
-            outputs=["output"],
             prompt="Match records into an output view.",
+            output_columns={"match_output": ["id"]},
         )
-        msg = build_transform_prompt(task)
-        assert "TASK: match" in msg
+        msg = build_transform_prompt(node)
+        assert "NODE: match" in msg
         assert "PROMPT:" in msg
         assert "Match records" in msg
-        assert "INPUTS:" in msg
-        assert "data" in msg
         assert "REQUIRED OUTPUTS:" in msg
-        assert "- output" in msg
-        assert "ALLOWED VIEWS: output or match_*" in msg
+        assert "- match_output: id" in msg
+        assert "ALLOWED VIEWS: match_*" in msg
 
     def test_output_columns_shown(self):
         """Required columns are listed next to their output views."""
-        task = _make_task(
+        node = _make_node(
             name="t",
-            outputs=["result"],
-            output_columns={"result": ["id", "score"]},
+            output_columns={"t_result": ["id", "score"]},
             prompt="Create result view",
         )
-        msg = build_transform_prompt(task)
-        assert "- result: id, score" in msg
+        msg = build_transform_prompt(node)
+        assert "- t_result: id, score" in msg
 
 
 class TestNamespace:
     """Tests for the Namespace class — factory methods, check_name, edge cases."""
 
-    def test_for_task_allows_declared_outputs(self):
-        """for_task() allows creating declared output views."""
-        task = _make_task(name="match", outputs=["result", "summary"])
-        ns = Namespace.for_task(task)
-        assert ns.is_name_allowed("result")
-        assert ns.is_name_allowed("summary")
+    def test_for_node_allows_prefixed_views(self):
+        """for_node() allows creating {name}_* views."""
+        node = _make_node(name="prep")
+        ns = Namespace.for_node(node)
+        assert ns.is_name_allowed("prep_clean")
+        assert ns.is_name_allowed("prep_output")
+        assert not ns.is_name_allowed("prep")  # bare name NOT allowed
+        assert not ns.is_name_allowed("other_thing")
 
-    def test_for_task_allows_prefixed_intermediates(self):
-        """for_task() allows creating {task_name}_* intermediates."""
-        task = _make_task(name="match", outputs=["result"])
-        ns = Namespace.for_task(task)
-        assert ns.is_name_allowed("match_temp")
-        assert ns.is_name_allowed("match_staging")
-
-    def test_for_task_blocks_validation_views(self):
-        """for_task() blocks validation views via forbidden check."""
-        task = _make_task(name="match", outputs=["result"])
-        ns = Namespace.for_task(task)
+    def test_for_node_blocks_validation_views(self):
+        """for_node() blocks validation views via forbidden check."""
+        node = _make_node(name="match")
+        ns = Namespace.for_node(node)
         ok, err = ns.check_name("match__validation", "view", "create")
         assert not ok
         assert "Validation views" in err
 
-    def test_for_task_blocks_validation_prefixed(self):
-        """for_task() blocks validation-prefixed views."""
-        task = _make_task(name="match", outputs=["result"])
-        ns = Namespace.for_task(task)
+    def test_for_node_blocks_validation_prefixed(self):
+        """for_node() blocks validation-prefixed views."""
+        node = _make_node(name="match")
+        ns = Namespace.for_node(node)
         ok, err = ns.check_name("match__validation_extra", "view", "create")
         assert not ok
         assert "Validation views" in err
 
-    def test_for_task_blocks_unrelated_names(self):
-        """for_task() blocks names outside outputs and prefix."""
-        task = _make_task(name="match", outputs=["result"])
-        ns = Namespace.for_task(task)
+    def test_for_node_blocks_unrelated_names(self):
+        """for_node() blocks any name not matching {name}_*."""
+        node = _make_node(name="match")
+        ns = Namespace.for_node(node)
         ok, err = ns.check_name("other_view", "view", "create")
         assert not ok
         assert "other_view" in err
 
+    def test_for_node_blocks_bare_name(self):
+        """for_node() blocks the bare node name (not prefixed)."""
+        node = _make_node(name="match")
+        ns = Namespace.for_node(node)
+        ok, err = ns.check_name("match", "view", "create")
+        assert not ok
+        assert "match" in err
+
     def test_for_validation_allows_base_name(self):
-        """for_validation() allows {task}__validation."""
-        task = _make_task(name="match", outputs=["result"])
-        ns = Namespace.for_validation(task)
+        """for_validation() allows {node}__validation."""
+        node = _make_node(name="match")
+        ns = Namespace.for_validation(node)
         assert ns.is_name_allowed("match__validation")
 
     def test_for_validation_allows_prefixed(self):
-        """for_validation() allows {task}__validation_* names."""
-        task = _make_task(name="match", outputs=["result"])
-        ns = Namespace.for_validation(task)
+        """for_validation() allows {node}__validation_* names."""
+        node = _make_node(name="match")
+        ns = Namespace.for_validation(node)
         assert ns.is_name_allowed("match__validation_extra")
         assert ns.is_name_allowed("match__validation_nulls")
 
-    def test_for_validation_blocks_task_outputs(self):
-        """for_validation() blocks task outputs."""
-        task = _make_task(name="match", outputs=["result"])
-        ns = Namespace.for_validation(task)
-        assert not ns.is_name_allowed("result")
+    def test_for_validation_blocks_node_outputs(self):
+        """for_validation() blocks node-prefixed views."""
+        node = _make_node(name="match")
+        ns = Namespace.for_validation(node)
+        assert not ns.is_name_allowed("match_result")
 
     def test_for_input_allows_base_name(self):
-        """for_input() allows {input}__validation."""
-        ns = Namespace.for_input("invoices")
+        """for_source_validation() allows {input}__validation."""
+        ns = Namespace.for_source_validation("invoices")
         assert ns.is_name_allowed("invoices__validation")
 
     def test_for_input_allows_prefixed(self):
-        """for_input() allows {input}__validation_* names."""
-        ns = Namespace.for_input("invoices")
+        """for_source_validation() allows {input}__validation_* names."""
+        ns = Namespace.for_source_validation("invoices")
         assert ns.is_name_allowed("invoices__validation_amounts")
 
     def test_for_input_blocks_unrelated(self):
-        """for_input() blocks names outside its validation prefix."""
-        ns = Namespace.for_input("invoices")
+        """for_source_validation() blocks names outside its validation prefix."""
+        ns = Namespace.for_source_validation("invoices")
         assert not ns.is_name_allowed("invoices")
         assert not ns.is_name_allowed("other__validation")
 
     def test_check_name_none_blocked(self):
         """check_name(None) is always blocked (tightened GAP 7)."""
-        ns = Namespace.for_input("invoices")
+        ns = Namespace.for_source_validation("invoices")
         ok, err = ns.check_name(None, "view", "create")
         assert not ok
         assert "Could not extract" in err
 
     def test_check_name_returns_ok_for_valid(self):
         """check_name returns (True, '') for valid names."""
-        ns = Namespace.for_input("invoices")
+        ns = Namespace.for_source_validation("invoices")
         ok, err = ns.check_name("invoices__validation", "view", "create")
         assert ok
         assert err == ""

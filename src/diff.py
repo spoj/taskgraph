@@ -1,7 +1,7 @@
 """View catalog diffing for change reporting.
 
 Captures before/after snapshots of DuckDB view definitions and produces
-structured diffs showing what each task changed: new views, dropped views,
+structured diffs showing what each node changed: new views, dropped views,
 and modified view SQL definitions.
 
 The diff operates on SQL definitions stored in duckdb_views(), not on data.
@@ -199,8 +199,8 @@ def _fmt_rows(count: int) -> str:
     return f"{count} row{'s' if count != 1 else ''}"
 
 
-def format_changes(task_name: str, changes: list[ViewChange]) -> str:
-    """Format task changes for terminal display.
+def format_changes(node_name: str, changes: list[ViewChange]) -> str:
+    """Format node changes for terminal display.
 
     Returns a multi-line string ready for click.echo(). Returns empty
     string if there are no changes.
@@ -209,7 +209,7 @@ def format_changes(task_name: str, changes: list[ViewChange]) -> str:
         return ""
 
     lines: list[str] = []
-    lines.append(f"  {task_name}:")
+    lines.append(f"  {node_name}:")
 
     for c in changes:
         if c.kind == "created":
@@ -258,17 +258,17 @@ def format_changes(task_name: str, changes: list[ViewChange]) -> str:
     return "\n".join(lines)
 
 
-def format_all_changes(task_changes: list[tuple[str, list[ViewChange]]]) -> str:
-    """Format changes for all tasks into a single terminal block.
+def format_all_changes(node_changes: list[tuple[str, list[ViewChange]]]) -> str:
+    """Format changes for all nodes into a single terminal block.
 
     Args:
-        task_changes: List of (task_name, changes) pairs in execution order.
+        node_changes: List of (node_name, changes) pairs in execution order.
 
     Returns formatted string, or empty string if no changes anywhere.
     """
     sections: list[str] = []
-    for task_name, changes in task_changes:
-        section = format_changes(task_name, changes)
+    for node_name, changes in node_changes:
+        section = format_changes(node_name, changes)
         if section:
             sections.append(section)
 
@@ -280,13 +280,13 @@ def format_all_changes(task_changes: list[tuple[str, list[ViewChange]]]) -> str:
 
 def persist_changes(
     conn: duckdb.DuckDBPyConnection,
-    task_name: str,
+    node_name: str,
     changes: list[ViewChange],
 ) -> None:
     """Write view changes to the _changes table in the output database."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _changes (
-            task        VARCHAR,
+            node        VARCHAR,
             view_name   VARCHAR,
             kind        VARCHAR,
             sql_before  VARCHAR,
@@ -305,7 +305,7 @@ def persist_changes(
     for c in changes:
         rows.append(
             (
-                task_name,
+                node_name,
                 c.view_name,
                 c.kind,
                 c.sql_before,

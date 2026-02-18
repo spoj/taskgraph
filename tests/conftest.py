@@ -9,7 +9,7 @@ import duckdb
 import pytest
 
 from src.agent import init_trace_table
-from src.task import Task
+from src.task import Node
 
 
 @pytest.fixture
@@ -21,18 +21,14 @@ def conn():
     c.close()
 
 
-def _make_task(**kwargs) -> Task:
-    """Helper to create a Task with defaults."""
+def _make_node(**kwargs) -> Node:
+    """Helper to create a Node with defaults."""
     defaults = {
         "name": "t",
-        "prompt": "test",
-        "inputs": [],
-        "outputs": [],
+        "sql": "SELECT 1",
     }
-    if "sql" in kwargs and "prompt" not in kwargs:
-        defaults["prompt"] = ""
     defaults.update(kwargs)
-    return Task(**defaults)
+    return Node(**defaults)
 
 
 def _write_spec_module(tmp_path: Path, source: str) -> str:

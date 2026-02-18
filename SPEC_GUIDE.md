@@ -3,8 +3,7 @@
 This guide targets people writing **workspace specs**: Python modules (usually shipped inside your own package) that call Taskgraph.
 
 A spec defines:
-- `INPUTS`: how to ingest data into DuckDB tables
-- `TASKS`: a DAG of tasks; each task runs via `sql` (deterministic SQL) or `prompt` (LLM transform) and produces one or more SQL views
+- `NODES`: a list of nodes — each either an **input node** (has `source`) or a **task node** (has `sql` or `prompt`). Input nodes are ingested into DuckDB tables; task nodes form a DAG and produce SQL views.
 - `EXPORTS` (optional): functions that export files from the final workspace
 
 Specs are imported as modules (e.g. `my_app.specs.main`). File paths are accepted by the CLI and auto-resolved to module paths.
@@ -74,24 +73,20 @@ def load_invoices() -> pl.DataFrame:
 def load_payments() -> pl.DataFrame:
     return pl.read_csv("data/payments.csv")
 
-INPUTS = {
-    "invoices": load_invoices,
-    "payments": load_payments,
-}
-
-TASKS = [
+NODES = [
+    {"name": "invoices", "source": load_invoices},
+    {"name": "payments", "source": load_payments},
     {
         "name": "match",
+        "depends_on": ["invoices", "payments"],
         "prompt": (
-            "Match invoices to payments. Create view 'matches' with columns:\n"
+            "Match invoices to payments. Create view 'match_results' with columns:\n"
             "- invoice_row_id: invoices._row_id\n"
             "- payment_row_id: payments._row_id\n"
             "- match_reason: brief explanation\n"
             "One invoice matches at most one payment; leave unmatched invoices out."
         ),
-        "inputs": ["invoices", "payments"],
-        "outputs": ["matches"],
-        "output_columns": {"matches": ["invoice_row_id", "payment_row_id", "match_reason"]},
+        "output_columns": {"match_results": ["invoice_row_id", "payment_row_id", "match_reason"]},
         "validate_sql": """
             CREATE OR REPLACE VIEW match__validation AS
             SELECT 'pass' AS status, 'ok' AS message
@@ -108,21 +103,30 @@ uv run taskgraph run --spec my_app.specs.main
 
 ---
 
-## INPUTS
+## NODES
 
-`INPUTS` is a dict mapping **table names** to data sources. Each key becomes a DuckDB table before any tasks run.
+`NODES` is a list of node dicts. Each node has a `name` and is either an **input node** (has `source`) or a **task node** (has `sql` or `prompt`).
 
-### Simple format
+Node discrimination:
+- Has `"source"` key → input node (ingested as a DuckDB table)
+- Has `"sql"` or `"prompt"` → task node (produces SQL views)
+- A node cannot have both `source` and `sql`/`prompt`.
 
-The value is a callable (called at ingest time), raw data, or a file path.
+---
+
+## Input Nodes
+
+An input node has `name` and `source`. Each becomes a DuckDB table before any tasks run.
+
+### Simple input nodes
 
 ```python
-INPUTS = {
-    "sales": load_sales,                           # callable -> DataFrame
-    "rates": [{"ccy": "USD", "rate": 1.0}, ...],  # list[dict]
-    "config": {"key": ["a", "b"], "val": [1, 2]}, # dict[str, list]
-    "events": "data/events.parquet",              # file path (extension-based)
-}
+NODES = [
+    {"name": "sales", "source": load_sales},                           # callable -> DataFrame
+    {"name": "rates", "source": [{"ccy": "USD", "rate": 1.0}, ...]},  # list[dict]
+    {"name": "config", "source": {"key": ["a", "b"], "val": [1, 2]}}, # dict[str, list]
+    {"name": "events", "source": "data/events.parquet"},               # file path (extension-based)
+]
 ```
 
 Accepted return types from callables:
@@ -130,13 +134,14 @@ Accepted return types from callables:
 - `list[dict]` — array of structs, each dict is a row
 - `dict[str, list]` — struct of arrays, each key is a column
 
-### Rich format
+### Input nodes with validation
 
-The value is a dict with a `"source"` key plus optional validation.
+Input nodes can include optional `columns` and `validate_sql` fields:
 
 ```python
-INPUTS = {
-    "invoices": {
+NODES = [
+    {
+        "name": "invoices",
         "source": "data/invoices.xlsx#Sheet1",
         "columns": ["id", "amount", "date", "vendor"],
         "validate_sql": """
@@ -149,16 +154,17 @@ INPUTS = {
             WHERE NOT EXISTS (SELECT 1 FROM invoices WHERE amount IS NULL)
         """,
     },
-}
+]
 ```
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `source` | callable, raw data, or file path | Yes | Same as simple format, with file path support |
+| `name` | `str` | Yes | Table name in DuckDB |
+| `source` | callable, raw data, or file path | Yes | Data source |
 | `columns` | `list[str]` | No | Required columns. Checked after ingestion, before tasks. Missing columns abort the run. |
 | `validate_sql` | `str` | No | SQL that creates `{input_name}__validation*` views with `status` and `message` columns. Same contract as task `validate_sql`. Passing views are materialized as tables; failing views are dropped. |
 
-Detection: a dict value with a `"source"` key is treated as rich format. A dict without `"source"` is treated as raw `dict[str, list]` data.
+Node type is determined by the presence of `source` vs `sql`/`prompt` keys.
 
 ### File paths
 
@@ -200,23 +206,26 @@ def load_data():
 
 ---
 
-## TASKS
+## Task Nodes
 
-A list of task definitions. Each task has exactly one transform mode:
+Task nodes are part of the same `NODES` list. Each task has exactly one transform mode:
 - `sql`: deterministic SQL statements executed directly (views/macros only).
 - `prompt`: LLM-driven transform. The agent writes SQL views/macros.
 
-Validation is optional and deterministic via `validate_sql`, which runs after the transform to create `{task_name}__validation*` views. Validation views are not listed in `outputs`.
+All views created by a task must be namespaced as `{name}_*` (underscore required — bare `{name}` is NOT a valid view name).
+
+Validation is optional and deterministic via `validate_sql`, which runs after the transform to create `{task_name}__validation*` views. Validation views are not listed in `output_columns`.
 
 ```python
-TASKS = [
+NODES = [
+    {"name": "invoices", "source": load_invoices},
+    {"name": "payments", "source": load_payments},
     {
         "name": "match",
+        "depends_on": ["invoices", "payments"],
         "prompt": "...",
-        "inputs": ["invoices", "payments"],
-        "outputs": ["matches"],
         "output_columns": {
-            "matches": ["invoice_row_id", "payment_row_id", "match_reason"],
+            "match_results": ["invoice_row_id", "payment_row_id", "match_reason"],
         },
         "validate_sql": """
             CREATE OR REPLACE VIEW match__validation AS
@@ -225,31 +234,29 @@ TASKS = [
     },
     {
         "name": "summary",
-        "sql": "CREATE OR REPLACE VIEW match_summary AS SELECT ...",
-        "inputs": ["matches"],
-        "outputs": ["match_summary"],
+        "depends_on": ["match"],
+        "sql": "CREATE OR REPLACE VIEW summary_report AS SELECT ...",
     },
 ]
 ```
 
-### Task fields
+### Task node fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | `str` | Yes | Unique identifier. Also the namespace prefix for intermediate views. |
+| `name` | `str` | Yes | Unique identifier. Also the namespace prefix — all views must be named `{name}_*`. |
 | `sql` | `str` | Exactly one of `sql` or `prompt` | Deterministic statements executed directly (views/macros only). Multiple statements are allowed in one string and will be split by DuckDB's parser. |
 | `prompt` | `str` | Exactly one of `sql` or `prompt` | Objective text for LLM-driven transforms. |
-| `validate_sql` | `str` | No | Deterministic SQL that creates `{task}__validation*` views. Runs after the transform. |
-| `inputs` | `list[str]` | Yes | Tables/views this task reads. Can be ingested tables or outputs of other tasks. |
-| `outputs` | `list[str]` | Yes | Views the task must create. Validation checks these exist. |
-| `output_columns` | `dict[str, list[str]]` | No | Required columns per output view. Checks names only, not types. Extra columns are fine. |
+| `validate_sql` | `str` | No | Deterministic SQL that creates `{name}__validation*` views. Runs after the transform. |
+| `depends_on` | `list[str]` | No | Node names (input or task) that must complete before this task runs. Used for DAG scheduling. |
+| `output_columns` | `dict[str, list[str]]` | No | Required views and their columns. Keys must start with `{name}_`. Checks names only, not types. Extra columns are fine. |
 
-### Naming and dependencies
+### Dependencies
 
-- A task may read any ingested table.
-- A task may also read other tasks' outputs by listing those output view names in `inputs`.
-- If an input name matches a prior task's output, Taskgraph wires the dependency automatically.
-- Two tasks may not declare the same output view name.
+- `depends_on` lists input node names and/or task node names.
+- If a dependency is an input node, the input is ingested before the task runs.
+- If a dependency is another task node, that task must complete first.
+- Circular dependencies are detected and raise an error.
 
 ### Compensation over upstream rewrites
 
@@ -268,10 +275,10 @@ The agent receives:
 2. A user message containing:
    - The task name
    - Your `prompt` text
-   - Input tables with schemas
-   - Required output view names (with expected columns, if declared)
+   - Input tables with schemas (from `depends_on` references)
+   - Required output views (with expected columns, if declared via `output_columns`)
    - `validate_sql` (if provided)
-   - Naming rules: the agent can create views/macros named either as declared outputs or prefixed with `{task_name}_` (e.g., task `match` can create `match_step1`, `match_candidates`, etc.)
+   - Naming rules: the agent can create views/macros named `{name}_*` (e.g., node `match` can create `match_step1`, `match_candidates`, etc.)
     
    If validation fails, the agent receives validation feedback and can retry within the iteration budget (default 200).
 
@@ -314,14 +321,15 @@ The agent is told about these DuckDB features in its system prompt:
 
 ### Namespace and intermediate views
 
-A task named `"match"` with `outputs: ["output"]` can create:
-- `output` — the required output view
-- `match_step1`, `match_candidates`, `match_scored`, etc. — any view prefixed with `match_`
+All views created by a task must be namespaced as `{name}_*` (underscore required). A task named `"match"` can create:
+- `match_results`, `match_scored`, `match_candidates`, etc. — any view prefixed with `match_`
 - `match_clean`, `match_normalize`, etc. — any macro prefixed with `match_`
+
+If `output_columns` declares `{"match_results": [...]}`, then `match_results` is the required output view.
 
 This allows the agent to build a chain of views:
 ```
-match_legs → match_candidates → match_scored → match_pass1 → output
+match_legs → match_candidates → match_scored → match_pass1 → match_results
 ```
 
 Views are late-binding in DuckDB — updating `match_legs` automatically propagates through the chain. The agent can iterate on upstream logic without recreating downstream views.
@@ -334,7 +342,7 @@ Validation runs automatically after the transform. There are three checks, in or
 
 ### 1. Output view existence
 
-Each view listed in `outputs` must exist. If not: `"Required output view 'X' was not created."`
+Each view declared as a key in `output_columns` must exist. If not: `"Required output view 'X' was not created."`
 
 ### 2. Output column check
 
@@ -345,12 +353,12 @@ View 'output' is missing required column(s): left_ids. Actual columns: category,
 
 ### 3. Validation SQL
 
-Task validation is expressed by `validate_sql`, which runs after the transform and creates one or more views named `{task_name}__validation` and/or `{task_name}__validation_*`.
+Task validation is expressed by `validate_sql`, which runs after the transform and creates one or more views named `{name}__validation` and/or `{name}__validation_*`.
 
 Contract:
 - The view must have columns `status` and `message`.
 - `status` must be one of: `pass`, `warn`, `fail` (case-insensitive).
-- If the view contains any row with `status='fail'`, the task fails.
+- If the view contains any row with `status='fail'`, the node fails.
 
 Recommended pattern:
 
@@ -372,7 +380,7 @@ WHERE NOT EXISTS (
 );
 ```
 
-`warn` rows are informational and shown by the CLI; only `fail` rows block the task.
+`warn` rows are informational and shown by the CLI; only `fail` rows block the node.
 You can optionally add helper columns (not required by the harness), such as `evidence_view` to point reviewers to a drill-down view.
 
 ---
@@ -444,52 +452,44 @@ Export function exceptions are caught — they don't crash the run. Errors are s
 
 ---
 
-## DAG: Multi-Task Specs
+## DAG: Multi-Node Specs
 
-Tasks form a directed acyclic graph based on input/output overlap. Tasks in the same layer run concurrently (their LLM API calls overlap).
+Nodes form a directed acyclic graph based on explicit `depends_on` edges. Nodes whose dependencies have all completed run concurrently (their LLM API calls overlap).
 
 ```python
-INPUTS = {
-    "raw_sales": load_sales,
-    "raw_costs": load_costs,
-}
-
-TASKS = [
+NODES = [
+    {"name": "raw_sales", "source": load_sales},
+    {"name": "raw_costs", "source": load_costs},
     {
         "name": "clean_sales",
-        "sql": "CREATE OR REPLACE VIEW sales AS SELECT ...",
-        "inputs": ["raw_sales"],
-        "outputs": ["sales"],
+        "depends_on": ["raw_sales"],
+        "sql": "CREATE OR REPLACE VIEW clean_sales_output AS SELECT ...",
     },
     {
         "name": "clean_costs",
-        "sql": "CREATE OR REPLACE VIEW costs AS SELECT ...",
-        "inputs": ["raw_costs"],
-        "outputs": ["costs"],
+        "depends_on": ["raw_costs"],
+        "sql": "CREATE OR REPLACE VIEW clean_costs_output AS SELECT ...",
     },
     {
         "name": "reconcile",
-        "sql": "CREATE OR REPLACE VIEW output AS SELECT ...",
-        "inputs": ["sales", "costs"],
-        "outputs": ["output"],
+        "depends_on": ["clean_sales", "clean_costs"],
+        "sql": "CREATE OR REPLACE VIEW reconcile_output AS SELECT ...",
     },
 ]
 ```
 
 This produces two layers:
-- Layer 1: `clean_sales` and `clean_costs` (run concurrently — both only depend on base tables)
-- Layer 2: `reconcile` (depends on outputs from layer 1)
+- Layer 1: `clean_sales` and `clean_costs` (run concurrently — both only depend on input nodes)
+- Layer 2: `reconcile` (depends on task nodes from layer 1)
 
 ### Dependency rules
 
-- If a task input name matches another task's output name, a dependency is created.
-- Input names that don't match any task output are treated as ingested tables (no dependency).
+- `depends_on` lists node names: input node names or task node names.
 - Circular dependencies are detected and raise an error.
-- Two tasks cannot produce the same output name.
 
 ### Layer failure
 
-A failed task only blocks its direct downstream dependents — tasks that consume its outputs. Unrelated tasks in later layers continue to run. Tasks in the same layer are not affected (they run concurrently and may succeed).
+A failed node only blocks its direct downstream dependents — nodes that consume its outputs. Unrelated nodes in later layers continue to run. Nodes in the same layer are not affected (they run concurrently and may succeed).
 
 ---
 
@@ -499,7 +499,7 @@ The `.db` is a queryable audit trail. After a run, you can open it and trace how
 
 ### Inspect the database
 
-After a run, task outputs and validation views are **materialized as tables** (frozen). Intermediate `{task}_*` views stay as views for debuggability. Every SQL statement (including input validation) is logged in `_trace`. The `_view_definitions` view (derived from `_trace`) provides lineage — the original CREATE VIEW SQL for each materialized output.
+After a run, node outputs and validation views are **materialized as tables** (frozen). Intermediate `{name}_*` views stay as views for debuggability. Every SQL statement (including input validation) is logged in `_trace`. The `_view_definitions` view (derived from `_trace`) provides lineage — the original CREATE VIEW SQL for each materialized output.
 
 ```bash
 # Show all user-created tables (materialized outputs + inputs)
@@ -523,7 +523,7 @@ duckdb output.db "SELECT * FROM invoices WHERE _row_id = 42"
 After materialization, output views become tables. Their original SQL is available via `_view_definitions` (a view derived from `_trace`). Views that were dropped are automatically excluded:
 
 ```sql
-SELECT task, view_name, sql FROM _view_definitions ORDER BY task, view_name
+SELECT node, view_name, sql FROM _view_definitions ORDER BY node, view_name
 ```
 
 Intermediate views (still live) reference materialized tables. The chain is the lineage:
@@ -533,19 +533,19 @@ intermediate_view → materialized_table → ... → input_table
 
 ### SQL execution trace
 
-Every SQL query executed — by task agents, SQL-only tasks, task validation, and input validation — is logged in `_trace` with a `source` column indicating the origin (`agent`, `sql_task`, `task_validation`, `input_validation`):
+Every SQL query executed — by node agents, SQL-only nodes, node validation, and input validation — is logged in `_trace` with a `source` column indicating the origin (`agent`, `sql_node`, `node_validation`, `input_validation`):
 ```sql
-SELECT task, source, query, success, error, row_count, elapsed_ms
+SELECT node, source, query, success, error, row_count, elapsed_ms
 FROM _trace
-WHERE task = 'match'
+WHERE node = 'match'
 ORDER BY id
 ```
 
-### Task metadata
+### Node metadata
 
-Per-task stats are in `_task_meta`:
+Per-node stats are in `_node_meta`:
 ```sql
-SELECT task, meta_json FROM _task_meta ORDER BY task
+SELECT node, meta_json FROM _node_meta ORDER BY node
 ```
 
 `meta_json` includes fields like `model`, `reasoning_effort`, `iterations`, `tool_calls`, `elapsed_s`, `validation`, token counts, and a timestamp.
@@ -563,7 +563,7 @@ Keys (v2):
 - `taskgraph_version`
 - `python_version`
 - `platform`
-- `task_prompts`
+- `node_prompts`
 - `llm_model`, `llm_reasoning_effort`, `llm_max_iterations`
 - `inputs_row_counts`, `inputs_schema`
 - `run` (JSON: run context)
@@ -575,14 +575,15 @@ Keys (v2):
 To make outputs self-documenting, require provenance columns in `output_columns`:
 
 ```python
-TASKS = [
+NODES = [
+    {"name": "invoices", "source": load_invoices},
+    {"name": "payments", "source": load_payments},
     {
         "name": "match",
+        "depends_on": ["invoices", "payments"],
         "prompt": "... Include a match_reason column explaining why each pair was matched ...",
-        "inputs": ["invoices", "payments"],
-        "outputs": ["output"],
         "output_columns": {
-            "output": ["left_ids", "right_ids", "match_reason", "match_score"],
+            "match_output": ["left_ids", "right_ids", "match_reason", "match_score"],
         },
     },
 ]
@@ -594,11 +595,11 @@ The agent must produce these columns or validation fails. The prompt should expl
 
 ## Writing Good Prompts
 
-The `prompt` field is your objective text for LLM-driven transforms. Write it broad-to-specific: start with *why* the task exists, then *how* it works, then the *output contract*.
+The `prompt` field is your objective text for LLM-driven transforms. Write it broad-to-specific: start with *why* the node exists, then *how* it works, then the *output contract*.
 
 ### Three layers
 
-1. **Business context** (1-2 sentences): Why does this task exist? What business question does it answer? Who uses the output?
+1. **Business context** (1-2 sentences): Why does this node exist? What business question does it answer? Who uses the output?
 2. **Logic description** (2-4 sentences): The approach in plain English — matching strategy, edge cases, expected data shape.
 3. **Output contract**: View names, required columns, constraints, tolerances.
 
@@ -663,7 +664,7 @@ Include these columns in the output for audit purposes:
 
 ## Strong Validation and Fail-Fast Patterns
 
-Stronger validation catches issues earlier and makes prompt-task retries more effective. Prefer failing fast with precise, actionable messages.
+Stronger validation catches issues earlier and makes prompt-node retries more effective. Prefer failing fast with precise, actionable messages.
 
 - Use `validate_sql` views that check completeness, totals, and uniqueness.
 - Use `output_columns` to enforce schema contracts immediately.
@@ -671,7 +672,7 @@ Stronger validation catches issues earlier and makes prompt-task retries more ef
 
 ### Warnings vs failures
 
-- `fail` rows block the task.
+- `fail` rows block the node.
 - `warn` rows are informational and shown by the CLI.
 - Prompt tasks can retry when validation fails, within the iteration budget (default 200).
 
@@ -708,7 +709,7 @@ taskgraph run -o OUTPUT_DB [options]
 | `-s, --spec MODULE` | Spec module path (default: `[tool.taskgraph].spec` from `pyproject.toml`; if unset: `specs.main` when present) |
 | `-m, --model MODEL` | LLM model (default: `openai/gpt-5.2`) |
 | `--reasoning-effort low\|medium\|high` | Reasoning effort level |
-| `--max-iterations N` | Max agent iterations per task (default: 200) |
+| `--max-iterations N` | Max agent iterations per node (default: 200) |
 | `-q, --quiet` | Suppress verbose output |
 | `-f, --force` | Overwrite output file without prompting |
 
@@ -721,7 +722,7 @@ taskgraph show
 ```
 
 When given a `.db` file, displays workspace metadata: creation time, model, inputs, tasks, and export results.
-Otherwise, displays spec structure: inputs, DAG layers, per-task details, validation summary, exports.
+Otherwise, displays spec structure: inputs, DAG layers, per-node details, validation summary, exports.
 
 ## Appendix: Debugging a Workspace
 
@@ -738,5 +739,5 @@ duckdb output.db "SELECT view_name FROM duckdb_views() WHERE internal = false OR
 duckdb output.db "SELECT sql FROM _view_definitions WHERE view_name = 'matches'"
 
 # What did the agent try?
-duckdb output.db "SELECT id, task, source, success, row_count, elapsed_ms, query FROM _trace ORDER BY id"
+duckdb output.db "SELECT id, node, source, success, row_count, elapsed_ms, query FROM _trace ORDER BY id"
 ```

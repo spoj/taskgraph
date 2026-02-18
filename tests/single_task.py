@@ -7,10 +7,9 @@ Usage:
     taskgraph run --spec tests.single_task -o output.db
 """
 
-# --- Inputs ---
-
-INPUTS = {
-    "employees": {
+NODES = [
+    {
+        "name": "employees",
         "source": [
             {"id": 1, "name": "Alice", "department": "Engineering", "salary": 120000},
             {"id": 2, "name": "Bob", "department": "Engineering", "salary": 110000},
@@ -21,15 +20,11 @@ INPUTS = {
         ],
         "columns": ["id", "name", "department", "salary"],
     },
-}
-
-# --- Task ---
-
-TASKS = [
     {
         "name": "summarize",
+        "depends_on": ["employees"],
         "sql": """
-            CREATE OR REPLACE VIEW department_summary AS
+            CREATE OR REPLACE VIEW summarize_department_summary AS
             SELECT
                 department,
                 COUNT(*) AS headcount,
@@ -39,10 +34,8 @@ TASKS = [
             GROUP BY department
             ORDER BY department
             """,
-        "inputs": ["employees"],
-        "outputs": ["department_summary"],
         "output_columns": {
-            "department_summary": [
+            "summarize_department_summary": [
                 "department",
                 "headcount",
                 "total_salary",

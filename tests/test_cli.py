@@ -9,19 +9,15 @@ def test_cli_run_sql_does_not_require_openrouter_api_key(tmp_path, monkeypatch):
     """SQL-only specs should run without OPENROUTER_API_KEY.
 
     This is a regression test for the CLI requiring the key even when no
-    task would invoke the LLM.
+    node would invoke the LLM.
     """
     from scripts.cli import main
 
     spec_source = """\
-INPUTS = {}
-
-TASKS = [
+NODES = [
     {
         "name": "t",
-        "inputs": [],
-        "outputs": ["v"],
-        "sql": "CREATE VIEW v AS SELECT 1 AS x",
+        "sql": "CREATE OR REPLACE VIEW t_v AS SELECT 1 AS x",
     }
 ]
 """
@@ -45,59 +41,63 @@ class TestLoadSpec:
     """Tests for load_spec_from_module: end-to-end spec module loading."""
 
     def test_simple_spec(self, tmp_path):
-        """Loads a minimal spec with INPUTS and TASKS."""
+        """Loads a minimal spec with NODES."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
-            'INPUTS = {"data": [{"x": 1}]}\n'
-            'TASKS = [{"name": "t1", '
-            '"sql": "CREATE VIEW out AS SELECT 1 AS x", '
-            '"inputs": ["data"], "outputs": ["out"]}]\n',
+            "NODES = [\n"
+            '    {"name": "data", "source": [{"x": 1}]},\n'
+            '    {"name": "t1", "depends_on": ["data"], '
+            '"sql": "CREATE OR REPLACE VIEW t1_out AS SELECT 1 AS x"},\n'
+            "]\n",
         )
 
-        result = load_spec_from_module(module_path)
-        assert "data" in result["inputs"]
-        assert len(result["tasks"]) == 1
-        assert result["tasks"][0].name == "t1"
+        nodes, exports = load_spec_from_module(module_path)
+        source_nodes = [n for n in nodes if n.is_source()]
+        transform_nodes = [n for n in nodes if not n.is_source()]
+        assert len(source_nodes) == 1
+        assert source_nodes[0].name == "data"
+        assert len(transform_nodes) == 1
+        assert transform_nodes[0].name == "t1"
 
-    def test_rich_inputs_extracted(self, tmp_path):
-        """Rich INPUTS with columns and validate_sql are parsed."""
+    def test_source_node_with_columns_and_validate_sql(self, tmp_path):
+        """Source nodes with columns and validate_sql are parsed."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
-            "INPUTS = {\n"
-            '    "tbl": {\n'
+            "NODES = [\n"
+            "    {\n"
+            '        "name": "tbl",\n'
             '        "source": [{"a": 1, "b": 2}],\n'
             '        "columns": ["a", "b"],\n'
             "        \"validate_sql\": \"CREATE OR REPLACE VIEW tbl__validation AS SELECT CASE WHEN COUNT(*) > 0 THEN 'fail' ELSE 'pass' END AS status, 'null a' AS message FROM tbl WHERE a IS NULL\",\n"
-            "    }\n"
-            "}\n"
-            'TASKS = [{"name": "t", '
-            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
-            '"inputs": ["tbl"], "outputs": ["o"]}]\n',
+            "    },\n"
+            '    {"name": "t", "depends_on": ["tbl"], '
+            '"sql": "CREATE OR REPLACE VIEW t_o AS SELECT 1 AS x"},\n'
+            "]\n",
         )
 
-        result = load_spec_from_module(module_path)
-        assert result["input_columns"] == {"tbl": ["a", "b"]}
-        assert result["input_validate_sql"] == {
-            "tbl": "CREATE OR REPLACE VIEW tbl__validation AS SELECT CASE WHEN COUNT(*) > 0 THEN 'fail' ELSE 'pass' END AS status, 'null a' AS message FROM tbl WHERE a IS NULL"
-        }
-        # The actual data is the list, not the dict
-        assert result["inputs"]["tbl"] == [{"a": 1, "b": 2}]
+        nodes, exports = load_spec_from_module(module_path)
+        tbl_node = [n for n in nodes if n.name == "tbl"][0]
+        assert tbl_node.is_source()
+        assert tbl_node.columns == ["a", "b"]
+        assert "tbl__validation" in tbl_node.validate_sql
+        assert tbl_node.source == [{"a": 1, "b": 2}]
 
     def test_file_input_parsed_relative_to_spec(self, tmp_path):
-        """File input strings resolve relative to the spec directory."""
+        """File source strings resolve relative to the spec directory."""
         from src.ingest import FileInput
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
-            'INPUTS = {"sales": "data/sales.csv"}\n'
-            'TASKS = [{"name": "t", '
-            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
-            '"inputs": ["sales"], "outputs": ["o"]}]\n',
+            "NODES = [\n"
+            '    {"name": "sales", "source": "data/sales.csv"},\n'
+            '    {"name": "t", "depends_on": ["sales"], '
+            '"sql": "CREATE OR REPLACE VIEW t_o AS SELECT 1 AS x"},\n'
+            "]\n",
         )
 
         module_dir = tmp_path / module_path
@@ -105,44 +105,35 @@ class TestLoadSpec:
         data_dir.mkdir()
         (data_dir / "sales.csv").write_text("id,val\n1,a\n")
 
-        result = load_spec_from_module(module_path)
-        file_input = result["inputs"]["sales"]
+        nodes, exports = load_spec_from_module(module_path)
+        sales_node = [n for n in nodes if n.name == "sales"][0]
+        file_input = sales_node.source
         assert isinstance(file_input, FileInput)
         assert file_input.format == "csv"
         assert file_input.path == (data_dir / "sales.csv").resolve()
 
-    def test_simple_input_no_validation(self, tmp_path):
-        """Simple INPUTS (no dict with 'source') have no validation metadata."""
+    def test_simple_source_no_validation(self, tmp_path):
+        """Simple source nodes (no validate_sql) have no validation metadata."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
-            'INPUTS = {"t": [{"x": 1}]}\n'
-            'TASKS = [{"name": "t", '
-            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
-            '"inputs": ["t"], "outputs": ["o"]}]\n',
+            'NODES = [\n    {"name": "t", "source": [{"x": 1}]},\n]\n',
         )
 
-        result = load_spec_from_module(module_path)
-        assert result["input_columns"] == {}
-        assert result["input_validate_sql"] == {}
+        nodes, exports = load_spec_from_module(module_path)
+        assert len(nodes) == 1
+        assert nodes[0].is_source()
+        assert not nodes[0].has_validation()
+        assert nodes[0].columns == []
 
-    def test_missing_inputs_raises(self, tmp_path):
-        """Spec without INPUTS raises ValueError."""
+    def test_missing_nodes_raises(self, tmp_path):
+        """Spec without NODES raises ValueError."""
         from src.spec import load_spec_from_module
 
-        module_path = _write_spec_module(tmp_path, "TASKS = []\n")
+        module_path = _write_spec_module(tmp_path, "X = 1\n")
 
-        with pytest.raises(ValueError, match="must define INPUTS"):
-            load_spec_from_module(module_path)
-
-    def test_missing_tasks_raises(self, tmp_path):
-        """Spec without TASKS raises ValueError."""
-        from src.spec import load_spec_from_module
-
-        module_path = _write_spec_module(tmp_path, 'INPUTS = {"t": []}\n')
-
-        with pytest.raises(ValueError, match="must define TASKS"):
+        with pytest.raises(ValueError, match="must define NODES"):
             load_spec_from_module(module_path)
 
     def test_exports_optional(self, tmp_path):
@@ -151,14 +142,11 @@ class TestLoadSpec:
 
         module_path = _write_spec_module(
             tmp_path,
-            'INPUTS = {"t": []}\n'
-            'TASKS = [{"name": "t", '
-            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
-            '"inputs": ["t"], "outputs": ["o"]}]\n',
+            'NODES = [\n    {"name": "t", "source": []},\n]\n',
         )
 
-        result = load_spec_from_module(module_path)
-        assert result["exports"] == {}
+        nodes, exports = load_spec_from_module(module_path)
+        assert exports == {}
 
     def test_exports_loaded(self, tmp_path):
         """Spec with EXPORTS includes them in the result."""
@@ -166,70 +154,161 @@ class TestLoadSpec:
 
         module_path = _write_spec_module(
             tmp_path,
-            'INPUTS = {"t": []}\n'
-            'TASKS = [{"name": "t", '
-            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
-            '"inputs": ["t"], "outputs": ["o"]}]\n'
+            "NODES = [\n"
+            '    {"name": "t", "source": []},\n'
+            "]\n"
             "def my_export(conn, path): pass\n"
             'EXPORTS = {"out.csv": my_export}\n',
         )
 
-        result = load_spec_from_module(module_path)
-        assert "out.csv" in result["exports"]
-        assert callable(result["exports"]["out.csv"])
+        nodes, exports = load_spec_from_module(module_path)
+        assert "out.csv" in exports
+        assert callable(exports["out.csv"])
 
-    def test_task_objects_accepted(self, tmp_path):
-        """Tasks can be Task objects directly (not just dicts)."""
+    def test_invalid_node_type_raises(self, tmp_path):
+        """Non-dict node raises ValueError with index."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
-            "from src.task import Task\n"
-            'INPUTS = {"t": []}\n'
-            'TASKS = [Task(name="t", '
-            'sql="CREATE VIEW o AS SELECT 1 AS x", '
-            'inputs=["t"], outputs=["o"])]\n',
+            'NODES = ["not a valid node"]\n',
         )
 
-        result = load_spec_from_module(module_path)
-        assert result["tasks"][0].name == "t"
-
-    def test_invalid_task_type_raises(self, tmp_path):
-        """Non-dict, non-Task task raises ValueError."""
-        from src.spec import load_spec_from_module
-
-        module_path = _write_spec_module(
-            tmp_path,
-            'INPUTS = {"t": []}\nTASKS = ["not a valid task"]\n',
-        )
-
-        with pytest.raises(ValueError, match="must be a dict or Task"):
+        with pytest.raises(ValueError, match=r"NODES\[0\] must be a dict"):
             load_spec_from_module(module_path)
 
-    def test_callable_input_preserved(self, tmp_path):
-        """Callable INPUTS values are preserved (not called at load time)."""
+    def test_empty_node_name_raises(self, tmp_path):
+        """Node with empty name raises ValueError."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            'NODES = [{"name": "", "source": []}]\n',
+        )
+
+        with pytest.raises(ValueError, match="missing required 'name'"):
+            load_spec_from_module(module_path)
+
+    def test_missing_node_name_raises(self, tmp_path):
+        """Node without name key raises ValueError."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            'NODES = [{"source": []}]\n',
+        )
+
+        with pytest.raises(ValueError, match=r"NODES\[0\] is missing required 'name'"):
+            load_spec_from_module(module_path)
+
+    def test_duplicate_node_name_raises(self, tmp_path):
+        """Duplicate node names raise ValueError."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            "NODES = [\n"
+            '  {"name": "dup", "source": [{"x": 1}]},\n'
+            '  {"name": "dup", "sql": "CREATE OR REPLACE VIEW dup_a AS SELECT 1 AS x"},\n'
+            "]\n",
+        )
+
+        with pytest.raises(ValueError, match="Duplicate node name.*dup"):
+            load_spec_from_module(module_path)
+
+    def test_unknown_node_fields_raises(self, tmp_path):
+        """Unknown node dict keys raise ValueError listing valid fields."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            'NODES = [{"name": "t", "sql": "CREATE OR REPLACE VIEW t_o AS SELECT 1 AS x", '
+            '"description": "nope"}]\n',
+        )
+
+        with pytest.raises(ValueError, match="unknown field.*description"):
+            load_spec_from_module(module_path)
+
+    def test_node_with_both_source_and_sql_raises(self, tmp_path):
+        """Node with both source and sql raises ValueError."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            'NODES = [{"name": "t", "source": [{"x": 1}], '
+            '"sql": "CREATE OR REPLACE VIEW t_o AS SELECT 1 AS x"}]\n',
+        )
+
+        with pytest.raises(ValueError, match="multiple modes"):
+            load_spec_from_module(module_path)
+
+    def test_node_missing_mode_raises(self, tmp_path):
+        """Node with none of source/sql/prompt raises ValueError."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            'NODES = [{"name": "t"}]\n',
+        )
+
+        with pytest.raises(
+            ValueError, match="must have exactly one of.*source.*sql.*prompt"
+        ):
+            load_spec_from_module(module_path)
+
+    def test_output_columns_as_list_raises(self, tmp_path):
+        """Node output_columns as list (not dict) raises ValueError."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            'NODES = [{"name": "t", '
+            '"sql": "CREATE OR REPLACE VIEW t_o AS SELECT 1 AS x", '
+            '"output_columns": ["x"]}]\n',
+        )
+
+        with pytest.raises(ValueError, match="output_columns must be a dict"):
+            load_spec_from_module(module_path)
+
+    def test_import_error_preserves_context(self, tmp_path):
+        """Module import errors are wrapped with context."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            "import nonexistent_module_xyz\nNODES = []\n",
+        )
+
+        with pytest.raises(ValueError, match="Cannot import spec module"):
+            load_spec_from_module(module_path)
+
+    def test_callable_source_preserved(self, tmp_path):
+        """Callable source values are preserved (not called at load time)."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
             tmp_path,
             'def load_data(): return [{"x": 1}]\n'
-            'INPUTS = {"t": load_data}\n'
-            'TASKS = [{"name": "t", '
-            '"sql": "CREATE VIEW o AS SELECT 1 AS x", '
-            '"inputs": ["t"], "outputs": ["o"]}]\n',
+            "NODES = [\n"
+            '    {"name": "t", "source": load_data},\n'
+            "]\n",
         )
 
-        result = load_spec_from_module(module_path)
-        assert callable(result["inputs"]["t"])
+        nodes, exports = load_spec_from_module(module_path)
+        source_node = [n for n in nodes if n.name == "t"][0]
+        assert callable(source_node.source)
 
     def test_existing_spec_files_load(self):
         """The existing test spec files load without error."""
         from src.spec import load_spec_from_module
 
         # diamond_dag.py
-        result = load_spec_from_module("tests.diamond_dag")
-        assert len(result["tasks"]) == 4
-        assert result["input_columns"]["transactions"] == [
+        nodes, exports = load_spec_from_module("tests.diamond_dag")
+        source_nodes = [n for n in nodes if n.is_source()]
+        transform_nodes = [n for n in nodes if not n.is_source()]
+        assert len(transform_nodes) == 4
+        transactions_node = [n for n in source_nodes if n.name == "transactions"][0]
+        assert transactions_node.columns == [
             "id",
             "date",
             "type",
@@ -239,9 +318,11 @@ class TestLoadSpec:
         ]
 
         # validation_view_demo.py
-        result = load_spec_from_module("tests.validation_view_demo")
-        assert len(result["tasks"]) == 1
-        assert "expenses" in result["inputs"]
+        nodes, exports = load_spec_from_module("tests.validation_view_demo")
+        transform_nodes = [n for n in nodes if not n.is_source()]
+        assert len(transform_nodes) == 1
+        source_names = {n.name for n in nodes if n.is_source()}
+        assert "expenses" in source_names
 
 
 def test_default_output_db_path_is_stable():
@@ -401,3 +482,52 @@ class TestInit:
         gi = (tmp_path / ".gitignore").read_text()
         assert ".env" in gi
         assert "*.pyc" in gi  # Original content preserved
+
+
+class TestShow:
+    """Tests for the tg show command."""
+
+    def test_show_nondb_file_rejects(self, tmp_path, monkeypatch):
+        """tg show with a non-.db file gives a clear error."""
+        from scripts.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "data.txt").write_text("hello")
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["show", str(tmp_path / "data.txt")])
+        assert result.exit_code != 0
+        assert "not a .db file" in result.output
+
+    def test_show_missing_db_rejects(self, tmp_path, monkeypatch):
+        """tg show with a nonexistent .db file gives a clear error."""
+        from scripts.cli import main
+
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["show", str(tmp_path / "missing.db")])
+        assert result.exit_code != 0
+        assert "does not exist" in result.output
+
+    def test_show_spec(self, tmp_path, monkeypatch):
+        """tg show --spec displays spec structure."""
+        from scripts.cli import main
+
+        spec_source = """\
+NODES = [
+    {"name": "data", "source": [{"x": 1}]},
+    {
+        "name": "t",
+        "depends_on": ["data"],
+        "sql": "CREATE OR REPLACE VIEW t_o AS SELECT 1 AS x",
+    },
+]
+"""
+        spec_module = _write_spec_module(tmp_path, spec_source)
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["show", "--spec", spec_module])
+        assert result.exit_code == 0, result.output
+        assert "Nodes (" in result.output
+        assert "DAG" in result.output

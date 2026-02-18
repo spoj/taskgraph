@@ -23,19 +23,10 @@ Usage:
 from examples.bank_rec_problem import BANK_TRANSACTIONS, GL_ENTRIES
 
 # ---------------------------------------------------------------------------
-# Inputs
+# Source data (referenced by source nodes in NODES below)
 # ---------------------------------------------------------------------------
 
-INPUTS = {
-    "bank_txns": {
-        "data": BANK_TRANSACTIONS,
-        "columns": ["id", "date", "description", "amount"],
-    },
-    "gl_entries": {
-        "data": GL_ENTRIES,
-        "columns": ["id", "date", "description", "amount", "ref", "entry_type"],
-    },
-}
+# (Source nodes are defined in NODES below)
 
 
 # ---------------------------------------------------------------------------
@@ -43,14 +34,14 @@ INPUTS = {
 # ---------------------------------------------------------------------------
 
 NORMALIZE_SQL = """\
-CREATE VIEW bank_norm AS
+CREATE VIEW normalize_bank AS
 SELECT
     id, date, description, amount,
     UPPER(regexp_replace(description, '[^A-Za-z0-9 ]', ' ', 'g')) AS desc_clean,
     TRY_CAST(regexp_extract(description, '#(\\d+)', 1) AS INTEGER) AS check_no
 FROM bank_txns;
 
-CREATE VIEW gl_norm AS
+CREATE VIEW normalize_gl AS
 SELECT
     id, date, description, amount, ref, entry_type,
     UPPER(regexp_replace(description, '[^A-Za-z0-9 ]', ' ', 'g')) AS desc_clean,
@@ -67,7 +58,7 @@ FROM gl_entries;
 # ---------------------------------------------------------------------------
 
 MATCH_CONFIDENT_SQL = """\
-CREATE VIEW confident_matched AS
+CREATE VIEW match_confident_matched AS
 WITH
 candidates AS (
     SELECT
@@ -79,8 +70,8 @@ candidates AS (
         jaro_winkler_similarity(b.desc_clean, g.desc_clean) AS desc_score,
         CASE WHEN b.check_no IS NOT NULL
               AND b.check_no = g.check_no THEN 1 ELSE 0 END AS check_match
-    FROM bank_norm b
-    JOIN gl_norm g
+    FROM normalize_bank b
+    JOIN normalize_gl g
       ON b.amount = g.amount
      AND ABS(date_diff('day', b.date, g.date)) <= 5
 ),
@@ -120,13 +111,13 @@ UNION ALL
 SELECT *, 'exact_1to1' AS match_type, '' AS note FROM round2;
 
 CREATE VIEW match_confident_unmatched_bank AS
-SELECT b.* FROM bank_norm b
-LEFT JOIN confident_matched m ON b.id = m.bank_id
+SELECT b.* FROM normalize_bank b
+LEFT JOIN match_confident_matched m ON b.id = m.bank_id
 WHERE m.bank_id IS NULL;
 
 CREATE VIEW match_confident_unmatched_gl AS
-SELECT g.* FROM gl_norm g
-LEFT JOIN confident_matched m ON g.id = m.gl_id
+SELECT g.* FROM normalize_gl g
+LEFT JOIN match_confident_matched m ON g.id = m.gl_id
 WHERE m.gl_id IS NULL;
 """
 
@@ -134,12 +125,12 @@ MATCH_CONFIDENT_VALIDATE_SQL = """\
 CREATE VIEW match_confident__validation AS
 SELECT 'fail' AS status,
        'bank_id ' || bank_id || ' matched ' || cnt || 'x' AS message
-FROM (SELECT bank_id, COUNT(*) AS cnt FROM confident_matched GROUP BY bank_id)
+FROM (SELECT bank_id, COUNT(*) AS cnt FROM match_confident_matched GROUP BY bank_id)
 WHERE cnt > 1
 UNION ALL
 SELECT 'fail' AS status,
        'gl_id ' || gl_id || ' matched ' || cnt || 'x' AS message
-FROM (SELECT gl_id, COUNT(*) AS cnt FROM confident_matched GROUP BY gl_id)
+FROM (SELECT gl_id, COUNT(*) AS cnt FROM match_confident_matched GROUP BY gl_id)
 WHERE cnt > 1;
 """
 
@@ -151,8 +142,8 @@ WHERE cnt > 1;
 OFFSETTING_SQL = """\
 CREATE VIEW offsetting_pairs AS
 WITH unmatched_gl AS (
-    SELECT g.* FROM gl_norm g
-    LEFT JOIN confident_matched m ON g.id = m.gl_id
+    SELECT g.* FROM normalize_gl g
+    LEFT JOIN match_confident_matched m ON g.id = m.gl_id
     WHERE m.gl_id IS NULL
 )
 SELECT
@@ -188,9 +179,9 @@ STRATEGIES:
 Bank descriptions are cryptic/truncated (e.g. 'AMZN MKTP US*RT4K29ZQ1').
 jaro_winkler scores between bank and GL are typically 0.3-0.6, not 0.8+.
 
-OUTPUT: all_matched view with columns:
+OUTPUT: match_hard_all_matched view with columns:
   bank_id, gl_id, bank_amount, gl_amount, match_type, note
-Must include ALL confident_matched rows plus any new batch/tolerance matches.
+Must include ALL match_confident_matched rows plus any new batch/tolerance matches.
 Batch deposits: one row per GL component, match_type='batch'.
 """
 
@@ -200,7 +191,7 @@ WITH bank_agg AS (
     SELECT bank_id, COUNT(*) AS cnt,
            COUNT(*) FILTER (WHERE match_type != 'batch') AS non_batch,
            SUM(gl_amount) AS gl_sum, MAX(bank_amount) AS bank_amt
-    FROM all_matched GROUP BY bank_id
+    FROM match_hard_all_matched GROUP BY bank_id
 )
 SELECT 'fail' AS status,
        'bank_id ' || bank_id || ' has invalid multi-match' AS message
@@ -209,23 +200,23 @@ WHERE cnt > 1 AND (non_batch > 0 OR ABS(gl_sum - bank_amt) > 0.01)
 UNION ALL
 SELECT 'fail' AS status,
        'gl_id ' || gl_id || ' matched ' || cnt || 'x' AS message
-FROM (SELECT gl_id, COUNT(*) AS cnt FROM all_matched GROUP BY gl_id)
+FROM (SELECT gl_id, COUNT(*) AS cnt FROM match_hard_all_matched GROUP BY gl_id)
 WHERE cnt > 1
 UNION ALL
 SELECT 'fail' AS status,
        'Confident match ' || c.bank_id || '->' || c.gl_id || ' missing' AS message
-FROM confident_matched c
-LEFT JOIN all_matched a ON c.bank_id = a.bank_id AND c.gl_id = a.gl_id
+FROM match_confident_matched c
+LEFT JOIN match_hard_all_matched a ON c.bank_id = a.bank_id AND c.gl_id = a.gl_id
 WHERE a.bank_id IS NULL
 UNION ALL
 SELECT 'warn' AS status,
        'Unmatched bank: ' || b.id || ' $' || b.amount || ' ' || b.description AS message
-FROM bank_norm b LEFT JOIN all_matched m ON b.id = m.bank_id
+FROM normalize_bank b LEFT JOIN match_hard_all_matched m ON b.id = m.bank_id
 WHERE m.bank_id IS NULL
 UNION ALL
 SELECT 'warn' AS status,
        'Unmatched GL: ' || g.id || ' $' || g.amount || ' ' || g.description AS message
-FROM match_hard_remaining_gl g LEFT JOIN all_matched m ON g.id = m.gl_id
+FROM match_hard_remaining_gl g LEFT JOIN match_hard_all_matched m ON g.id = m.gl_id
 WHERE m.gl_id IS NULL;
 """
 
@@ -237,11 +228,11 @@ WHERE m.gl_id IS NULL;
 REPORT_SQL = """\
 CREATE VIEW report_matched AS
 SELECT bank_id, gl_id, bank_amount, gl_amount, match_type, note
-FROM all_matched ORDER BY bank_id;
+FROM match_hard_all_matched ORDER BY bank_id;
 
 CREATE VIEW report_unmatched_bank AS
 SELECT b.id, b.date, b.description, b.amount
-FROM bank_norm b LEFT JOIN all_matched m ON b.id = m.bank_id
+FROM normalize_bank b LEFT JOIN match_hard_all_matched m ON b.id = m.bank_id
 WHERE m.bank_id IS NULL ORDER BY b.date;
 
 CREATE VIEW report_unmatched_gl AS
@@ -250,18 +241,18 @@ WITH offsetting_ids AS (
     UNION ALL SELECT reversal_id FROM offsetting_pairs
 )
 SELECT g.id, g.date, g.description, g.amount, g.ref, g.entry_type
-FROM gl_norm g
-LEFT JOIN all_matched m ON g.id = m.gl_id
+FROM normalize_gl g
+LEFT JOIN match_hard_all_matched m ON g.id = m.gl_id
 LEFT JOIN offsetting_ids oi ON g.id = oi.id
 WHERE m.gl_id IS NULL AND oi.id IS NULL ORDER BY g.date;
 
 CREATE VIEW report_summary AS
 SELECT
-    (SELECT COUNT(*) FROM bank_norm) AS bank_count,
-    (SELECT COUNT(*) FROM gl_norm) AS gl_count,
-    (SELECT COUNT(*) FROM all_matched WHERE match_type = 'exact_1to1') AS exact_matches,
-    (SELECT COUNT(*) FROM all_matched WHERE match_type = 'batch') AS batch_gl_rows,
-    (SELECT COUNT(*) FROM all_matched WHERE match_type = 'amount_mismatch') AS mismatch_matches,
+    (SELECT COUNT(*) FROM normalize_bank) AS bank_count,
+    (SELECT COUNT(*) FROM normalize_gl) AS gl_count,
+    (SELECT COUNT(*) FROM match_hard_all_matched WHERE match_type = 'exact_1to1') AS exact_matches,
+    (SELECT COUNT(*) FROM match_hard_all_matched WHERE match_type = 'batch') AS batch_gl_rows,
+    (SELECT COUNT(*) FROM match_hard_all_matched WHERE match_type = 'amount_mismatch') AS mismatch_matches,
     (SELECT COUNT(*) FROM report_unmatched_bank) AS unmatched_bank,
     (SELECT COUNT(*) FROM report_unmatched_gl) AS unmatched_gl,
     (SELECT COUNT(*) FROM offsetting_pairs) AS offsetting_pairs;
@@ -272,16 +263,16 @@ CREATE VIEW report__validation AS
 SELECT 'fail' AS status,
        'Bank count mismatch: ' || bc || ' != ' || mc || ' + ' || ub AS message
 FROM (
-    SELECT (SELECT COUNT(*) FROM bank_norm) AS bc,
-           (SELECT COUNT(DISTINCT bank_id) FROM all_matched) AS mc,
+    SELECT (SELECT COUNT(*) FROM normalize_bank) AS bc,
+           (SELECT COUNT(DISTINCT bank_id) FROM match_hard_all_matched) AS mc,
            (SELECT COUNT(*) FROM report_unmatched_bank) AS ub
 ) WHERE bc != mc + ub
 UNION ALL
 SELECT 'fail' AS status,
        'GL count mismatch: ' || gc || ' != ' || mc || ' + ' || ug || ' + ' || oc AS message
 FROM (
-    SELECT (SELECT COUNT(*) FROM gl_norm) AS gc,
-           (SELECT COUNT(DISTINCT gl_id) FROM all_matched) AS mc,
+    SELECT (SELECT COUNT(*) FROM normalize_gl) AS gc,
+           (SELECT COUNT(DISTINCT gl_id) FROM match_hard_all_matched) AS mc,
            (SELECT COUNT(*) FROM report_unmatched_gl) AS ug,
            (SELECT COUNT(*) * 2 FROM offsetting_pairs) AS oc
 ) WHERE gc != mc + ug + oc;
@@ -289,28 +280,34 @@ FROM (
 
 
 # ---------------------------------------------------------------------------
-# Tasks
+# Nodes
 # ---------------------------------------------------------------------------
 
-TASKS = [
+NODES = [
+    # Source nodes
+    {
+        "name": "bank_txns",
+        "source": BANK_TRANSACTIONS,
+        "columns": ["id", "date", "description", "amount"],
+    },
+    {
+        "name": "gl_entries",
+        "source": GL_ENTRIES,
+        "columns": ["id", "date", "description", "amount", "ref", "entry_type"],
+    },
+    # Transform nodes
     {
         "name": "normalize",
         "sql": NORMALIZE_SQL,
-        "inputs": ["bank_txns", "gl_entries"],
-        "outputs": ["bank_norm", "gl_norm"],
+        "depends_on": ["bank_txns", "gl_entries"],
     },
     {
         "name": "match_confident",
         "sql": MATCH_CONFIDENT_SQL,
         "validate_sql": MATCH_CONFIDENT_VALIDATE_SQL,
-        "inputs": ["bank_norm", "gl_norm"],
-        "outputs": [
-            "confident_matched",
-            "match_confident_unmatched_bank",
-            "match_confident_unmatched_gl",
-        ],
+        "depends_on": ["normalize"],
         "output_columns": {
-            "confident_matched": [
+            "match_confident_matched": [
                 "bank_id",
                 "gl_id",
                 "bank_amount",
@@ -323,24 +320,15 @@ TASKS = [
     {
         "name": "offsetting",
         "sql": OFFSETTING_SQL,
-        "inputs": ["gl_norm", "confident_matched"],
-        "outputs": ["offsetting_pairs"],
+        "depends_on": ["normalize", "match_confident"],
     },
     {
         "name": "match_hard",
         "prompt": MATCH_HARD_INTENT,
         "validate_sql": MATCH_HARD_VALIDATE_SQL,
-        "inputs": [
-            "bank_norm",
-            "gl_norm",
-            "confident_matched",
-            "match_confident_unmatched_bank",
-            "match_confident_unmatched_gl",
-            "offsetting_pairs",
-        ],
-        "outputs": ["match_hard_remaining_gl", "all_matched"],
+        "depends_on": ["normalize", "match_confident", "offsetting"],
         "output_columns": {
-            "all_matched": [
+            "match_hard_all_matched": [
                 "bank_id",
                 "gl_id",
                 "bank_amount",
@@ -354,12 +342,6 @@ TASKS = [
         "name": "report",
         "sql": REPORT_SQL,
         "validate_sql": REPORT_VALIDATE_SQL,
-        "inputs": ["bank_norm", "gl_norm", "all_matched", "offsetting_pairs"],
-        "outputs": [
-            "report_matched",
-            "report_unmatched_bank",
-            "report_unmatched_gl",
-            "report_summary",
-        ],
+        "depends_on": ["normalize", "match_hard", "offsetting"],
     },
 ]

@@ -16,7 +16,7 @@ spec module -> ingest -> DAG -> tasks (concurrent) -> validate -> export -> outp
 ## What Problem It Solves
 
 - **Reproducible, reviewable work**: outputs are SQL view definitions stored in the database.
-- **Strong guardrails**: agents can only `CREATE VIEW`/`CREATE MACRO` (no tables, no inserts) and are namespace-restricted per task.
+- **Strong guardrails**: agents can only `CREATE VIEW`/`CREATE MACRO` (no tables, no inserts) and are namespace-restricted per node.
 - **Fast iteration**: views are late-binding; tweak upstream logic and downstream results update automatically.
 
 ## Quick Start

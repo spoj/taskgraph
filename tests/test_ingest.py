@@ -5,7 +5,7 @@ import pytest
 import polars as pl
 from openpyxl import Workbook
 
-from tests.conftest import _make_task
+from tests.conftest import _make_node
 from src.ingest import (
     coerce_to_dataframe,
     ingest_csv,
@@ -17,6 +17,8 @@ from src.ingest import (
     parse_file_path,
     parse_file_string,
 )
+from src.task import Node
+from src.agent import run_validate_sql
 from src.workspace import Workspace
 
 
@@ -233,198 +235,202 @@ class TestIngestion:
         assert file_input.sheet is None
 
 
-class TestInputValidation:
-    """Tests for Workspace._validate_inputs() and _ingest_all() auto-checks."""
+class TestSourceNodeValidation:
+    """Tests for source node validation via Node.validate_outputs() and
+    the unified _post_execute() flow in Workspace.
 
-    def _make_workspace(self, **kwargs) -> Workspace:
-        """Helper to create a Workspace with defaults."""
-        defaults = {
-            "db_path": ":memory:",
-            "inputs": {},
-            "tasks": [],
-        }
-        defaults.update(kwargs)
-        return Workspace(**defaults)
+    In the unified node model, source nodes use:
+    - ``columns`` for required column checks (via Node.validate_outputs)
+    - ``validate_sql`` for SQL validation (via run_validate_sql + validate_validation_views)
+    - ``Workspace._post_execute()`` for the full validation + materialization flow
+    """
 
-    def test_input_columns_pass(self, conn):
-        """Input column validation passes when all required columns exist."""
+    def test_source_columns_pass(self, conn):
+        """Source column validation passes when all required columns exist."""
         ingest_table(conn, [{"name": "alice", "age": 30}], "people")
-        ws = self._make_workspace(
-            input_columns={"people": ["name", "age"]},
+        node = Node(
+            name="people",
+            source=[{"name": "alice", "age": 30}],
+            columns=["name", "age"],
         )
-        errors = ws._validate_inputs(conn)
+        errors = node.validate_outputs(conn)
         assert errors == []
 
-    def test_input_columns_missing(self, conn):
-        """Input column validation fails when required columns are missing."""
+    def test_source_columns_missing(self, conn):
+        """Source column validation fails when required columns are missing."""
         ingest_table(conn, [{"name": "alice"}], "people")
-        ws = self._make_workspace(
-            input_columns={"people": ["name", "age", "email"]},
+        node = Node(
+            name="people", source=[{"name": "alice"}], columns=["name", "age", "email"]
         )
-        errors = ws._validate_inputs(conn)
+        errors = node.validate_outputs(conn)
         assert len(errors) == 1
         assert "age" in errors[0]
         assert "email" in errors[0]
         assert "name" in errors[0]  # actual columns listed
 
-    def test_input_columns_table_not_found(self, conn):
-        """Input column validation reports missing table."""
-        ws = self._make_workspace(
-            input_columns={"nonexistent": ["col1"]},
-        )
-        errors = ws._validate_inputs(conn)
+    def test_source_columns_table_not_found(self, conn):
+        """Source column validation reports missing table."""
+        node = Node(name="nonexistent", source=[], columns=["col1"])
+        errors = node.validate_outputs(conn)
         assert len(errors) == 1
         assert "not found" in errors[0].lower()
 
-    def test_input_columns_extra_columns_ok(self, conn):
+    def test_source_columns_extra_columns_ok(self, conn):
         """Extra columns beyond required are fine."""
         ingest_table(conn, [{"a": 1, "b": 2, "c": 3}], "t")
-        ws = self._make_workspace(
-            input_columns={"t": ["a"]},
-        )
-        errors = ws._validate_inputs(conn)
+        node = Node(name="t", source=[], columns=["a"])
+        errors = node.validate_outputs(conn)
         assert errors == []
 
-    def test_input_columns_excludes_row_id(self, conn):
+    def test_source_columns_excludes_row_id(self, conn):
         """_row_id is excluded from the actual columns listed in error messages."""
         ingest_table(conn, [{"x": 1}], "t")
-        ws = self._make_workspace(
-            input_columns={"t": ["missing_col"]},
-        )
-        errors = ws._validate_inputs(conn)
+        node = Node(name="t", source=[], columns=["missing_col"])
+        errors = node.validate_outputs(conn)
         assert len(errors) == 1
         assert "_row_id" not in errors[0]
 
-    def test_input_columns_short_circuits_before_sql(self, conn):
-        """Column errors short-circuit before SQL validation runs."""
+    def test_source_columns_short_circuits_before_validate_sql(self, conn):
+        """Column errors are found before validate_sql would run."""
         ingest_table(conn, [{"x": 1}], "t")
-        ws = self._make_workspace(
-            input_columns={"t": ["missing"]},
-            input_validate_sql={
-                "t": (
-                    "CREATE OR REPLACE VIEW t__validation AS "
-                    "SELECT 'fail' AS status, 'should not run' AS message"
-                )
-            },
+        node = Node(
+            name="t",
+            source=[],
+            columns=["missing"],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW t__validation AS "
+                "SELECT 'fail' AS status, 'should not run' AS message"
+            ),
         )
-        errors = ws._validate_inputs(conn)
+        # validate_outputs catches the column error first
+        errors = node.validate_outputs(conn)
         assert len(errors) == 1
         assert "missing" in errors[0]
 
-    def test_input_validate_sql_pass(self, conn):
+    def test_validate_sql_pass(self, conn):
         """Validation passes when all rows have status='pass'."""
         ingest_table(conn, [{"id": 1, "val": 10}, {"id": 2, "val": 20}], "data")
-        ws = self._make_workspace(
-            input_validate_sql={
-                "data": (
-                    "CREATE OR REPLACE VIEW data__validation AS "
-                    "SELECT 'pass' AS status, 'all values positive' AS message"
-                )
-            },
+        node = Node(
+            name="data",
+            source=[],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW data__validation AS "
+                "SELECT 'pass' AS status, 'all values positive' AS message"
+            ),
         )
-        errors = ws._validate_inputs(conn)
+        errors = run_validate_sql(conn=conn, node=node)
+        assert errors == []
+        errors = node.validate_validation_views(conn)
         assert errors == []
 
-    def test_input_validate_sql_fail(self, conn):
+    def test_validate_sql_fail(self, conn):
         """Validation fails when view has status='fail' rows."""
         ingest_table(conn, [{"id": 1, "val": -5}], "data")
-        ws = self._make_workspace(
-            input_validate_sql={
-                "data": (
-                    "CREATE OR REPLACE VIEW data__validation AS "
-                    "SELECT 'fail' AS status, "
-                    "'negative value for id=' || CAST(id AS VARCHAR) AS message "
-                    "FROM data WHERE val < 0"
-                )
-            },
+        node = Node(
+            name="data",
+            source=[],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW data__validation AS "
+                "SELECT 'fail' AS status, "
+                "'negative value for id=' || CAST(id AS VARCHAR) AS message "
+                "FROM data WHERE val < 0"
+            ),
         )
-        errors = ws._validate_inputs(conn)
+        errors = run_validate_sql(conn=conn, node=node)
+        assert errors == []  # SQL execution succeeds
+        errors = node.validate_validation_views(conn)
         assert len(errors) == 1
         assert "negative value for id=1" in errors[0]
 
-    def test_input_validate_sql_error_handling(self, conn):
+    def test_validate_sql_error_handling(self, conn):
         """SQL validation catches query errors gracefully."""
-        ws = self._make_workspace(
-            input_validate_sql={
-                "bad": (
-                    "CREATE OR REPLACE VIEW bad__validation AS "
-                    "SELECT 'fail' AS status, x AS message "
-                    "FROM nonexistent_table"
-                )
-            },
+        node = Node(
+            name="bad",
+            source=[],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW bad__validation AS "
+                "SELECT 'fail' AS status, x AS message "
+                "FROM nonexistent_table"
+            ),
         )
-        errors = ws._validate_inputs(conn)
+        errors = run_validate_sql(conn=conn, node=node)
         assert len(errors) == 1
-        assert "error" in errors[0].lower()
+        assert "error" in errors[0].lower() or "nonexistent_table" in errors[0].lower()
 
-    def test_input_validate_sql_status_message(self, conn):
+    def test_validate_sql_mixed_status(self, conn):
         """Validation view with mixed pass/fail rows reports only failures."""
         ingest_table(
             conn, [{"id": 1, "status": "bad"}, {"id": 2, "status": "ok"}], "items"
         )
-        ws = self._make_workspace(
-            input_validate_sql={
-                "items": (
-                    "CREATE OR REPLACE VIEW items__validation AS "
-                    "SELECT 'fail' AS status, "
-                    "'bad status for id=' || CAST(id AS VARCHAR) AS message "
-                    "FROM items WHERE status = 'bad' "
-                    "UNION ALL "
-                    "SELECT 'pass' AS status, 'ok' AS message "
-                    "FROM items WHERE status = 'ok'"
-                )
-            },
+        node = Node(
+            name="items",
+            source=[],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW items__validation AS "
+                "SELECT 'fail' AS status, "
+                "'bad status for id=' || CAST(id AS VARCHAR) AS message "
+                "FROM items WHERE status = 'bad' "
+                "UNION ALL "
+                "SELECT 'pass' AS status, 'ok' AS message "
+                "FROM items WHERE status = 'ok'"
+            ),
         )
-        errors = ws._validate_inputs(conn)
+        errors = run_validate_sql(conn=conn, node=node)
+        assert errors == []
+        errors = node.validate_validation_views(conn)
         assert len(errors) == 1
         assert "bad status for id=1" in errors[0]
 
-    def test_input_validate_sql_short_circuits(self, conn):
-        """Validation with multiple views stops at first failure."""
+    def test_validate_sql_multiple_views_both_fail(self, conn):
+        """Multiple validation views both reporting failures."""
         ingest_table(conn, [{"id": 1}], "t")
-        ws = self._make_workspace(
-            input_validate_sql={
-                "t": (
-                    "CREATE OR REPLACE VIEW t__validation AS "
-                    "SELECT 'fail' AS status, 'error1' AS message; "
-                    "CREATE OR REPLACE VIEW t__validation_extra AS "
-                    "SELECT 'fail' AS status, 'error2' AS message"
-                )
-            },
+        node = Node(
+            name="t",
+            source=[],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW t__validation AS "
+                "SELECT 'fail' AS status, 'error1' AS message; "
+                "CREATE OR REPLACE VIEW t__validation_extra AS "
+                "SELECT 'fail' AS status, 'error2' AS message"
+            ),
         )
-        errors = ws._validate_inputs(conn)
-        # First view fails, so we get that error (short-circuit)
+        errors = run_validate_sql(conn=conn, node=node)
+        assert errors == []
+        errors = node.validate_validation_views(conn)
         assert len(errors) >= 1
         assert "error1" in errors[0]
 
-    def test_input_validate_sql_missing_view_name(self, conn):
-        """Validation SQL that doesn't create properly named views fails."""
+    def test_validate_sql_wrong_view_name(self, conn):
+        """Validation SQL creating wrong-named view is blocked by namespace."""
         ingest_table(conn, [{"id": 1}], "t")
-        ws = self._make_workspace(
-            input_validate_sql={
-                "t": (
-                    "CREATE OR REPLACE VIEW wrong_name AS "
-                    "SELECT 'pass' AS status, 'ok' AS message"
-                )
-            },
+        node = Node(
+            name="t",
+            source=[],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW wrong_name AS "
+                "SELECT 'pass' AS status, 'ok' AS message"
+            ),
         )
-        errors = ws._validate_inputs(conn)
+        # run_validate_sql uses namespace enforcement: wrong_name is not t__validation*
+        errors = run_validate_sql(conn=conn, node=node)
         assert len(errors) == 1
-        assert "t__validation" in errors[0]
 
-    def test_input_validate_sql_cleanup(self, conn):
-        """Validation views are materialized as tables after passing validation."""
+    def test_post_execute_materializes_validation_views(self, conn):
+        """_post_execute materializes validation views as tables after passing."""
         ingest_table(conn, [{"id": 1}], "t")
-        ws = self._make_workspace(
-            input_validate_sql={
-                "t": (
-                    "CREATE OR REPLACE VIEW t__validation AS "
-                    "SELECT 'pass' AS status, 'ok' AS message"
-                )
-            },
+        node = Node(
+            name="t",
+            source=[],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW t__validation AS "
+                "SELECT 'pass' AS status, 'ok' AS message"
+            ),
         )
-        errors = ws._validate_inputs(conn)
-        assert errors == []
+        ws = Workspace(db_path=":memory:", nodes=[node])
+        # Manually run validate_sql then post_execute
+        run_validate_sql(conn=conn, node=node)
+        success, msg = ws._post_execute(conn, node)
+        assert success, msg
         # View should be gone (materialized into a table)
         views = {
             row[0]
@@ -444,43 +450,45 @@ class TestInputValidation:
         row = conn.execute("SELECT status, message FROM t__validation").fetchone()
         assert row == ("pass", "ok")
 
-    def test_input_validate_sql_preserves_definition(self, conn):
-        """Materialized input validation views have SQL preserved in _view_definitions."""
+    def test_validate_sql_preserves_definition(self, conn):
+        """Validation SQL is recorded in _trace (visible via _view_definitions)."""
         ingest_table(conn, [{"id": 1}], "data")
-        ws = self._make_workspace(
-            input_validate_sql={
-                "data": (
-                    "CREATE OR REPLACE VIEW data__validation AS "
-                    "SELECT 'pass' AS status, 'all good' AS message"
-                )
-            },
+        node = Node(
+            name="data",
+            source=[],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW data__validation AS "
+                "SELECT 'pass' AS status, 'all good' AS message"
+            ),
         )
-        errors = ws._validate_inputs(conn)
+        errors = run_validate_sql(conn=conn, node=node)
         assert errors == []
-        # SQL definition should be stored with input table name as label
+        # SQL definition should be stored with node name as task label
         rows = conn.execute(
-            "SELECT task, view_name, sql FROM _view_definitions"
+            "SELECT node, view_name, sql FROM _view_definitions"
         ).fetchall()
         assert len(rows) == 1
-        assert rows[0][0] == "data"  # label = input table name
+        assert rows[0][0] == "data"  # label = node name
         assert rows[0][1] == "data__validation"
         assert "all good" in rows[0][2]
 
-    def test_input_validate_sql_multiple_views_materialized(self, conn):
-        """Multiple input validation views are all materialized."""
+    def test_post_execute_multiple_validation_views(self, conn):
+        """Multiple validation views are all materialized via _post_execute."""
         ingest_table(conn, [{"id": 1}], "t")
-        ws = self._make_workspace(
-            input_validate_sql={
-                "t": (
-                    "CREATE OR REPLACE VIEW t__validation AS "
-                    "SELECT 'pass' AS status, 'ok' AS message; "
-                    "CREATE OR REPLACE VIEW t__validation_extra AS "
-                    "SELECT 'pass' AS status, 'also ok' AS message"
-                )
-            },
+        node = Node(
+            name="t",
+            source=[],
+            validate_sql=(
+                "CREATE OR REPLACE VIEW t__validation AS "
+                "SELECT 'pass' AS status, 'ok' AS message; "
+                "CREATE OR REPLACE VIEW t__validation_extra AS "
+                "SELECT 'pass' AS status, 'also ok' AS message"
+            ),
         )
-        errors = ws._validate_inputs(conn)
-        assert errors == []
+        ws = Workspace(db_path=":memory:", nodes=[node])
+        run_validate_sql(conn=conn, node=node)
+        success, msg = ws._post_execute(conn, node)
+        assert success, msg
         tables = {
             row[0]
             for row in conn.execute(
@@ -490,65 +498,38 @@ class TestInputValidation:
         assert "t__validation" in tables
         assert "t__validation_extra" in tables
 
-    def test_input_validate_sql_failure_drops_views(self, conn):
-        """On validation failure, views are dropped (not materialized)."""
-        ingest_table(conn, [{"id": 1, "val": -1}], "data")
-        ws = self._make_workspace(
-            input_validate_sql={
-                "data": (
-                    "CREATE OR REPLACE VIEW data__validation AS "
-                    "SELECT 'fail' AS status, 'bad value' AS message "
-                    "FROM data WHERE val < 0"
-                )
-            },
-        )
-        errors = ws._validate_inputs(conn)
-        assert len(errors) == 1
-        # View should be dropped on failure, NOT materialized
-        views = {
-            row[0]
-            for row in conn.execute(
-                "SELECT view_name FROM duckdb_views() WHERE internal = false"
-            ).fetchall()
-        }
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "data__validation" not in views
-        assert "data__validation" not in tables
-
     def test_no_validation_returns_empty(self, conn):
-        """No input_columns or input_validate_sql returns no errors."""
-        ws = self._make_workspace()
-        errors = ws._validate_inputs(conn)
+        """Source node with no columns or validate_sql passes validation."""
+        ingest_table(conn, [{"x": 1}], "t")
+        node = Node(name="t", source=[])
+        errors = node.validate_outputs(conn)
         assert errors == []
 
-    def test_multiple_tables_column_check(self, conn):
-        """Column validation works across multiple tables."""
+    def test_multiple_source_nodes_column_check(self, conn):
+        """Column validation works across multiple source nodes."""
         ingest_table(conn, [{"a": 1, "b": 2}], "t1")
         ingest_table(conn, [{"x": 1}], "t2")
-        ws = self._make_workspace(
-            input_columns={
-                "t1": ["a", "b"],
-                "t2": ["x", "y"],  # y is missing
-            },
-        )
-        errors = ws._validate_inputs(conn)
+        node1 = Node(name="t1", source=[], columns=["a", "b"])
+        node2 = Node(name="t2", source=[], columns=["x", "y"])  # y is missing
+        assert node1.validate_outputs(conn) == []
+        errors = node2.validate_outputs(conn)
         assert len(errors) == 1
         assert "t2" in errors[0]
         assert "y" in errors[0]
 
-    def test_ingest_callable_error_handling(self, conn):
-        """_ingest_all catches callable errors with context."""
+    def test_source_callable_error_handling(self):
+        """Source node callable errors are caught with context."""
 
         def bad_loader():
             raise FileNotFoundError("data.csv not found")
 
-        ws = self._make_workspace(
-            inputs={"broken": bad_loader},
-        )
-        with pytest.raises(RuntimeError, match="Input 'broken' callable failed"):
-            asyncio.run(ws._ingest_all(conn, client=None))
+        node = Node(name="broken", source=bad_loader)
+        ws = Workspace(db_path=":memory:", nodes=[node])
+        import duckdb
+
+        conn = duckdb.connect(":memory:")
+        try:
+            with pytest.raises(RuntimeError, match="Source 'broken' callable failed"):
+                asyncio.run(ws._ingest_node(conn, node, client=None))
+        finally:
+            conn.close()

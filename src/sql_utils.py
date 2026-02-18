@@ -1,6 +1,5 @@
 import re
 import duckdb
-from typing import Any
 
 _parser_conn: duckdb.DuckDBPyConnection | None = None
 

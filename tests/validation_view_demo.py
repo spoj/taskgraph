@@ -7,10 +7,12 @@ Usage:
     taskgraph run --spec tests.validation_view_demo -o output.db
 """
 
-# --- Inputs ---
+# Expected total = sum of all amounts: 1500+2300+4200+800+950+320+1100+3500+4200+130 = 19000
 
-INPUTS = {
-    "expenses": {
+NODES = [
+    # --- Sources ---
+    {
+        "name": "expenses",
         "source": [
             {
                 "id": 1,
@@ -85,24 +87,19 @@ INPUTS = {
         ],
         "columns": ["id", "date", "vendor", "amount", "description"],
     },
-    # Expected total for this dataset
-    "expected_total": {
+    {
+        "name": "expected_total",
         "source": [
             {"label": "expected", "total": 19000.00},
         ],
         "columns": ["label", "total"],
     },
-}
-
-# Expected total = sum of all amounts: 1500+2300+4200+800+950+320+1100+3500+4200+130 = 19000
-
-# --- Task ---
-
-TASKS = [
+    # --- Transform ---
     {
         "name": "categorize",
+        "depends_on": ["expenses", "expected_total"],
         "sql": """
-            CREATE OR REPLACE VIEW categorized AS
+            CREATE OR REPLACE VIEW categorize_detail AS
             SELECT
                 e.*,
                 CASE
@@ -114,26 +111,26 @@ TASKS = [
                 END AS category
             FROM expenses e;
 
-            CREATE OR REPLACE VIEW category_summary AS
+            CREATE OR REPLACE VIEW categorize_summary AS
             SELECT
                 category,
                 COUNT(*) AS item_count,
                 SUM(amount) AS total_amount
-            FROM categorized
+            FROM categorize_detail
             GROUP BY category
             UNION ALL
             SELECT
                 'TOTAL' AS category,
                 COUNT(*) AS item_count,
                 SUM(amount) AS total_amount
-            FROM categorized;
+            FROM categorize_detail;
             """,
         "validate_sql": """
             CREATE OR REPLACE VIEW categorize__validation AS
             WITH
             exp AS (SELECT COUNT(*) AS cnt FROM expenses),
-            cat AS (SELECT COUNT(*) AS cnt FROM categorized),
-            sumcat AS (SELECT SUM(amount) AS total_amount FROM categorized),
+            cat AS (SELECT COUNT(*) AS cnt FROM categorize_detail),
+            sumcat AS (SELECT SUM(amount) AS total_amount FROM categorize_detail),
             tot AS (SELECT total FROM expected_total)
             SELECT
                 'fail' AS status,
@@ -156,11 +153,9 @@ TASKS = [
             WHERE exp.cnt = cat.cnt
               AND ABS(tot.total - sumcat.total_amount) <= 0.01
             """,
-        "inputs": ["expenses", "expected_total"],
-        "outputs": ["categorized", "category_summary"],
         "output_columns": {
-            "categorized": ["category"],
-            "category_summary": ["category", "item_count", "total_amount"],
+            "categorize_detail": ["category"],
+            "categorize_summary": ["category", "item_count", "total_amount"],
         },
     },
 ]

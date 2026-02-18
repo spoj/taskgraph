@@ -42,7 +42,7 @@ from typing import Any, Awaitable, Callable
 
 log = logging.getLogger(__name__)
 
-# Default token budget per task (prompt + completion combined)
+# Default token budget per node (prompt + completion combined)
 DEFAULT_MAX_TOKENS = 20_000_000
 DEFAULT_MAX_ITERATIONS = 200
 

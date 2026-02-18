@@ -1,14 +1,15 @@
 """Namespace enforcement for DDL name control.
 
-A Namespace controls what names a task (or input validator) can use in
+A Namespace controls what names a node (or input validator) can use in
 CREATE/DROP VIEW|MACRO statements.  Three factory methods encode the
 project's naming conventions:
 
-- ``Namespace.for_task(task)`` — task transform: outputs + ``{name}_*``
-  prefix, validation views forbidden.
-- ``Namespace.for_validation(task)`` — validation SQL:
+- ``Namespace.for_node(node)`` — node transform: ``{name}_*``
+  prefix only, validation views forbidden.
+- ``Namespace.for_validation(node)`` — validation SQL:
   ``{name}__validation`` + ``{name}__validation_*`` prefix.
-- ``Namespace.for_input(input_name)`` — input validation SQL:
+- ``Namespace.for_source_validation(input_name)`` — source node
+  validation SQL:
   ``{input}__validation`` + ``{input}__validation_*`` prefix.
 """
 
@@ -16,10 +17,10 @@ from __future__ import annotations
 
 from typing import Callable, TYPE_CHECKING
 
-from .task import is_validation_view_for_task
+from .task import is_validation_view
 
 if TYPE_CHECKING:
-    from .task import Task
+    from .task import Node
 
 
 class Namespace:
@@ -56,17 +57,17 @@ class Namespace:
     # --- Factory methods ---
 
     @classmethod
-    def for_task(cls, task: Task) -> Namespace:
-        """Namespace for task transform execution.
+    def for_node(cls, node: Node) -> Namespace:
+        """Namespace for node transform execution.
 
-        Allows creating task outputs and ``{task.name}_*`` prefixed
-        intermediates.  Blocks validation views — those are created
-        separately by ``validate_sql``.
+        Allows only ``{node.name}_*`` prefixed views (underscore required —
+        bare ``{node.name}`` is NOT a valid view name).  Blocks validation
+        views — those are created separately by ``validate_sql``.
         """
         return cls(
-            allowed_names=frozenset(task.outputs),
-            prefix=task.name,
-            forbidden=lambda name: is_validation_view_for_task(name, task.name),
+            allowed_names=frozenset(),
+            prefix=node.name,
+            forbidden=lambda name: is_validation_view(name, node.name),
             forbidden_msg=(
                 "Validation views cannot be created during transform; "
                 "they are created by validate_sql."
@@ -74,21 +75,21 @@ class Namespace:
         )
 
     @classmethod
-    def for_validation(cls, task: Task) -> Namespace:
-        """Namespace for task validation SQL execution.
+    def for_validation(cls, node: Node) -> Namespace:
+        """Namespace for node validation SQL execution.
 
-        Allows ``{task.name}__validation`` and
-        ``{task.name}__validation_*`` prefixed names.
+        Allows ``{node.name}__validation`` and
+        ``{node.name}__validation_*`` prefixed names.
         """
-        base = f"{task.name}__validation"
+        base = f"{node.name}__validation"
         return cls(
-            allowed_names=frozenset(task.validation_view_names()) | frozenset({base}),
+            allowed_names=frozenset(node.validation_view_names()) | frozenset({base}),
             prefix=base,
         )
 
     @classmethod
-    def for_input(cls, input_name: str) -> Namespace:
-        """Namespace for input validation SQL execution.
+    def for_source_validation(cls, input_name: str) -> Namespace:
+        """Namespace for source node validation SQL execution.
 
         Allows ``{input_name}__validation`` and
         ``{input_name}__validation_*`` prefixed names.

@@ -2,8 +2,8 @@
 
 from .agent_loop import run_agent_loop, AgentResult
 from .api import OpenRouterClient, create_model_callable
-from .agent import run_task_agent
-from .task import Task, resolve_dag, resolve_task_deps, validate_task_graph
+from .agent import run_node_agent
+from .task import Node, resolve_dag, resolve_deps, validate_graph
 from .workspace import Workspace, WorkspaceResult
 from .ingest import ingest_table, coerce_to_dataframe
 
@@ -14,13 +14,13 @@ __all__ = [
     # API client
     "OpenRouterClient",
     "create_model_callable",
-    # Task agent
-    "run_task_agent",
-    # Task DAG
-    "Task",
+    # Node agent
+    "run_node_agent",
+    # Node DAG
+    "Node",
     "resolve_dag",
-    "resolve_task_deps",
-    "validate_task_graph",
+    "resolve_deps",
+    "validate_graph",
     # Workspace orchestrator
     "Workspace",
     "WorkspaceResult",

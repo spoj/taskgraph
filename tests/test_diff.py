@@ -261,7 +261,7 @@ class TestPersistChanges:
         persist_changes(conn, "my_task", changes)
 
         rows = conn.execute(
-            "SELECT task, view_name, kind FROM _changes ORDER BY view_name"
+            "SELECT node, view_name, kind FROM _changes ORDER BY view_name"
         ).fetchall()
         assert len(rows) == 2
         assert rows[0] == ("my_task", "v1", "created")
@@ -284,7 +284,7 @@ class TestPersistChanges:
         persist_changes(conn, "task_b", [c2])
 
         rows = conn.execute(
-            "SELECT task, view_name FROM _changes ORDER BY task"
+            "SELECT node, view_name FROM _changes ORDER BY node"
         ).fetchall()
         assert len(rows) == 2
         assert rows[0] == ("task_a", "v1")
@@ -328,15 +328,13 @@ class TestWorkspaceChangesIntegration:
         from scripts.cli import main
 
         spec_source = """\
-INPUTS = {"t": [{"x": 1}, {"x": 2}]}
-
-TASKS = [
+NODES = [
+    {"name": "t", "source": [{"x": 1}, {"x": 2}]},
     {
         "name": "double",
-        "sql": "CREATE VIEW output AS SELECT x, x * 2 AS x2 FROM t",
-        "inputs": ["t"],
-        "outputs": ["output"],
-    }
+        "depends_on": ["t"],
+        "sql": "CREATE OR REPLACE VIEW double_output AS SELECT x, x * 2 AS x2 FROM t",
+    },
 ]
 """
         spec_module = _write_spec_module(tmp_path, spec_source)
@@ -352,9 +350,9 @@ TASKS = [
 
         conn = duckdb.connect(str(out_db), read_only=True)
         try:
-            rows = conn.execute("SELECT task, view_name, kind FROM _changes").fetchall()
+            rows = conn.execute("SELECT node, view_name, kind FROM _changes").fetchall()
             assert len(rows) == 1
-            assert rows[0] == ("double", "output", "created")
+            assert rows[0] == ("double", "double_output", "created")
         finally:
             conn.close()
 
@@ -363,15 +361,13 @@ TASKS = [
         from scripts.cli import main
 
         spec_source = """\
-INPUTS = {"t": [{"x": 1}, {"x": 2}]}
-
-TASKS = [
+NODES = [
+    {"name": "t", "source": [{"x": 1}, {"x": 2}]},
     {
         "name": "double",
-        "sql": "CREATE VIEW output AS SELECT x, x * 2 AS x2 FROM t",
-        "inputs": ["t"],
-        "outputs": ["output"],
-    }
+        "depends_on": ["t"],
+        "sql": "CREATE OR REPLACE VIEW double_output AS SELECT x, x * 2 AS x2 FROM t",
+    },
 ]
 """
         spec_module = _write_spec_module(tmp_path, spec_source)
@@ -384,4 +380,4 @@ TASKS = [
             env={"OPENROUTER_API_KEY": ""},
         )
         assert result.exit_code == 0, result.output
-        assert "+ output" in result.output
+        assert "+ double_output" in result.output

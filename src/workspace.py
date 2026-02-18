@@ -1,27 +1,33 @@
-"""Workspace orchestrator — resolve inputs, run task DAG, run exports.
+"""Workspace orchestrator — resolve DAG of nodes, execute, run exports.
 
 A workspace is a single DuckDB database containing:
-- Ingested input tables (from user-provided functions or data)
-- Per-task output views (created by agents, materialized as tables after task completion)
+- Ingested source tables (from user-provided functions, data, or files)
+- Per-node output views (created by SQL or agents, materialized as
+  tables after validation)
 - Metadata and trace tables
 
-Tasks are scheduled greedily: each task starts as soon as all its
-dependencies complete (not layer-by-layer). A failed task only blocks
+Nodes are scheduled greedily: each node starts as soon as all its
+dependencies complete (not layer-by-layer). A failed node only blocks
 its downstream dependents; unrelated branches continue.
 
-After a task passes validation, its declared output views are
-materialized as tables (frozen). The original SQL that created each
-view is already in ``_trace`` (logged during execution). A derived
-``_view_definitions`` view on ``_trace`` provides lineage queries.
-Intermediate views (``{task}_*``) are left as views for debuggability.
+Node types:
+- **source** — ingest data into table ``{name}``.
+- **sql** — execute deterministic SQL creating ``{name}_*`` views.
+- **prompt** — run LLM agent creating ``{name}_*`` views.
+
+After execution, ALL nodes go through the same post-execution flow:
+1. Validate outputs (``node.validate_outputs(conn)``)
+2. Execute validate_sql if present (create validation views)
+3. Check validation views (``node.validate_validation_views(conn)``)
+4. Materialize views (sql/prompt: all ``{name}_*`` views; source: none,
+   already a table — only validation views if they passed)
 
 Usage:
 
     workspace = Workspace(
-        db_path="output.db",
-        inputs={...},
-        tasks=[task_prep, task_match],
+        nodes=[source_node, prep_node, match_node],
         exports={"report.xlsx": write_report},
+        db_path="output.db",
     )
 
     results = await workspace.run(client, model="openai/gpt-5.2")
@@ -50,21 +56,18 @@ from .diff import (
 from .ingest import FileInput, ingest_file, ingest_table
 from .agent import (
     init_trace_table,
-    execute_sql,
-    run_task_agent,
-    run_sql_only_task,
+    run_node_agent,
+    run_sql_node,
+    run_validate_sql,
 )
-from .namespace import Namespace
 from .task import (
-    Task,
+    Node,
     resolve_dag,
-    resolve_task_deps,
-    validate_task_graph,
-    validation_view_prefix,
-    is_validation_view_for_task,
-    validate_one_validation_view,
+    resolve_deps,
+    validate_graph,
+    is_validation_view,
 )
-from .sql_utils import get_column_schema, split_sql_statements, extract_create_name
+from .sql_utils import get_column_schema
 
 log = logging.getLogger(__name__)
 
@@ -79,10 +82,10 @@ ExportFn = Callable[[duckdb.DuckDBPyConnection, Path], None]
 def persist_workspace_meta(
     conn: duckdb.DuckDBPyConnection,
     model: str,
-    tasks: list[Task],
+    nodes: list[Node],
     reasoning_effort: str | None = None,
     max_iterations: int | None = None,
-    input_row_counts: dict[str, int] | None = None,
+    source_row_counts: dict[str, int] | None = None,
     spec_module: str | None = None,
 ) -> None:
     """Write workspace-level metadata to _workspace_meta.
@@ -94,6 +97,7 @@ def persist_workspace_meta(
 
     Values are stored as strings. Most complex values are JSON.
     """
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _workspace_meta (
             key VARCHAR PRIMARY KEY,
@@ -102,16 +106,17 @@ def persist_workspace_meta(
     """)
     conn.execute("DELETE FROM _workspace_meta")
 
-    task_prompts = {t.name: t.prompt for t in tasks}
+    # Extract prompts from prompt nodes
+    node_prompts = {n.name: n.prompt for n in (nodes or []) if n.prompt}
 
     created_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    input_tables = list(sorted(input_row_counts.keys())) if input_row_counts else []
-    input_schemas: dict[str, list[dict[str, str]]] = {}
-    if input_tables:
-        for table in input_tables:
+    source_tables = list(sorted(source_row_counts.keys())) if source_row_counts else []
+    source_schemas: dict[str, list[dict[str, str]]] = {}
+    if source_tables:
+        for table in source_tables:
             rows_cols = get_column_schema(conn, table)
-            input_schemas[table] = [{"name": r[0], "type": r[1]} for r in rows_cols]
+            source_schemas[table] = [{"name": r[0], "type": r[1]} for r in rows_cols]
 
     try:
         tg_version = importlib.metadata.version("taskgraph")
@@ -124,7 +129,7 @@ def persist_workspace_meta(
         ("taskgraph_version", tg_version),
         ("python_version", sys.version.split()[0]),
         ("platform", platform.platform()),
-        ("task_prompts", json.dumps(task_prompts, sort_keys=True)),
+        ("node_prompts", json.dumps(node_prompts, sort_keys=True)),
         ("llm_model", model),
     ]
 
@@ -133,9 +138,11 @@ def persist_workspace_meta(
     if max_iterations is not None:
         rows.append(("llm_max_iterations", str(max_iterations)))
 
-    if input_row_counts:
-        rows.append(("inputs_row_counts", json.dumps(input_row_counts, sort_keys=True)))
-        rows.append(("inputs_schema", json.dumps(input_schemas, sort_keys=True)))
+    if source_row_counts:
+        rows.append(
+            ("inputs_row_counts", json.dumps(source_row_counts, sort_keys=True))
+        )
+        rows.append(("inputs_schema", json.dumps(source_schemas, sort_keys=True)))
 
     run_context: dict[str, Any] = {"mode": "run"}
     rows.append(("run", json.dumps(run_context, sort_keys=True)))
@@ -195,13 +202,12 @@ def _drop_views(conn: duckdb.DuckDBPyConnection, view_names: list[str]) -> None:
 def materialize_views(
     conn: duckdb.DuckDBPyConnection,
     view_names: list[str],
-    label: str,
 ) -> int:
     """Materialize a list of views as tables.
 
-    Core materialization logic shared by task outputs and input validation
-    views. For each view that exists, does a 3-step swap: CREATE TABLE
-    from view, DROP VIEW, RENAME TABLE.
+    Core materialization logic shared by all node types. For each view
+    that exists, does a 3-step swap: CREATE TABLE from view, DROP VIEW,
+    RENAME TABLE.
 
     The original CREATE VIEW SQL is already recorded in ``_trace`` (from
     the exec that created it). The ``_view_definitions`` view on ``_trace``
@@ -211,8 +217,6 @@ def materialize_views(
         conn: DuckDB connection.
         view_names: View names to materialize. Duplicates are ignored.
             Missing views are silently skipped.
-        label: Not used for lineage anymore (SQL is already in _trace).
-            Kept for API compatibility and logging.
 
     Returns the number of views materialized.
     """
@@ -232,7 +236,7 @@ def materialize_views(
             [view_name],
         ).fetchall()
         if not rows:
-            continue  # View doesn't exist (task may have failed or already materialized)
+            continue  # View doesn't exist (node may have failed or already materialized)
 
         # Materialize: create table from view, drop view, rename table.
         # Drop any leftover tmp table from a previous crashed run, then
@@ -255,332 +259,196 @@ def materialize_views(
     return materialized
 
 
-def materialize_task_outputs(
+def materialize_node_outputs(
     conn: duckdb.DuckDBPyConnection,
-    task: Task,
+    node: Node,
 ) -> int:
-    """Materialize a task's declared output views as tables.
+    """Materialize a node's output views as tables.
 
-    After a task completes and passes validation, its output views and
-    validation views are converted to tables so downstream tasks read
-    pre-computed data instead of re-evaluating the entire upstream view
-    chain on every query.
+    After a node completes and passes validation, views are discovered
+    from the DB catalog and materialized as tables so downstream nodes
+    read pre-computed data instead of re-evaluating the entire upstream
+    view chain on every query.
 
-    The original CREATE VIEW SQL is in ``_trace`` (logged when the agent
-    or SQL-only task executed it). The ``_view_definitions`` view on
-    ``_trace`` provides the same lineage interface.
+    What gets materialized depends on node type:
 
-    What gets materialized:
-    - Declared task outputs (``task.outputs``)
-    - Validation views (``{task}__validation*``)
-
-    What stays as views:
-    - Intermediate ``{task}_*`` views (for debuggability)
+    - **Source nodes**: only validation views (the ingested table already
+      exists).
+    - **SQL/prompt nodes**: all ``{node.name}_*`` views (excluding
+      validation views) plus validation views.
 
     Returns the number of views materialized.
     """
-    view_names = list(task.outputs) + task.validation_view_names()
-    return materialize_views(conn, view_names, label=task.name)
+    prefix = f"{node.name}_"
+    all_views = conn.execute(
+        "SELECT view_name FROM duckdb_views() WHERE internal = false"
+    ).fetchall()
+
+    if node.is_source():
+        # Source nodes: only validation views need materialization
+        validation_views = [
+            v[0] for v in all_views if is_validation_view(v[0], node.name)
+        ]
+        view_names = sorted(validation_views)
+    else:
+        # SQL/prompt nodes: all {name}_* views (excluding validation) + validation views
+        node_views = [
+            v[0]
+            for v in all_views
+            if v[0].startswith(prefix) and not is_validation_view(v[0], node.name)
+        ]
+        validation_views = [
+            v[0] for v in all_views if is_validation_view(v[0], node.name)
+        ]
+        view_names = sorted(node_views) + sorted(validation_views)
+
+    return materialize_views(conn, view_names)
 
 
 @dataclass
 class WorkspaceResult:
-    """Aggregated results from running all tasks in a workspace."""
+    """Aggregated results from running all nodes in a workspace."""
 
-    success: bool  # True if ALL tasks passed validation
-    task_results: dict[str, AgentResult]  # task_name -> AgentResult
+    success: bool  # True if ALL nodes passed validation
+    node_results: dict[str, AgentResult]  # node_name -> AgentResult
     elapsed_s: float
-    dag_layers: list[list[str]]  # For display: layer -> [task_names]
+    dag_layers: list[list[str]]  # For display: layer -> [node_names]
     export_errors: dict[str, str] = field(default_factory=dict)
-
-
-class InputValidator:
-    """Validates input tables after ingestion.
-
-    Owns the lifecycle state for validation view tracking and cleanup.
-    Runs two phases:
-    1. Column checks — each declared table has all required columns.
-    2. SQL validation — per-input CREATE VIEW statements producing
-       {input_name}__validation* views with status/message columns.
-
-    Input validation SQL is namespace-enforced: each input's SQL can
-    only create views matching ``{input_name}__validation*``.  Statements
-    go through ``execute_sql()`` with ``ddl_only=True`` and a
-    ``Namespace.for_input()`` — the same enforcement pipeline used by
-    task agents and SQL-only tasks.
-
-    On success, validation views are materialized as tables (same pattern
-    as task validation views) with SQL preserved in ``_view_definitions``.
-    On failure, all created views are dropped for cleanup.
-    """
-
-    __slots__ = (
-        "conn",
-        "input_columns",
-        "input_validate_sql",
-        "_created_views",
-        "_per_input_views",
-    )
-
-    def __init__(
-        self,
-        conn: duckdb.DuckDBPyConnection,
-        input_columns: dict[str, list[str]],
-        input_validate_sql: dict[str, str],
-    ) -> None:
-        self.conn = conn
-        self.input_columns = input_columns
-        self.input_validate_sql = input_validate_sql
-        self._created_views: list[str] = []
-        self._per_input_views: dict[str, list[str]] = {}
-
-    def _cleanup(self) -> None:
-        """Drop all created validation views (error path)."""
-        _drop_views(self.conn, self._created_views)
-
-    def _check_columns(self) -> list[str]:
-        """Phase 1: Check required columns exist in input tables."""
-        errors: list[str] = []
-
-        for table_name, required_cols in self.input_columns.items():
-            try:
-                actual_cols = {
-                    row[0]
-                    for row in self.conn.execute(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_name = ?",
-                        [table_name],
-                    ).fetchall()
-                }
-            except duckdb.Error as e:
-                errors.append(f"Schema check error for input '{table_name}': {e}")
-                continue
-
-            if not actual_cols:
-                errors.append(f"Input table '{table_name}' not found.")
-                continue
-
-            missing = [c for c in required_cols if c not in actual_cols]
-            if missing:
-                errors.append(
-                    f"Input '{table_name}' is missing required column(s): "
-                    f"{', '.join(missing)}. "
-                    f"Actual columns: {', '.join(sorted(actual_cols - {'_row_id'}))}"
-                )
-
-        return errors
-
-    def _execute_validation_sql(
-        self, table_name: str, sql: str, ns: Namespace
-    ) -> str | None:
-        """Execute a single input validation SQL statement.
-
-        Routes through ``execute_sql()`` for namespace enforcement and
-        tracing (GAP 6 fix — previously called raw ``conn.execute()``).
-
-        Returns an error message on failure, or None on success.
-        """
-        result = execute_sql(
-            self.conn,
-            sql,
-            namespace=ns,
-            task_name=table_name,
-            ddl_only=True,
-            source="input_validation",
-        )
-        if not result.get("success", False):
-            error = result.get("error", "SQL execution failed")
-            return f"Input validation SQL error for '{table_name}': {error}"
-        return None
-
-    def _run_validation_sql(self) -> list[str]:
-        """Phase 2: Execute per-input validation SQL and check results."""
-        errors: list[str] = []
-
-        for table_name, validate_sql in self.input_validate_sql.items():
-            stmts = split_sql_statements(validate_sql)
-            ns = Namespace.for_input(table_name)
-
-            # Execute all statements (CREATE VIEW etc.)
-            for sql in stmts:
-                err = self._execute_validation_sql(table_name, sql, ns)
-                if err:
-                    errors.append(err)
-                    self._cleanup()
-                    return errors
-
-            # Discover created validation views for this input
-            input_views: list[str] = []
-            prefix = validation_view_prefix(table_name)
-            for stmt in stmts:
-                name = extract_create_name(stmt)
-                if name and is_validation_view_for_task(name, table_name):
-                    input_views.append(name)
-                    self._created_views.append(name)
-
-            if not input_views:
-                errors.append(
-                    f"Input '{table_name}' validate_sql did not create any "
-                    f"'{prefix}' views."
-                )
-                self._cleanup()
-                return errors
-
-            self._per_input_views[table_name] = input_views
-
-            # Validate the views
-            for view_name in input_views:
-                view_errors, fatal = validate_one_validation_view(self.conn, view_name)
-                if view_errors:
-                    errors.extend(view_errors)
-                if fatal:
-                    self._cleanup()
-                    return errors
-
-            if errors:
-                self._cleanup()
-                return errors
-
-        return errors
-
-    def _materialize(self) -> None:
-        """Materialize all passing validation views as tables."""
-        for table_name, view_names in self._per_input_views.items():
-            n = materialize_views(self.conn, view_names, label=table_name)
-            if n:
-                log.debug(
-                    "Materialized %d input validation view(s) for '%s'",
-                    n,
-                    table_name,
-                )
-
-    def run(self) -> list[str]:
-        """Run all validation checks.
-
-        Returns list of error messages (empty = pass).
-        """
-        errors = self._check_columns()
-        if errors:
-            return errors
-
-        errors = self._run_validation_sql()
-        if errors:
-            return errors
-
-        self._materialize()
-        return []
 
 
 @dataclass
 class Workspace:
-    """A multi-task workspace backed by a single DuckDB database.
+    """A multi-node workspace backed by a single DuckDB database.
 
     Args:
-        db_path: Path for the output database (created fresh).
-    inputs: Mapping of table_name -> file input, callable, or raw data.
-        File inputs are parsed by the spec loader and ingested via DuckDB
-        or the PDF extractor. Callables return DataFrame, list[dict], or
-        dict[str, list]. Non-callables are treated as raw data directly.
-        tasks: List of Task definitions forming a DAG.
+        nodes: List of Node definitions forming a DAG.  Each node is
+            one of: source (data ingestion), sql (deterministic SQL),
+            or prompt (LLM-driven).  Source nodes are scheduled through
+            the same DAG as sql/prompt nodes.
         exports: Mapping of output_path -> fn(conn, path).
-            Export functions run after all tasks pass. They receive the
+            Export functions run after all nodes pass. They receive the
             open database connection and the output file path. Paths
             are relative to CWD.
-        input_columns: Optional column validation for input tables.
-            Maps table_name -> list of required column names.
-            Checked after ingestion, before tasks run.
-        input_validate_sql: Optional SQL validation for input tables.
-            Maps table_name -> SQL string that creates
-            {input_name}__validation* views with status/message columns.
-            Same contract as task validate_sql. Passing views are
-            materialized as tables; failing views are dropped.
-            Checked after input_columns, before tasks.
+        db_path: Path for the output database (created fresh).
         spec_module: Module path used to load the spec.
     """
 
     db_path: Path | str
-    inputs: dict[str, InputValue]
-    tasks: list[Task]
+    nodes: list[Node] = field(default_factory=list)
     exports: dict[str, ExportFn] = field(default_factory=dict)
-    input_columns: dict[str, list[str]] = field(default_factory=dict)
-    input_validate_sql: dict[str, str] = field(default_factory=dict)
     spec_module: str | None = None
 
     def _validate_config(self) -> None:
         """Validate the workspace configuration before running."""
-        errors = validate_task_graph(self.tasks, set(self.inputs.keys()))
+        errors = validate_graph(self.nodes)
         if errors:
             raise ValueError(
-                "Task graph validation failed:\n"
-                + "\n".join(f"  - {e}" for e in errors)
+                "Graph validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
             )
 
-    async def _ingest_all(
-        self, conn: duckdb.DuckDBPyConnection, client: Any | None
-    ) -> dict[str, int]:
-        """Resolve all inputs and ingest into the database.
+    # ------------------------------------------------------------------
+    # Source node ingestion
+    # ------------------------------------------------------------------
 
-        Auto-checks:
-        - Callable errors are caught and re-raised with context.
-        - Empty tables log a warning (not an error).
+    async def _ingest_node(
+        self, conn: duckdb.DuckDBPyConnection, node: Node, client: Any | None
+    ) -> int:
+        """Ingest a single source node into the database.
 
-        Returns dict of table_name -> row_count.
+        Returns row count. Raises on failure.
         """
-        row_counts: dict[str, int] = {}
-        for table_name, value in self.inputs.items():
-            if isinstance(value, FileInput):
-                await ingest_file(conn, value, table_name, client=client)
-            elif callable(value):
-                try:
-                    data = value()
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Input '{table_name}' callable failed: {e}"
-                    ) from e
-                ingest_table(conn, data, table_name)
-            else:
-                ingest_table(conn, value, table_name)
-            row = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()
-            count = row[0] if row else 0
-            row_counts[table_name] = count
-            if count == 0:
-                log.warning("  %s: 0 rows (empty table)", table_name)
-            else:
-                log.info("  %s: %d rows", table_name, count)
-        return row_counts
+        value = node.source
+        if isinstance(value, FileInput):
+            await ingest_file(conn, value, node.name, client=client)
+        elif callable(value):
+            try:
+                data = value()
+            except Exception as e:
+                raise RuntimeError(f"Source '{node.name}' callable failed: {e}") from e
+            ingest_table(conn, data, node.name)
+        else:
+            ingest_table(conn, value, node.name)
 
-    def _validate_inputs(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
-        """Validate input tables after ingestion.
+        row = conn.execute(f'SELECT COUNT(*) FROM "{node.name}"').fetchone()
+        count = row[0] if row else 0
+        if count == 0:
+            log.warning("  %s: 0 rows (empty table)", node.name)
+        else:
+            log.info("  %s: %d rows", node.name, count)
+        return count
 
-        Delegates to InputValidator which owns the lifecycle state for
-        validation view tracking and cleanup.
+    # ------------------------------------------------------------------
+    # Post-execution flow (unified for all node types)
+    # ------------------------------------------------------------------
 
-        Returns list of error messages (empty = pass).
+    def _post_execute(
+        self, conn: duckdb.DuckDBPyConnection, node: Node
+    ) -> tuple[bool, str]:
+        """Unified post-execution: validate outputs, run validate_sql, check
+        validation views, materialize.
+
+        Returns (success, error_message).
         """
-        return InputValidator(conn, self.input_columns, self.input_validate_sql).run()
+        # 1. Validate outputs (columns for source, output_columns for sql/prompt)
+        errors = node.validate_outputs(conn)
+        if errors:
+            return False, "\n".join(f"- {e}" for e in errors)
+
+        # 2. Run validate_sql if present
+        if node.has_validation():
+            val_errors = run_validate_sql(conn=conn, node=node)
+            if val_errors:
+                return False, "\n".join(f"- {e}" for e in val_errors)
+
+            # 3. Check validation views
+            errors = node.validate_validation_views(conn)
+            if errors:
+                return False, "\n".join(f"- {e}" for e in errors)
+
+        # 4. Materialize
+        self._materialize_node(conn, node)
+        return True, ""
+
+    def _materialize_node(self, conn: duckdb.DuckDBPyConnection, node: Node) -> int:
+        """Materialize views for a node after successful validation.
+
+        Delegates to :func:`materialize_node_outputs` which handles both
+        source nodes (only validation views) and sql/prompt nodes (all
+        ``{name}_*`` views + validation views).
+
+        Returns the number of views materialized.
+        """
+        n = materialize_node_outputs(conn, node)
+        if n:
+            log.debug("[%s] Materialized %d view(s)", node.name, n)
+        return n
+
+    # ------------------------------------------------------------------
+    # DAG execution
+    # ------------------------------------------------------------------
 
     @staticmethod
-    async def _run_task_dag(
-        tasks: list[Task],
-        run_one: Callable[[Task], Any],
+    async def _run_dag(
+        nodes: list[Node],
+        run_one: Callable[[Node], Any],
     ) -> tuple[dict[str, AgentResult], bool]:
-        """Schedule tasks as soon as their dependencies are met.
+        """Schedule nodes as soon as their dependencies are met.
 
         Args:
-            tasks: All tasks in the DAG.
-            run_one: Async callable (task) -> (task_name, AgentResult).
+            nodes: All nodes in the DAG.
+            run_one: Async callable (node) -> (node_name, AgentResult).
 
         Returns:
-            (task_results dict, all_success bool)
+            (results dict, all_success bool)
         """
-        task_by_name = {t.name: t for t in tasks}
-        deps = resolve_task_deps(tasks)
-        task_results: dict[str, AgentResult] = {}
+        node_by_name = {n.name: n for n in nodes}
+        deps = resolve_deps(nodes)
+        results: dict[str, AgentResult] = {}
         all_success = True
         done: set[str] = set()
         failed: set[str] = set()
         running: set[str] = set()
-        pending = set(task_by_name.keys())
+        pending = set(node_by_name.keys())
         active: set[asyncio.Task] = set()
 
         def launch_ready() -> None:
@@ -592,7 +460,7 @@ class Workspace:
                     continue
                 if deps[name] <= done:
                     running.add(name)
-                    t = asyncio.create_task(run_one(task_by_name[name]))
+                    t = asyncio.create_task(run_one(node_by_name[name]))
                     active.add(t)
                     newly_launched.append(name)
             for name in newly_launched:
@@ -609,7 +477,7 @@ class Workspace:
                 if exc is not None:
                     raise exc
                 name, result = fut.result()
-                task_results[name] = result
+                results[name] = result
                 done.add(name)
                 running.discard(name)
                 if not result.success:
@@ -625,7 +493,86 @@ class Workspace:
                 "Skipped (blocked by failed deps): %s", ", ".join(sorted(blocked))
             )
 
-        return task_results, all_success
+        return results, all_success
+
+    # ------------------------------------------------------------------
+    # Node execution (dispatches by type)
+    # ------------------------------------------------------------------
+
+    async def _execute_source_node(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        node: Node,
+        client: Any | None,
+    ) -> AgentResult:
+        """Execute a source node: ingest data, return AgentResult."""
+        start_time = time.time()
+        try:
+            row_count = await self._ingest_node(conn, node, client)
+        except Exception as e:
+            elapsed = time.time() - start_time
+            return AgentResult(
+                success=False,
+                final_message=f"Source ingestion failed: {e}",
+                iterations=0,
+                messages=[],
+                tool_calls_count=0,
+            )
+
+        # Post-execution: validate outputs + validate_sql + materialize
+        success, err_msg = self._post_execute(conn, node)
+        if not success:
+            return AgentResult(
+                success=False,
+                final_message=err_msg,
+                iterations=0,
+                messages=[],
+                tool_calls_count=0,
+            )
+
+        return AgentResult(
+            success=True,
+            final_message=f"OK ({row_count} rows)",
+            iterations=0,
+            messages=[],
+            tool_calls_count=0,
+        )
+
+    async def _execute_sql_node(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        node: Node,
+    ) -> AgentResult:
+        """Execute a SQL node and return its result.
+
+        Validation (outputs + validate_sql) runs inside run_sql_node.
+        Post-execution materialization is handled by the caller.
+        """
+        return await run_sql_node(conn=conn, node=node)
+
+    async def _execute_prompt_node(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        node: Node,
+        client: OpenRouterClient,
+        model: str,
+        max_iterations: int,
+    ) -> AgentResult:
+        """Execute a prompt node (LLM agent) and return its result.
+
+        Validation runs inside the agent loop.
+        """
+        return await run_node_agent(
+            conn=conn,
+            node=node,
+            client=client,
+            model=model,
+            max_iterations=max_iterations,
+        )
+
+    # ------------------------------------------------------------------
+    # Exports
+    # ------------------------------------------------------------------
 
     def _run_exports(self, conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
         """Run export functions. Returns dict of name -> error for failures."""
@@ -639,39 +586,9 @@ class Workspace:
                 log.error("  %s: FAILED (%s)", output_path, e)
         return errors
 
-    async def _execute_task(
-        self,
-        conn: duckdb.DuckDBPyConnection,
-        task: Task,
-        client: OpenRouterClient | None,
-        model: str,
-        max_iterations: int,
-    ) -> AgentResult:
-        """Execute a single task (SQL or LLM) and return its result.
-
-        For LLM tasks, both structural and SQL validation run inside the
-        agent loop — the agent gets feedback and self-corrects within its
-        iteration budget.
-
-        For SQL-only tasks, validation runs once after execution (no agent
-        to retry).
-        """
-        mode = task.transform_mode()
-
-        if mode == "sql":
-            return await run_sql_only_task(conn=conn, task=task)
-        elif mode == "prompt":
-            if client is None:
-                raise RuntimeError(f"Task '{task.name}' requires an OpenRouterClient")
-            return await run_task_agent(
-                conn=conn,
-                task=task,
-                client=client,
-                model=model,
-                max_iterations=max_iterations,
-            )
-        else:
-            raise RuntimeError(f"Unknown task mode: {mode}")
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     async def run(
         self,
@@ -679,24 +596,21 @@ class Workspace:
         model: str = DEFAULT_MODEL,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
     ) -> WorkspaceResult:
-        """Run the full workspace: ingest, resolve DAG, execute tasks, export.
+        """Run the full workspace: resolve DAG, execute all nodes, export.
 
-        Each task starts as soon as all its dependencies complete
+        Each node starts as soon as all its dependencies complete
         (cooperative async — DuckDB access naturally serialized).
-        If a task fails, only its downstream dependents are blocked.
-        Export functions run after all tasks pass.
+        If a node fails, only its downstream dependents are blocked.
+        Export functions run after all nodes pass.
 
         Returns:
-            WorkspaceResult with per-task results and overall status.
+            WorkspaceResult with per-node results and overall status.
         """
         start_time = time.time()
         self._validate_config()
 
-        layers = resolve_dag(self.tasks)
-        dag_layer_names = [[t.name for t in layer] for layer in layers]
-
-        # Workspace task display is now handled by the CLI for tree formatting.
-        # This keeps the workspace focused on execution.
+        layers = resolve_dag(self.nodes)
+        dag_layer_names = [[n.name for n in layer] for layer in layers]
 
         # Create fresh database
         db_path = Path(self.db_path)
@@ -706,66 +620,73 @@ class Workspace:
         try:
             init_trace_table(conn)
 
-            log.info("Ingesting %d input(s)...", len(self.inputs))
-            input_row_counts = await self._ingest_all(conn, client=client)
+            # Track row counts for source nodes (populated during execution)
+            source_row_counts: dict[str, int] = {}
 
-            # Persist workspace metadata (after ingestion so we have row counts)
+            async def run_one(node: Node) -> tuple[str, AgentResult]:
+                log.info(
+                    "[%s] Starting (%s)",
+                    node.name,
+                    node.node_type(),
+                )
+                before = snapshot_views(conn)
+
+                if node.is_source():
+                    result = await self._execute_source_node(conn, node, client)
+                    # Track row count for metadata
+                    if result.success:
+                        try:
+                            row = conn.execute(
+                                f'SELECT COUNT(*) FROM "{node.name}"'
+                            ).fetchone()
+                            source_row_counts[node.name] = row[0] if row else 0
+                        except duckdb.Error:
+                            pass
+                elif node.node_type() == "sql":
+                    result = await self._execute_sql_node(conn, node)
+                elif node.node_type() == "prompt":
+                    if client is None:
+                        raise RuntimeError(
+                            f"Node '{node.name}' requires an OpenRouterClient"
+                        )
+                    result = await self._execute_prompt_node(
+                        conn, node, client, model, max_iterations
+                    )
+                else:
+                    raise RuntimeError(f"Unknown node type: {node.node_type()}")
+
+                # Snapshot BEFORE materialization to capture view changes
+                after = snapshot_views(conn)
+                changes = diff_snapshots(before, after)
+
+                # Materialize on success (sql/prompt nodes only — source
+                # nodes handle materialization inside _execute_source_node
+                # via _post_execute)
+                if result.success and not node.is_source():
+                    self._materialize_node(conn, node)
+
+                if changes:
+                    persist_changes(conn, node.name, changes)
+                    change_summary = format_changes(node.name, changes)
+                    if change_summary:
+                        log.info("%s", change_summary)
+
+                return node.name, result
+
+            node_results, all_success = await self._run_dag(self.nodes, run_one)
+
+            # Persist workspace metadata (after execution so we have row counts)
             persist_workspace_meta(
                 conn,
                 model,
-                tasks=self.tasks,
+                nodes=self.nodes,
                 reasoning_effort=client.reasoning_effort if client else None,
                 max_iterations=max_iterations,
-                input_row_counts=input_row_counts,
+                source_row_counts=source_row_counts if source_row_counts else None,
                 spec_module=self.spec_module,
             )
 
-            # Validate inputs before running tasks
-            if self.input_columns or self.input_validate_sql:
-                log.info("Validating inputs...")
-                input_errors = self._validate_inputs(conn)
-                if input_errors:
-                    elapsed_s = time.time() - start_time
-                    log.error("Input validation failed:")
-                    for e in input_errors:
-                        log.error("  - %s", e)
-                    raise ValueError(
-                        "Input validation failed:\n"
-                        + "\n".join(f"  - {e}" for e in input_errors)
-                    )
-
-            async def run_one(task: Task) -> tuple[str, AgentResult]:
-                log.info(
-                    "[%s] Starting (outputs: %s)",
-                    task.name,
-                    ", ".join(task.outputs),
-                )
-                before = snapshot_views(conn)
-                result = await self._execute_task(
-                    conn=conn,
-                    task=task,
-                    client=client,
-                    model=model,
-                    max_iterations=max_iterations,
-                )
-                after = snapshot_views(conn)
-                changes = diff_snapshots(before, after)
-                if changes:
-                    persist_changes(conn, task.name, changes)
-                    change_summary = format_changes(task.name, changes)
-                    if change_summary:
-                        log.info("%s", change_summary)
-                # Materialize successful task outputs as tables so downstream
-                # tasks read pre-computed data instead of re-evaluating view chains.
-                if result.success:
-                    n = materialize_task_outputs(conn, task)
-                    if n:
-                        log.debug("[%s] Materialized %d output(s)", task.name, n)
-                return task.name, result
-
-            task_results, all_success = await self._run_task_dag(self.tasks, run_one)
-
-            # Run exports if all tasks passed
+            # Run exports if all nodes passed
             export_errors: dict[str, str] = {}
             if all_success and self.exports:
                 log.info("--- Exports (%d) ---", len(self.exports))
@@ -792,7 +713,7 @@ class Workspace:
 
             status = "ALL PASSED" if all_success else "SOME FAILED"
             log.info("--- Workspace complete: %s (%.1fs) ---", status, elapsed_s)
-            for name, result in task_results.items():
+            for name, result in node_results.items():
                 s = "PASS" if result.success else "FAIL"
                 tokens = (
                     result.usage["prompt_tokens"] + result.usage["completion_tokens"]
@@ -808,7 +729,7 @@ class Workspace:
 
             return WorkspaceResult(
                 success=all_success and not export_errors,
-                task_results=task_results,
+                node_results=node_results,
                 elapsed_s=elapsed_s,
                 dag_layers=dag_layer_names,
                 export_errors=export_errors,

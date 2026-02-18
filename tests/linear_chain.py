@@ -9,10 +9,10 @@ Usage:
     taskgraph run --spec tests.linear_chain -o output.db
 """
 
-# --- Inputs ---
-
-INPUTS = {
-    "raw_orders": {
+NODES = [
+    # --- Sources ---
+    {
+        "name": "raw_orders",
         "source": [
             {
                 "order_id": "ORD-001",
@@ -47,7 +47,8 @@ INPUTS = {
         ],
         "columns": ["order_id", "customer", "items", "date"],
     },
-    "price_list": {
+    {
+        "name": "price_list",
         "source": [
             {"sku": "widget_a", "unit_price": 10.00},
             {"sku": "widget_b", "unit_price": 25.00},
@@ -55,72 +56,68 @@ INPUTS = {
         ],
         "columns": ["sku", "unit_price"],
     },
-}
-
-# --- Tasks: linear chain ---
-
-parse = {
-    "name": "parse",
-    "sql": """
-        CREATE OR REPLACE VIEW order_lines AS
-        SELECT
-            o.order_id,
-            o.customer,
-            o.date,
-            split_part(item, ':', 1) AS sku,
-            CAST(split_part(item, ':', 2) AS INTEGER) AS quantity
-        FROM raw_orders o,
-        UNNEST(string_split(o.items, ',')) AS t(item)
-        """,
-    "inputs": ["raw_orders"],
-    "outputs": ["order_lines"],
-    "output_columns": {
-        "order_lines": ["order_id", "customer", "date", "sku", "quantity"],
+    # --- Transforms: linear chain ---
+    {
+        "name": "parse",
+        "depends_on": ["raw_orders"],
+        "sql": """
+            CREATE OR REPLACE VIEW parse_order_lines AS
+            SELECT
+                o.order_id,
+                o.customer,
+                o.date,
+                split_part(item, ':', 1) AS sku,
+                CAST(split_part(item, ':', 2) AS INTEGER) AS quantity
+            FROM raw_orders o,
+            UNNEST(string_split(o.items, ',')) AS t(item)
+            """,
+        "output_columns": {
+            "parse_order_lines": ["order_id", "customer", "date", "sku", "quantity"],
+        },
     },
-}
-
-enrich = {
-    "name": "enrich",
-    "sql": """
-        CREATE OR REPLACE VIEW enriched_lines AS
-        SELECT
-            l.*, p.unit_price, l.quantity * p.unit_price AS line_total
-        FROM order_lines l
-        JOIN price_list p ON p.sku = l.sku
-        """,
-    "inputs": ["order_lines", "price_list"],
-    "outputs": ["enriched_lines"],
-    "output_columns": {
-        "enriched_lines": ["unit_price", "line_total"],
+    {
+        "name": "enrich",
+        "depends_on": ["parse", "price_list"],
+        "sql": """
+            CREATE OR REPLACE VIEW enrich_lines AS
+            SELECT
+                l.*, p.unit_price, l.quantity * p.unit_price AS line_total
+            FROM parse_order_lines l
+            JOIN price_list p ON p.sku = l.sku
+            """,
+        "output_columns": {
+            "enrich_lines": ["unit_price", "line_total"],
+        },
     },
-}
+    {
+        "name": "aggregate",
+        "depends_on": ["enrich"],
+        "sql": """
+            CREATE OR REPLACE VIEW aggregate_customer_totals AS
+            SELECT
+                customer,
+                COUNT(DISTINCT order_id) AS order_count,
+                SUM(quantity) AS total_items,
+                SUM(line_total) AS total_spend
+            FROM enrich_lines
+            GROUP BY customer;
 
-aggregate = {
-    "name": "aggregate",
-    "sql": """
-        CREATE OR REPLACE VIEW customer_totals AS
-        SELECT
-            customer,
-            COUNT(DISTINCT order_id) AS order_count,
-            SUM(quantity) AS total_items,
-            SUM(line_total) AS total_spend
-        FROM enriched_lines
-        GROUP BY customer;
-
-        CREATE OR REPLACE VIEW sku_totals AS
-        SELECT
-            sku,
-            SUM(quantity) AS total_quantity,
-            SUM(line_total) AS total_revenue
-        FROM enriched_lines
-        GROUP BY sku
-        """,
-    "inputs": ["enriched_lines"],
-    "outputs": ["customer_totals", "sku_totals"],
-    "output_columns": {
-        "customer_totals": ["customer", "order_count", "total_items", "total_spend"],
-        "sku_totals": ["sku", "total_quantity", "total_revenue"],
+            CREATE OR REPLACE VIEW aggregate_sku_totals AS
+            SELECT
+                sku,
+                SUM(quantity) AS total_quantity,
+                SUM(line_total) AS total_revenue
+            FROM enrich_lines
+            GROUP BY sku
+            """,
+        "output_columns": {
+            "aggregate_customer_totals": [
+                "customer",
+                "order_count",
+                "total_items",
+                "total_spend",
+            ],
+            "aggregate_sku_totals": ["sku", "total_quantity", "total_revenue"],
+        },
     },
-}
-
-TASKS = [parse, enrich, aggregate]
+]

@@ -44,10 +44,10 @@ from src.agent_loop import DEFAULT_MAX_ITERATIONS
 from src.spec import load_spec_from_module, resolve_module_path
 from src.workspace import Workspace, read_workspace_meta
 from src.task import (
-    Task,
+    Node,
     resolve_dag,
-    resolve_task_deps,
-    validate_task_graph,
+    resolve_deps,
+    validate_graph,
     MAX_INLINE_MESSAGES,
 )
 
@@ -74,7 +74,7 @@ def _require_openrouter_api_key() -> None:
 
 @click.group()
 def main():
-    """Taskgraph — multi-task workspace runner."""
+    """Taskgraph — multi-node workspace runner."""
 
 
 def _default_spec_module() -> str:
@@ -217,24 +217,23 @@ spec = "specs.main"
     if not spec_path.exists() or force:
         spec_path.write_text(
             """\
-INPUTS = {
-    "data": [
-        {"x": 1},
-        {"x": 2},
-        {"x": 3},
-    ],
-}
-
-TASKS = [
+NODES = [
+    {
+        "name": "data",
+        "source": [
+            {"x": 1},
+            {"x": 2},
+            {"x": 3},
+        ],
+    },
     {
         "name": "double",
+        "depends_on": ["data"],
         # sql: deterministic SQL, no LLM needed.
         # Use "prompt" for LLM-driven transforms.
-        "sql": "CREATE VIEW output AS SELECT x, x * 2 AS x2 FROM data",
-        "inputs": ["data"],
-        "outputs": ["output"],
-        "output_columns": {"output": ["x", "x2"]},
-    }
+        "sql": "CREATE OR REPLACE VIEW double_output AS SELECT x, x * 2 AS x2 FROM data",
+        "output_columns": {"double_output": ["x", "x2"]},
+    },
 ]
 """
         )
@@ -250,7 +249,7 @@ TASKS = [
             guide_dst.write_text(guide_src.read_text())
             created.append("SPEC_GUIDE.md")
         except OSError:
-            pass  # Source not available (installed without docs)
+            skipped.append("SPEC_GUIDE.md (source not available)")
     else:
         skipped.append("SPEC_GUIDE.md")
 
@@ -292,15 +291,18 @@ TASKS = [
     click.echo("  tg run")
 
 
-def _format_task_tree(tasks: list[Task]) -> list[str]:
-    """Format task DAG as a list of tree lines."""
-    if not tasks:
-        return ["  (no tasks)"]
+def _format_node_tree(nodes: list[Node]) -> list[str]:
+    """Format node DAG as a list of tree lines.
 
-    deps = resolve_task_deps(tasks)
-    task_by_name = {t.name: t for t in tasks}
+    Shows all node types: [source], [sql], [prompt].
+    """
+    if not nodes:
+        return ["  (no nodes)"]
+
+    deps = resolve_deps(nodes)
+    node_by_name = {n.name: n for n in nodes}
     # parent -> sorted children
-    children: dict[str, list[str]] = {t.name: [] for t in tasks}
+    children: dict[str, list[str]] = {n.name: [] for n in nodes}
     for name, parents in deps.items():
         for p in parents:
             children[p].append(name)
@@ -308,40 +310,48 @@ def _format_task_tree(tasks: list[Task]) -> list[str]:
         children[p] = sorted(set(children[p]))
 
     roots = sorted([name for name, parents in deps.items() if not parents])
-    all_task_outputs: set[str] = set()
-    for t in tasks:
-        all_task_outputs.update(t.outputs)
 
-    def _fmt_details(t: Task) -> str:
-        kind = t.transform_mode()
-        validation = "yes" if t.has_validation() else "no"
-        if t.inputs:
-            inp_parts = []
-            for inp in t.inputs:
-                if inp in all_task_outputs:
-                    inp_parts.append(inp)
+    def _fmt_details(n: Node) -> str:
+        ntype = n.node_type()
+        parts: list[str] = [f"[{ntype}]"]
+
+        if ntype == "source":
+            # Describe the source
+            src = n.source
+            if callable(src) and not isinstance(src, FileInput):
+                parts.append("(callable)")
+            elif isinstance(src, FileInput):
+                parts.append(f"({src.path})")
+            elif isinstance(src, str):
+                parts.append(f"({src})")
+            elif isinstance(src, (list, dict)):
+                if isinstance(src, list):
+                    parts.append(f"({len(src)} rows)")
                 else:
-                    inp_parts.append(f"{inp} (table)")
-            inp_s = ", ".join(inp_parts)
+                    parts.append("(dict)")
+            if n.columns:
+                parts.append(f"columns: {', '.join(n.columns)}")
         else:
-            inp_s = "(none)"
+            # sql or prompt node
+            if n.depends_on:
+                dep_s = ", ".join(n.depends_on)
+                parts.append(f"depends on: {dep_s}")
+            if n.output_columns:
+                out_parts = []
+                for o, cols in n.output_columns.items():
+                    out_parts.append(f"{o}({', '.join(cols)})" if cols else o)
+                parts.append(" -> " + ", ".join(out_parts))
+            if n.has_validation():
+                parts.append("validate=yes")
 
-        out_parts = []
-        for o in t.outputs:
-            cols = t.output_columns.get(o, [])
-            out_parts.append(f"{o} ({len(cols)} cols)" if cols else o)
-
-        return (
-            f"type={kind}  validate={validation}  in={inp_s}  "
-            f"out={', '.join(out_parts) if out_parts else '(none)'}"
-        )
+        return "  ".join(parts)
 
     lines: list[str] = []
 
     def _emit(name: str, prefix: str, is_last: bool, stack: set[str], seen: set[str]):
-        t = task_by_name[name]
+        n = node_by_name[name]
         branch = "`- " if is_last else "|- "
-        lines.append(f"{prefix}{branch}{name}  {_fmt_details(t)}")
+        lines.append(f"{prefix}{branch}{name}  {_fmt_details(n)}")
 
         if name in stack:
             lines.append(f"{prefix}{'   ' if is_last else '|  '}[cycle]")
@@ -401,7 +411,7 @@ def _format_task_tree(tasks: list[Task]) -> list[str]:
     "--max-iterations",
     default=DEFAULT_MAX_ITERATIONS,
     type=int,
-    help=f"Maximum agent iterations per task (default: {DEFAULT_MAX_ITERATIONS})",
+    help=f"Maximum agent iterations per node (default: {DEFAULT_MAX_ITERATIONS})",
 )
 @click.option("--quiet", "-q", is_flag=True, help="Suppress verbose output")
 @click.option(
@@ -447,6 +457,7 @@ def run(
         output = Path(output)
         if output.suffix != ".db":
             output = output.with_suffix(".db")
+            log.warning("Output path adjusted to %s (added .db suffix)", output)
 
     # Resolve and validate spec module
     try:
@@ -456,7 +467,7 @@ def run(
 
     # Load workspace spec
     try:
-        loaded = load_spec_from_module(spec)
+        nodes, exports = load_spec_from_module(spec)
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -470,31 +481,36 @@ def run(
 
     workspace = Workspace(
         db_path=output,
-        inputs=loaded["inputs"],
-        tasks=loaded["tasks"],
-        exports=loaded["exports"],
-        input_columns=loaded["input_columns"],
-        input_validate_sql=loaded["input_validate_sql"],
+        nodes=nodes,
+        exports=exports,
         spec_module=spec,
     )
+
+    source_nodes = [n for n in nodes if n.is_source()]
+    transform_nodes = [n for n in nodes if not n.is_source()]
 
     log.info("Spec: %s", spec)
     log.info("Output: %s", output)
     log.info("Model: %s", model)
-    log.info("Tasks: %d", len(loaded["tasks"]))
+    log.info(
+        "Nodes: %d (%d sources, %d transforms)",
+        len(nodes),
+        len(source_nodes),
+        len(transform_nodes),
+    )
 
-    # Show task tree before running
-    tree_lines = _format_task_tree(loaded["tasks"])
+    # Show node tree before running
+    tree_lines = _format_node_tree(nodes)
     if tree_lines:
         log.info("\nDAG (tree):")
         for line in tree_lines:
             log.info(line)
         log.info("")
 
-    needs_llm = any(t.transform_mode() == "prompt" for t in loaded["tasks"])
+    needs_llm = any(n.node_type() == "prompt" for n in nodes)
     needs_pdf = any(
-        isinstance(value, FileInput) and value.format == "pdf"
-        for value in loaded["inputs"].values()
+        isinstance(n.source, FileInput) and n.source.format == "pdf"
+        for n in source_nodes
     )
     needs_client = needs_llm or needs_pdf
     if needs_client:
@@ -516,16 +532,16 @@ def run(
     result = asyncio.run(_run())
 
     log.info("Saved to: %s", output)
-    log.info("Task metadata: SELECT task, meta_json FROM _task_meta")
+    log.info("Node metadata: SELECT node, meta_json FROM _node_meta")
     log.info("SQL trace: SELECT * FROM _trace")
 
     if not quiet:
-        _report_run_summary(output, loaded["tasks"])
+        _report_run_summary(output, nodes)
 
     sys.exit(0 if result.success else 1)
 
 
-def _report_run_summary(output: Path, tasks: list[Task]) -> None:
+def _report_run_summary(output: Path, nodes: list[Node]) -> None:
     try:
         conn = duckdb.connect(str(output), read_only=True)
     except duckdb.Error:
@@ -538,7 +554,7 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
         views = {row[0] for row in view_rows}
 
         # Also check materialized tables (outputs are converted to tables
-        # after task completion for performance).
+        # after node completion for performance).
         table_rows = conn.execute(
             "SELECT table_name FROM duckdb_tables() WHERE internal = false"
         ).fetchall()
@@ -549,13 +565,15 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
         has_changes = False
         try:
             change_rows = conn.execute(
-                "SELECT task, view_name, kind, sql_before, sql_after, "
+                "SELECT node, view_name, kind, sql_before, sql_after, "
                 "cols_before, cols_after, rows_before, rows_after "
-                "FROM _changes ORDER BY task, view_name"
+                "FROM _changes ORDER BY node, view_name"
             ).fetchall()
             has_changes = bool(change_rows)
         except duckdb.Error:
             change_rows = []
+
+        transform_nodes = [n for n in nodes if not n.is_source()]
 
         if has_changes:
             # Changes are now reported real-time by the workspace
@@ -566,12 +584,37 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
                 f"\nOutputs: {len(all_outputs)} ({len(tables)} materialized, {len(views)} views)"
             )
 
-            for task in tasks:
-                if not task.outputs:
+            # Show source node row counts
+            source_nodes = [n for n in nodes if n.is_source()]
+            if source_nodes:
+                click.echo("\n  Sources:")
+                for node in source_nodes:
+                    if node.name in tables:
+                        try:
+                            count = conn.execute(
+                                f'SELECT COUNT(*) FROM "{node.name}"'
+                            ).fetchone()
+                            count_s = str(count[0]) if count else "0"
+                            click.echo(f"    {node.name}: {count_s} rows")
+                        except duckdb.Error:
+                            click.echo(f"    {node.name}: error counting rows")
+
+            for node in transform_nodes:
+                # Discover node outputs: use output_columns keys if available,
+                # otherwise find materialized tables/views matching {name}_*
+                if node.output_columns:
+                    node_output_names = list(node.output_columns.keys())
+                else:
+                    prefix = f"{node.name}_"
+                    node_output_names = sorted(
+                        n for n in all_outputs if n.startswith(prefix)
+                    )
+
+                if not node_output_names:
                     continue
 
-                click.echo(f"\n  {task.name}:")
-                for output_name in task.outputs:
+                click.echo(f"\n  {node.name}:")
+                for output_name in node_output_names:
                     if output_name in all_outputs:
                         try:
                             count = conn.execute(
@@ -585,20 +628,20 @@ def _report_run_summary(output: Path, tasks: list[Task]) -> None:
                         click.echo(f"    {output_name}: MISSING")
 
         # --- Warnings and errors (always shown) ---
-        for task in tasks:
-            warn_count, warn_msgs = task.validation_warnings(
+        for node in transform_nodes:
+            warn_count, warn_msgs = node.validation_warnings(
                 conn, limit=MAX_INLINE_MESSAGES
             )
             if warn_count:
-                click.echo(f"\n  {task.name} warnings: {warn_count}")
+                click.echo(f"\n  {node.name} warnings: {warn_count}")
                 for msg in warn_msgs:
                     click.echo(f"    - {msg}")
 
-            errors = task.validate_transform(conn)
-            if task.has_validation():
-                errors.extend(task.validate_validation_views(conn))
+            errors = node.validate_outputs(conn)
+            if node.has_validation():
+                errors.extend(node.validate_validation_views(conn))
             if errors:
-                click.echo(f"\n  {task.name} errors: {len(errors)}")
+                click.echo(f"\n  {node.name} errors: {len(errors)}")
                 for msg in errors:
                     click.echo(f"    - {msg}")
     finally:
@@ -632,7 +675,19 @@ def show(target: Path | None, spec: str | None):
     )
 
     if target is not None:
-        conn = duckdb.connect(str(target), read_only=True)
+        if not target.suffix == ".db":
+            raise click.ClickException(
+                f"{target} is not a .db file. "
+                f"Use --spec to show a spec module, or pass a .db workspace file."
+            )
+        if not target.exists():
+            raise click.ClickException(f"{target} does not exist.")
+        try:
+            conn = duckdb.connect(str(target), read_only=True)
+        except duckdb.Error as e:
+            raise click.ClickException(
+                f"Cannot open {target} as a DuckDB database: {e}"
+            )
         meta = read_workspace_meta(conn)
         conn.close()
         if not meta:
@@ -657,9 +712,9 @@ def show(target: Path | None, spec: str | None):
             for name in sorted(counts.keys()):
                 click.echo(f"  {name}: {counts[name]} rows")
 
-        prompts = _meta_json(meta, "task_prompts")
+        prompts = _meta_json(meta, "node_prompts")
         if prompts:
-            click.echo(f"\nTasks ({len(prompts)}):")
+            click.echo(f"\nNodes ({len(prompts)}):")
             for name in sorted(prompts.keys()):
                 click.echo(f"  {name}")
 
@@ -690,63 +745,86 @@ def show(target: Path | None, spec: str | None):
         raise click.ClickException(str(e))
 
     try:
-        loaded = load_spec_from_module(spec_module)
+        nodes, exports = load_spec_from_module(spec_module)
     except Exception as e:
         raise click.ClickException(str(e))
 
-    tasks = loaded["tasks"]
-    inputs = loaded["inputs"]
-    input_columns = loaded.get("input_columns", {})
-    input_validate_sql = loaded.get("input_validate_sql", {})
-    exports = loaded.get("exports", {})
+    source_nodes = [n for n in nodes if n.is_source()]
+    transform_nodes = [n for n in nodes if not n.is_source()]
 
     click.echo(f"Spec: {spec_module}\n")
 
-    # --- Inputs ---
-    click.echo(f"Inputs ({len(inputs)}):")
-    name_width = max((len(n) for n in inputs), default=0)
-    for name in inputs:
-        cols = input_columns.get(name, [])
-        sql_checks = input_validate_sql.get(name, [])
-        parts = []
-        if cols:
-            parts.append(f"{len(cols)} cols: {', '.join(cols)}")
-        if sql_checks:
-            parts.append(
-                f"{len(sql_checks)} SQL check{'s' if len(sql_checks) > 1 else ''}"
-            )
-        detail = "  ".join(parts) if parts else "(no validation)"
-        click.echo(f"  {name:<{name_width}}  {detail}")
-
-    # --- DAG (tree) ---
-    # Use resolve_dag for full validation (cycles, duplicate outputs). Display
-    # uses a dependency tree view instead of execution layers.
+    # --- Nodes by layer ---
     try:
-        resolve_dag(tasks)
+        layers = resolve_dag(nodes)
     except ValueError as e:
         click.echo(f"\nDAG error: {e}")
         sys.exit(1)
 
-    total_tasks = len(tasks)
-    click.echo(f"\nDAG (tree, {total_tasks} tasks):")
-    for line in _format_task_tree(tasks):
+    click.echo(f"Nodes ({len(nodes)}):")
+    for layer_idx, layer in enumerate(layers):
+        click.echo(f"  Layer {layer_idx}:")
+        for n in layer:
+            ntype = n.node_type()
+            tag = f"[{ntype}]"
+
+            if ntype == "source":
+                # Describe the source
+                src = n.source
+                if callable(src) and not isinstance(src, FileInput):
+                    src_desc = "(callable)"
+                elif isinstance(src, FileInput):
+                    src_desc = f"({src.path})"
+                elif isinstance(src, str):
+                    src_desc = f"({src})"
+                elif isinstance(src, list):
+                    src_desc = f"({len(src)} rows)"
+                elif isinstance(src, dict):
+                    src_desc = "(dict)"
+                else:
+                    src_desc = ""
+
+                col_desc = ""
+                if n.columns:
+                    col_desc = f", columns: {', '.join(n.columns)}"
+                click.echo(f"    {tag:<10}{n.name:<20}{src_desc}{col_desc}")
+            else:
+                # sql or prompt node
+                dep_desc = ""
+                if n.depends_on:
+                    dep_desc = f"depends on: {', '.join(n.depends_on)}"
+
+                out_desc = ""
+                if n.output_columns:
+                    out_parts = []
+                    for o, cols in n.output_columns.items():
+                        out_parts.append(f"{o}({', '.join(cols)})" if cols else o)
+                    out_desc = " -> " + ", ".join(out_parts)
+
+                click.echo(f"    {tag:<10}{n.name:<20}{dep_desc}{out_desc}")
+
+    # --- DAG (tree) ---
+    click.echo(f"\nDAG (tree, {len(nodes)} nodes):")
+    for line in _format_node_tree(nodes):
         click.echo(line)
     click.echo()
 
     # --- Validation summary ---
     has_validation = False
     val_lines = []
-    for t in tasks:
+    for n in nodes:
         parts = []
-        if t.output_columns:
-            n_schemas = len(t.output_columns)
+        if n.is_source() and n.columns:
+            parts.append(f"{len(n.columns)} required columns")
+        if n.output_columns:
+            n_schemas = len(n.output_columns)
             parts.append(f"{n_schemas} output schema{'s' if n_schemas > 1 else ''}")
-        n_val = len(t.validation_view_names())
+        n_val = len(n.validation_view_names())
         if n_val:
             parts.append(f"{n_val} validation view{'s' if n_val > 1 else ''}")
         if parts:
             has_validation = True
-            val_lines.append(f"  {t.name}: {', '.join(parts)}")
+            val_lines.append(f"  {n.name}: {', '.join(parts)}")
 
     if has_validation:
         click.echo("Validation:")
@@ -754,8 +832,7 @@ def show(target: Path | None, spec: str | None):
             click.echo(line)
 
     # --- Graph validation ---
-    input_tables = set(inputs.keys())
-    graph_errors = validate_task_graph(tasks, available_tables=input_tables)
+    graph_errors = validate_graph(nodes)
     if graph_errors:
         click.echo("\nGraph errors:")
         for err in graph_errors:

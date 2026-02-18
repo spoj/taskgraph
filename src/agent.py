@@ -1,7 +1,7 @@
-"""Task agent — executes a single task within a DuckDB workspace.
+"""Node agent — executes a single node within a DuckDB workspace.
 
-Each task runs as an independent agent that can only CREATE/DROP views
-within its declared outputs or namespace prefix. SELECTs can read anything.
+Each node runs as an independent agent that can only CREATE/DROP views
+within its namespace prefix ({name}_*). SELECTs can read anything.
 """
 
 import json
@@ -17,7 +17,7 @@ from typing import Any, cast
 from .agent_loop import run_agent_loop, AgentResult, DEFAULT_MAX_ITERATIONS
 from .api import OpenRouterClient, create_model_callable, DEFAULT_MODEL
 from .namespace import Namespace
-from .task import Task
+from .task import Node
 from .sql_utils import (
     get_parser_conn,
     get_column_schema,
@@ -52,13 +52,13 @@ MAX_RESULT_CHARS = 30_000
 # --- System prompt ---
 
 SYSTEM_PROMPT = """You are a SQL transform agent working in a DuckDB database.
-You build task output views based on the task prompt and required outputs.
-You can read anything but can only write views/macros within the task's allowed names.
+You build node output views based on the node prompt and required outputs.
+You can read anything but can only write views/macros within the node's allowed names.
 
 RULES:
 - Allowed: SELECT, SUMMARIZE, EXPLAIN, CREATE/DROP VIEW, CREATE/DROP MACRO. Nothing else.
-- Use CREATE OR REPLACE VIEW for outputs; namespace-prefix intermediates (task_name_*)
-- Do not create validation views (task_name__validation*); the system creates those separately
+- Use CREATE OR REPLACE VIEW for outputs; namespace-prefix intermediates ({name}_*)
+- Do not create validation views ({name}__validation*); the system creates those separately
 - Batch independent run_sql calls in parallel to minimize rounds
 - When done, reply with a short message (no tool calls) to trigger validation
 - If validation fails, you get feedback — fix and reply again
@@ -191,13 +191,13 @@ def is_sql_allowed(
     # SELECT — always allowed (covers UNION, INTERSECT, EXCEPT, SUMMARIZE, DESCRIBE)
     if st == StatementType.SELECT:
         if ddl_only:
-            return False, "SQL-only tasks only allow CREATE/DROP VIEW|MACRO statements"
+            return False, "SQL-only nodes only allow CREATE/DROP VIEW|MACRO statements"
         return True, ""
 
     # EXPLAIN — allowed (read-only introspection)
     if st == StatementType.EXPLAIN:
         if ddl_only:
-            return False, "SQL-only tasks only allow CREATE/DROP VIEW|MACRO statements"
+            return False, "SQL-only nodes only allow CREATE/DROP VIEW|MACRO statements"
         return True, ""
 
     # CREATE — only VIEW and MACRO
@@ -236,24 +236,24 @@ def is_sql_allowed(
 # --- Metadata persistence ---
 
 
-def persist_task_meta(
-    conn: duckdb.DuckDBPyConnection, task_name: str, meta: dict[str, Any]
+def persist_node_meta(
+    conn: duckdb.DuckDBPyConnection, node_name: str, meta: dict[str, Any]
 ) -> None:
-    """Persist per-task run metadata in _task_meta.
+    """Persist per-node run metadata in _node_meta.
 
-    _task_meta is a simple per-task JSON blob. It is overwritten per run.
+    _node_meta is a simple per-node JSON blob. It is overwritten per run.
     """
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS _task_meta (
-            task VARCHAR PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS _node_meta (
+            node VARCHAR PRIMARY KEY,
             meta_json VARCHAR NOT NULL
         )
     """)
 
-    conn.execute("DELETE FROM _task_meta WHERE task = ?", [task_name])
+    conn.execute("DELETE FROM _node_meta WHERE node = ?", [node_name])
     conn.execute(
-        "INSERT INTO _task_meta (task, meta_json) VALUES (?, ?)",
-        [task_name, json.dumps(meta, sort_keys=True)],
+        "INSERT INTO _node_meta (node, meta_json) VALUES (?, ?)",
+        [node_name, json.dumps(meta, sort_keys=True)],
     )
 
 
@@ -265,7 +265,7 @@ def init_trace_table(conn: duckdb.DuckDBPyConnection) -> None:
 
     Also creates ``_view_definitions`` as a view on ``_trace`` — it
     extracts the last successful ``CREATE VIEW`` statement per view name,
-    giving the same ``(task, view_name, sql)`` interface that the old
+    giving the same ``(node, view_name, sql)`` interface that the old
     ``_view_definitions`` table provided, but derived entirely from the
     trace log.
     """
@@ -274,7 +274,7 @@ def init_trace_table(conn: duckdb.DuckDBPyConnection) -> None:
         CREATE TABLE IF NOT EXISTS _trace (
             id INTEGER DEFAULT nextval('_trace_seq'),
             timestamp TIMESTAMP DEFAULT current_timestamp,
-            task VARCHAR,
+            node VARCHAR,
             source VARCHAR,
             query VARCHAR NOT NULL,
             success BOOLEAN NOT NULL,
@@ -291,7 +291,7 @@ def init_trace_table(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(r"""
         CREATE OR REPLACE VIEW _view_definitions AS
         WITH actions AS (
-            SELECT id, task, query,
+            SELECT id, node, query,
                    regexp_extract(
                        query,
                        '(?i)VIEW\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?"?(\w+)"?',
@@ -312,7 +312,7 @@ def init_trace_table(conn: duckdb.DuckDBPyConnection) -> None:
             FROM actions
             WHERE view_name IS NOT NULL
         )
-        SELECT task, view_name, query AS sql
+        SELECT node, view_name, query AS sql
         FROM latest
         WHERE rn = 1 AND action = 'create'
     """)
@@ -325,21 +325,21 @@ def log_trace(
     error: str | None = None,
     row_count: int | None = None,
     elapsed_ms: float | None = None,
-    task_name: str | None = None,
+    node_name: str | None = None,
     source: str | None = None,
 ) -> None:
     """Log a SQL query execution to the _trace table.
 
     Args:
-        source: Origin of the query — ``'agent'``, ``'sql_task'``,
-            ``'task_validation'``, or ``'input_validation'``.
+        source: Origin of the query — ``'agent'``, ``'sql_node'``,
+            ``'node_validation'``, or ``'input_validation'``.
     """
     conn.execute(
         """
-        INSERT INTO _trace (task, source, query, success, error, row_count, elapsed_ms)
+        INSERT INTO _trace (node, source, query, success, error, row_count, elapsed_ms)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        [task_name, source, query, success, error, row_count, elapsed_ms],
+        [node_name, source, query, success, error, row_count, elapsed_ms],
     )
 
 
@@ -350,7 +350,7 @@ def execute_sql(
     conn: duckdb.DuckDBPyConnection,
     query: str,
     namespace: Namespace | None = None,
-    task_name: str | None = None,
+    node_name: str | None = None,
     query_timeout_s: int = DEFAULT_QUERY_TIMEOUT_S,
     max_result_chars: int = MAX_RESULT_CHARS,
     ddl_only: bool = False,
@@ -386,7 +386,7 @@ def execute_sql(
             success=False,
             error=error_msg,
             elapsed_ms=elapsed_ms,
-            task_name=task_name,
+            node_name=node_name,
             source=source,
         )
         return {"success": False, "error": error_msg}
@@ -443,7 +443,7 @@ def execute_sql(
             result = {"success": True, "message": "OK"}
     except duckdb.InterruptException:
         error_str = f"Query timed out after {query_timeout_s}s"
-        log.warning("[%s] %s", task_name or "?", error_str)
+        log.warning("[%s] %s", node_name or "?", error_str)
         result = {"success": False, "error": error_str}
     except Exception as e:
         error_str = str(e)
@@ -463,20 +463,34 @@ def execute_sql(
         error=error_str,
         row_count=row_count,
         elapsed_ms=elapsed_ms,
-        task_name=task_name,
+        node_name=node_name,
         source=source,
     )
     return result
 
 
-def _format_input_schema_lines(
-    conn: duckdb.DuckDBPyConnection, inputs: list[str]
+def _discover_available_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
+    """Return all non-internal table names from the database."""
+    rows = conn.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE internal = false ORDER BY table_name"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _format_table_schema_lines(
+    conn: duckdb.DuckDBPyConnection, tables: list[str] | None = None
 ) -> list[str]:
-    if not inputs:
+    """Format schema lines for the given tables (or all available tables).
+
+    If *tables* is None, discovers all non-internal tables from the DB.
+    """
+    if tables is None:
+        tables = _discover_available_tables(conn)
+    if not tables:
         return ["(none)"]
 
     lines: list[str] = []
-    for table_name in inputs:
+    for table_name in tables:
         rows = get_column_schema(conn, table_name)
         if rows:
             cols = ", ".join(f"{name} {dtype}" for name, dtype in rows)
@@ -488,53 +502,61 @@ def _format_input_schema_lines(
 
 
 def build_transform_prompt(
-    task: Task,
+    node: Node,
     input_lines: list[str] | None = None,
 ) -> str:
-    """Build a prompt for the LLM to produce task outputs."""
-    has_column_rules = bool(task.output_columns)
+    """Build a prompt for the LLM to produce node outputs.
+
+    Args:
+        node: Node specification.
+        input_lines: Pre-formatted table schema lines. If None, a
+            placeholder is shown (caller should pass discovered tables).
+    """
+    # Required outputs from output_columns keys
     required_outputs: list[str] = []
-    for view_name in task.outputs:
-        cols = task.output_columns.get(view_name, [])
-        if cols:
-            required_outputs.append(f"- {view_name}: {', '.join(cols)}")
-        elif has_column_rules:
-            required_outputs.append(f"- {view_name}: (no required columns)")
-        else:
-            required_outputs.append(f"- {view_name}")
-    if not required_outputs:
-        required_outputs.append("(none)")
+    if node.output_columns:
+        for view_name, cols in node.output_columns.items():
+            if cols:
+                required_outputs.append(f"- {view_name}: {', '.join(cols)}")
+            else:
+                required_outputs.append(f"- {view_name}: (no required columns)")
+    else:
+        required_outputs.append(
+            f"(none declared — create at least one view named {node.name}_*)"
+        )
 
     parts = [
-        f"TASK: {task.name}",
+        f"NODE: {node.name}",
         "",
         "PROMPT:",
-        task.prompt or "(no prompt provided)",
+        node.prompt or "(no prompt provided)",
         "",
-        "INPUTS:",
+        "AVAILABLE TABLES:",
         *(
             input_lines
             if input_lines is not None
-            else [", ".join(task.inputs) if task.inputs else "(none)"]
+            else [
+                "(discover via: SELECT table_name FROM duckdb_tables() WHERE internal = false)"
+            ]
         ),
         "",
         "REQUIRED OUTPUTS:",
         *required_outputs,
     ]
 
-    if task.has_validation():
+    if node.has_validation():
         parts.extend(
             [
                 "",
-                f"VALIDATION SQL (runs after transform; creates {task.name}__validation* views):",
-                task.validate_sql,
+                f"VALIDATION SQL (runs after transform; creates {node.name}__validation* views):",
+                node.validate_sql,
             ]
         )
 
     parts.extend(
         [
             "",
-            f"ALLOWED VIEWS: {', '.join(task.outputs)} or {task.name}_*",
+            f"ALLOWED VIEWS: {node.name}_* (all views must start with {node.name}_)",
         ]
     )
 
@@ -544,18 +566,17 @@ def build_transform_prompt(
 # --- Agent entry point ---
 
 
-async def run_task_agent(
+async def run_node_agent(
     conn: duckdb.DuckDBPyConnection,
-    task: Task,
+    node: Node,
     client: OpenRouterClient,
     model: str = DEFAULT_MODEL,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> AgentResult:
-    """Run the agent for a single Task within a shared workspace database.
+    """Run the agent for a single Node within a shared workspace database.
 
-    The agent is namespace-restricted: it can only CREATE/DROP views in
-    its declared outputs or with its name as prefix. It can SELECT from
-    any table/view.
+    The agent is namespace-restricted: it can only CREATE/DROP views
+    with its name as prefix ({name}_*). It can SELECT from any table/view.
 
     Validation (structural + SQL validation views) runs inside the agent
     loop. If validation fails, the agent gets feedback and continues
@@ -563,7 +584,7 @@ async def run_task_agent(
 
     Args:
         conn: DuckDB connection (shared workspace database).
-        task: Task specification.
+        node: Node specification.
         client: OpenRouterClient (must be in async context).
         model: Model identifier.
         max_iterations: Maximum agent iterations.
@@ -571,11 +592,11 @@ async def run_task_agent(
         AgentResult with success status, final message, and usage stats.
     """
     start_time = time.time()
-    ns = Namespace.for_task(task)
+    ns = Namespace.for_node(node)
 
     # Build messages
-    input_lines = _format_input_schema_lines(conn, task.inputs)
-    user_message = build_transform_prompt(task, input_lines)
+    input_lines = _format_table_schema_lines(conn)
+    user_message = build_transform_prompt(node, input_lines)
     initial_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
@@ -591,7 +612,7 @@ async def run_task_agent(
         if name == "run_sql":
             query = args.get("query", "")
             result = execute_sql(
-                conn, query, namespace=ns, task_name=task.name, source="agent"
+                conn, query, namespace=ns, node_name=node.name, source="agent"
             )
             log.debug(".")
             return json.dumps(result, default=_json_default)
@@ -600,7 +621,7 @@ async def run_task_agent(
 
     # Validation: structural checks + SQL validation views
     def validation_fn() -> tuple[bool, str]:
-        errors = validate_task_complete(conn, task)
+        errors = validate_node_complete(conn, node)
         if errors:
             return False, "\n".join(f"- {e}" for e in errors)
         return True, ""
@@ -626,14 +647,15 @@ async def run_task_agent(
 
     elapsed_s = time.time() - start_time
 
-    # Persist per-task metadata
-    persist_task_meta(
+    # Persist per-node metadata
+    persist_node_meta(
         conn,
-        task.name,
+        node.name,
         {
             "model": model,
             "reasoning_effort": client.reasoning_effort,
-            "outputs": task.outputs,
+            "depends_on": node.depends_on,
+            "output_columns": {k: v for k, v in node.output_columns.items()},
             "iterations": result.iterations,
             "tool_calls": result.tool_calls_count,
             "elapsed_s": round(elapsed_s, 1),
@@ -647,41 +669,41 @@ async def run_task_agent(
     )
 
     status = "PASSED" if result.success else "FAILED"
-    log.info("[%s] Validation: %s (%.1fs)", task.name, status, elapsed_s)
+    log.info("[%s] Validation: %s (%.1fs)", node.name, status, elapsed_s)
 
     return result
 
 
-# --- SQL-only task executor ---
+# --- SQL-only node executor ---
 
 
-async def run_sql_only_task(
+async def run_sql_node(
     conn: duckdb.DuckDBPyConnection,
-    task: Task,
+    node: Node,
 ) -> AgentResult:
-    """Execute a deterministic SQL-only task.
+    """Execute a deterministic SQL-only node.
 
-    The task provides a list of SQL statements (task.sql).
-    Each statement is executed with the same namespace enforcement as agent tasks.
+    The node provides a list of SQL statements (node.sql).
+    Each statement is executed with the same namespace enforcement as agent nodes.
     """
     start_time = time.time()
 
-    statements = task.sql_statements()
+    statements = node.sql_statements()
     if not statements:
         return AgentResult(
             success=False,
-            final_message="SQL-only task has no SQL statements",
+            final_message="SQL-only node has no SQL statements",
             iterations=0,
             messages=[],
             tool_calls_count=0,
         )
 
-    ns = Namespace.for_task(task)
+    ns = Namespace.for_node(node)
     execution_error: str | None = None
 
     for q in statements:
         result = execute_sql(
-            conn, q, namespace=ns, task_name=task.name, ddl_only=True, source="sql_task"
+            conn, q, namespace=ns, node_name=node.name, ddl_only=True, source="sql_node"
         )
         if not result.get("success", False):
             execution_error = str(result.get("error") or "SQL execution failed")
@@ -689,13 +711,14 @@ async def run_sql_only_task(
 
     validation_errors: list[str] = []
     if execution_error is None:
-        validation_errors = validate_task_complete(conn, task)
+        validation_errors = validate_node_complete(conn, node)
 
     elapsed_s = time.time() - start_time
     validation_status = "FAILED" if execution_error or validation_errors else "PASSED"
     meta: dict[str, Any] = {
         "model": "sql",
-        "outputs": task.outputs,
+        "depends_on": node.depends_on,
+        "output_columns": {k: v for k, v in node.output_columns.items()},
         "iterations": 0,
         "tool_calls": 0,
         "elapsed_s": round(elapsed_s, 1),
@@ -705,7 +728,7 @@ async def run_sql_only_task(
     if execution_error:
         meta["error"] = execution_error
 
-    persist_task_meta(conn, task.name, meta)
+    persist_node_meta(conn, node.name, meta)
 
     if execution_error or validation_errors:
         msg = execution_error or "\n".join(f"- {e}" for e in validation_errors)
@@ -728,26 +751,26 @@ async def run_sql_only_task(
 
 def run_validate_sql(
     conn: duckdb.DuckDBPyConnection,
-    task: Task,
+    node: Node,
 ) -> list[str]:
     """Execute validate_sql statements with validation namespace restrictions.
 
     Returns a list of error messages (empty = success).
     """
-    statements = task.validate_sql_statements()
+    statements = node.validate_sql_statements()
     if not statements:
         return []
 
-    vns = Namespace.for_validation(task)
+    vns = Namespace.for_validation(node)
 
     for q in statements:
         result = execute_sql(
             conn,
             q,
             namespace=vns,
-            task_name=task.name,
+            node_name=node.name,
             ddl_only=True,
-            source="task_validation",
+            source="node_validation",
         )
         if not result.get("success", False):
             return [str(result.get("error") or "validate_sql execution failed")]
@@ -755,19 +778,19 @@ def run_validate_sql(
     return []
 
 
-def validate_task_complete(
+def validate_node_complete(
     conn: duckdb.DuckDBPyConnection,
-    task: Task,
+    node: Node,
 ) -> list[str]:
-    """Run full task validation and return error messages (empty = pass)."""
-    errors = task.validate_transform(conn)
+    """Run full node validation and return error messages (empty = pass)."""
+    errors = node.validate_outputs(conn)
     if errors:
         return errors
-    if task.has_validation():
-        errors = run_validate_sql(conn=conn, task=task)
+    if node.has_validation():
+        errors = run_validate_sql(conn=conn, node=node)
         if errors:
             return errors
-        errors = task.validate_validation_views(conn)
+        errors = node.validate_validation_views(conn)
         if errors:
             return errors
     return []

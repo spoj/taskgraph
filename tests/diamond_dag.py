@@ -10,11 +10,10 @@ DAG shape:
 Tests: DAG resolution, layer concurrency, namespace enforcement.
 """
 
-
-# --- Inputs: synthetic data ---
-
-INPUTS = {
-    "transactions": {
+NODES = [
+    # --- Sources ---
+    {
+        "name": "transactions",
         "source": lambda: [
             {
                 "id": 1,
@@ -104,7 +103,8 @@ INPUTS = {
         ],
         "columns": ["id", "date", "type", "product", "amount", "region"],
     },
-    "products": {
+    {
+        "name": "products",
         "source": [
             {"name": "Widget A", "sku": "WA-001", "unit_price": 100.00},
             {"name": "Widget B", "sku": "WB-001", "unit_price": 250.00},
@@ -112,93 +112,81 @@ INPUTS = {
         ],
         "columns": ["name", "sku", "unit_price"],
     },
-}
+    # --- Transforms: diamond DAG ---
+    {
+        "name": "prep",
+        "depends_on": ["transactions"],
+        "sql": """
+            CREATE OR REPLACE VIEW prep_sales AS
+            SELECT id, date, product, amount, region
+            FROM transactions
+            WHERE type = 'sale';
 
-
-# --- Tasks: diamond DAG ---
-
-prep = {
-    "name": "prep",
-    "sql": """
-        CREATE OR REPLACE VIEW prepared_sales AS
-        SELECT id, date, product, amount, region
-        FROM transactions
-        WHERE type = 'sale';
-
-        CREATE OR REPLACE VIEW prepared_costs AS
-        SELECT id, date, product, category, amount, region
-        FROM transactions
-        WHERE type = 'cost'
-        """,
-    "inputs": ["transactions"],
-    "outputs": ["prepared_sales", "prepared_costs"],
-    "output_columns": {
-        "prepared_sales": ["id", "date", "product", "amount", "region"],
-        "prepared_costs": ["id", "date", "product", "category", "amount", "region"],
+            CREATE OR REPLACE VIEW prep_costs AS
+            SELECT id, date, product, category, amount, region
+            FROM transactions
+            WHERE type = 'cost'
+            """,
+        "output_columns": {
+            "prep_sales": ["id", "date", "product", "amount", "region"],
+            "prep_costs": ["id", "date", "product", "category", "amount", "region"],
+        },
     },
-}
-
-sales = {
-    "name": "sales",
-    "sql": """
-        CREATE OR REPLACE VIEW sales_summary AS
-        SELECT
-            s.product,
-            SUM(s.amount) AS total_sales,
-            COUNT(*) AS num_transactions
-        FROM prepared_sales s
-        GROUP BY s.product
-        """,
-    "inputs": ["prepared_sales", "products"],
-    "outputs": ["sales_summary"],
-    "output_columns": {
-        "sales_summary": ["product", "total_sales", "num_transactions"],
+    {
+        "name": "sales",
+        "depends_on": ["prep", "products"],
+        "sql": """
+            CREATE OR REPLACE VIEW sales_summary AS
+            SELECT
+                s.product,
+                SUM(s.amount) AS total_sales,
+                COUNT(*) AS num_transactions
+            FROM prep_sales s
+            GROUP BY s.product
+            """,
+        "output_columns": {
+            "sales_summary": ["product", "total_sales", "num_transactions"],
+        },
     },
-}
-
-costs = {
-    "name": "costs",
-    "sql": """
-        CREATE OR REPLACE VIEW costs_summary AS
-        SELECT
-            product,
-            SUM(amount) AS total_costs,
-            SUM(CASE WHEN category = 'materials' THEN amount ELSE 0 END) AS materials_cost,
-            SUM(CASE WHEN category = 'labor' THEN amount ELSE 0 END) AS labor_cost
-        FROM prepared_costs
-        GROUP BY product
-        """,
-    "inputs": ["prepared_costs"],
-    "outputs": ["costs_summary"],
-    "output_columns": {
-        "costs_summary": ["product", "total_costs", "materials_cost", "labor_cost"],
+    {
+        "name": "costs",
+        "depends_on": ["prep"],
+        "sql": """
+            CREATE OR REPLACE VIEW costs_summary AS
+            SELECT
+                product,
+                SUM(amount) AS total_costs,
+                SUM(CASE WHEN category = 'materials' THEN amount ELSE 0 END) AS materials_cost,
+                SUM(CASE WHEN category = 'labor' THEN amount ELSE 0 END) AS labor_cost
+            FROM prep_costs
+            GROUP BY product
+            """,
+        "output_columns": {
+            "costs_summary": ["product", "total_costs", "materials_cost", "labor_cost"],
+        },
     },
-}
-
-report = {
-    "name": "report",
-    "sql": """
-        CREATE OR REPLACE VIEW profit_report AS
-        SELECT
-            s.product,
-            s.total_sales,
-            c.total_costs,
-            s.total_sales - c.total_costs AS profit,
-            ROUND((s.total_sales - c.total_costs) / s.total_sales * 100, 1) AS margin_pct
-        FROM sales_summary s
-        LEFT JOIN costs_summary c ON c.product = s.product
-        """,
-    "inputs": ["sales_summary", "costs_summary"],
-    "outputs": ["profit_report"],
-    "output_columns": {
-        "profit_report": [
-            "product",
-            "total_sales",
-            "total_costs",
-            "profit",
-            "margin_pct",
-        ],
+    {
+        "name": "report",
+        "depends_on": ["sales", "costs"],
+        "sql": """
+            CREATE OR REPLACE VIEW report_profit AS
+            SELECT
+                s.product,
+                s.total_sales,
+                c.total_costs,
+                s.total_sales - c.total_costs AS profit,
+                ROUND((s.total_sales - c.total_costs) / s.total_sales * 100, 1) AS margin_pct
+            FROM sales_summary s
+            LEFT JOIN costs_summary c ON c.product = s.product
+            """,
+        "output_columns": {
+            "report_profit": [
+                "product",
+                "total_sales",
+                "total_costs",
+                "profit",
+                "margin_pct",
+            ],
+        },
     },
-}
-
-TASKS = [prep, sales, costs, report]
+]

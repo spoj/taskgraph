@@ -1,12 +1,18 @@
 """Workspace spec loader.
 
-A spec is a Python module defining INPUTS, TASKS, and optional EXPORTS.
+A spec is a Python module defining NODES and optional EXPORTS.
 
-INPUTS values can be:
-- Simple: callable, raw data, or file path
-- Rich: dict with "source" key + optional "columns" and "validate_sql"
+NODES is a list of dicts, each defining a single node in the workspace DAG.
+Node type is determined by which of ``source`` / ``sql`` / ``prompt`` is
+present (exactly one required):
 
-Task prompt values must be strings.
+- **source** — data ingestion node (callable, raw data, or file path).
+- **sql** — deterministic SQL transform.
+- **prompt** — LLM-driven transform.
+
+All nodes share: ``name``, ``depends_on``, ``validate_sql``.
+Source nodes additionally: ``source``, ``columns``.
+SQL/prompt nodes additionally: ``sql`` OR ``prompt``, ``output_columns``.
 """
 
 import importlib
@@ -21,7 +27,17 @@ from .ingest import (
     parse_file_path,
     parse_file_string,
 )
-from .task import Task
+from .task import Node, _NO_SOURCE
+
+_SOURCE_FIELDS = {"name", "depends_on", "source", "columns", "validate_sql"}
+_SQL_PROMPT_FIELDS = {
+    "name",
+    "depends_on",
+    "sql",
+    "prompt",
+    "output_columns",
+    "validate_sql",
+}
 
 
 def resolve_module_path(module_path: str) -> Path:
@@ -34,151 +50,162 @@ def resolve_module_path(module_path: str) -> Path:
     return Path(spec.origin).resolve()
 
 
-def _parse_module(module: ModuleType) -> dict[str, Any]:
-    """Parse INPUTS, TASKS, EXPORTS from a loaded module.
+def _resolve_source_path(source: Any, spec_dir: Path) -> Any:
+    """Resolve a source value, turning file paths/strings into FileInput."""
+    if isinstance(source, FileInput):
+        return source
+    if isinstance(source, Path):
+        return parse_file_path(source, base_dir=spec_dir)
+    if isinstance(source, str) and is_supported_file_string(source):
+        return parse_file_string(source, base_dir=spec_dir)
+    return source
 
-    Returns dict with 'inputs', 'tasks', 'exports',
-    'input_columns', 'input_validate_sql' keys.
+
+def _parse_module(module: ModuleType) -> tuple[list[Node], dict]:
+    """Parse NODES and EXPORTS from a loaded module.
+
+    Returns ``(nodes, exports)`` where *nodes* is a list of :class:`Node`
+    objects and *exports* is a dict of export functions.
     """
-    if not hasattr(module, "INPUTS"):
-        raise ValueError("Spec must define INPUTS")
-    if not hasattr(module, "TASKS"):
-        raise ValueError("Spec must define TASKS")
+    if not hasattr(module, "NODES"):
+        raise ValueError("Spec module must define NODES list.")
+    raw_nodes = module.NODES
+    if not isinstance(raw_nodes, list):
+        raise ValueError("NODES must be a list.")
 
-    raw_inputs = module.INPUTS
     spec_dir = Path(module.__file__).resolve().parent if module.__file__ else Path.cwd()
 
-    # Parse INPUTS: separate data from validation metadata
-    inputs: dict[str, Any] = {}
-    input_columns: dict[str, list[str]] = {}
-    input_validate_sql: dict[str, str] = {}
+    nodes: list[Node] = []
+    seen_names: set[str] = set()
 
-    def _resolve_source(source: Any) -> Any:
-        if isinstance(source, FileInput):
-            return source
-        if isinstance(source, Path):
-            return parse_file_path(source, base_dir=spec_dir)
-        if isinstance(source, str) and is_supported_file_string(source):
-            return parse_file_string(source, base_dir=spec_dir)
-        return source
+    for i, raw in enumerate(raw_nodes):
+        if not isinstance(raw, dict):
+            raise ValueError(f"NODES[{i}] must be a dict, got {type(raw).__name__}.")
 
-    for name, value in raw_inputs.items():
-        if isinstance(value, dict) and "source" in value:
-            # Rich format: {"source": ..., "columns": [...], "validate_sql": [...]}
-            inputs[name] = _resolve_source(value["source"])
-            if "columns" in value:
-                input_columns[name] = value["columns"]
-            if "validate_sql" in value:
-                vs = value["validate_sql"]
-                if not isinstance(vs, str):
+        name = raw.get("name")
+        if not name:
+            raise ValueError(f"NODES[{i}] is missing required 'name' field.")
+        if not isinstance(name, str):
+            raise ValueError(
+                f"NODES[{i}] 'name' must be a string, got {type(name).__name__}."
+            )
+        name = name.strip()
+        if not name:
+            raise ValueError(f"NODES[{i}] 'name' must not be empty.")
+        if name in seen_names:
+            raise ValueError(f"Duplicate node name: '{name}'.")
+        seen_names.add(name)
+
+        # Determine mode: exactly one of source / sql / prompt
+        modes = [k for k in ("source", "sql", "prompt") if k in raw]
+        if len(modes) != 1:
+            if len(modes) == 0:
+                raise ValueError(
+                    f"Node '{name}' must have exactly one of: source, sql, prompt."
+                )
+            else:
+                raise ValueError(
+                    f"Node '{name}' has multiple modes: {modes}. Only one allowed."
+                )
+
+        mode = modes[0]
+
+        # Field validation
+        allowed = _SOURCE_FIELDS if mode == "source" else _SQL_PROMPT_FIELDS
+        unknown = set(raw.keys()) - allowed
+        if unknown:
+            raise ValueError(
+                f"Node '{name}' has unknown fields: "
+                f"{', '.join(sorted(unknown))}. "
+                f"Allowed: {', '.join(sorted(allowed))}"
+            )
+
+        # Build Node kwargs
+        kwargs: dict[str, Any] = {"name": name}
+
+        if "depends_on" in raw:
+            deps = raw["depends_on"]
+            if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
+                raise ValueError(
+                    f"Node '{name}': depends_on must be a list of strings."
+                )
+            kwargs["depends_on"] = deps
+
+        if mode == "source":
+            kwargs["source"] = _resolve_source_path(raw["source"], spec_dir)
+
+            if "columns" in raw:
+                cols = raw["columns"]
+                if not isinstance(cols, list) or not all(
+                    isinstance(c, str) for c in cols
+                ):
                     raise ValueError(
-                        f"Input '{name}' validate_sql must be a string, "
-                        f"got {type(vs).__name__}"
+                        f"Node '{name}': columns must be a list of strings."
                     )
-                vs = vs.strip()
-                if vs:
-                    input_validate_sql[name] = vs
-            continue
+                kwargs["columns"] = cols
 
-        if isinstance(value, dict) and "data" in value:
-            raise ValueError(
-                f"Input '{name}' uses deprecated key 'data'; use 'source' instead"
-            )
+        elif mode == "sql":
+            sql_val = raw["sql"]
+            if not isinstance(sql_val, str):
+                raise ValueError(f"Node '{name}': sql must be a non-empty string.")
+            sql_val = sql_val.strip()
+            if not sql_val:
+                raise ValueError(f"Node '{name}': sql must be a non-empty string.")
+            kwargs["sql"] = sql_val
 
-        # Simple format: callable or raw data
-        inputs[name] = _resolve_source(value)
+        elif mode == "prompt":
+            prompt_val = raw["prompt"]
+            if not isinstance(prompt_val, str):
+                raise ValueError(f"Node '{name}': prompt must be a non-empty string.")
+            prompt_val = prompt_val.strip()
+            if not prompt_val:
+                raise ValueError(f"Node '{name}': prompt must be a non-empty string.")
+            kwargs["prompt"] = prompt_val
 
-    # Accept tasks as dicts or Task objects
-    tasks = []
-
-    def _normalize_text(task_name: str, value: Any, key: str) -> str:
-        if not isinstance(value, str):
-            raise ValueError(f"Task '{task_name}' {key} must be a string")
-        s2 = value.strip()
-        if not s2:
-            raise ValueError(f"Task '{task_name}' {key} must not be empty")
-        return s2
-
-    for t in module.TASKS:
-        if isinstance(t, dict):
-            t = dict(t)  # shallow copy to avoid mutating the original
-            task_name = t.get("name", "")
-
-            # Deterministic SQL (optional). If present, the harness will
-            # execute it directly (no LLM). Accept str.
-            if "sql" in t:
-                t["sql"] = _normalize_text(task_name, t.get("sql", ""), "sql")
-
-            # Prompt-driven transform (optional).
-            if "prompt" in t:
-                t["prompt"] = _normalize_text(task_name, t.get("prompt", ""), "prompt")
-
-            # Validation SQL (optional).
-            if "validate_sql" in t:
-                t["validate_sql"] = _normalize_text(
-                    task_name, t.get("validate_sql", ""), "validate_sql"
-                )
-
-            sql_statements = (t.get("sql") or "").strip()
-            prompt_text = (t.get("prompt") or "").strip()
-
-            if sql_statements and prompt_text:
+        if "output_columns" in raw:
+            oc = raw["output_columns"]
+            if not isinstance(oc, dict):
                 raise ValueError(
-                    f"Task '{task_name}' must not specify both 'sql' and 'prompt'"
+                    f"Node '{name}': output_columns must be a dict "
+                    f"mapping view_name -> [column_names], "
+                    f"got {type(oc).__name__}"
                 )
-            if not sql_statements and not prompt_text:
+            for k, v in oc.items():
+                if not isinstance(v, list) or not all(isinstance(c, str) for c in v):
+                    raise ValueError(
+                        f"Node '{name}': output_columns['{k}'] must be a list of strings."
+                    )
+            kwargs["output_columns"] = oc
+
+        if "validate_sql" in raw:
+            vs = raw["validate_sql"]
+            if not isinstance(vs, str):
                 raise ValueError(
-                    f"Task '{task_name}' must specify exactly one of 'sql' or 'prompt'"
+                    f"Node '{name}': validate_sql must be a string, "
+                    f"got {type(vs).__name__}"
                 )
+            vs = vs.strip()
+            if vs:
+                kwargs["validate_sql"] = vs
 
-            tasks.append(Task(**t))
-        elif isinstance(t, Task):
-            tasks.append(t)
-        else:
-            raise ValueError(
-                f"Each task must be a dict or Task, got {type(t).__name__}"
-            )
+        nodes.append(Node(**kwargs))
 
-    for t in tasks:
-        if not isinstance(t.sql, str):
-            raise ValueError(
-                f"Task '{t.name}' sql must be a string, got {type(t.sql).__name__}"
-            )
-        if not isinstance(t.prompt, str):
-            raise ValueError(
-                f"Task '{t.name}' prompt must be a string, got {type(t.prompt).__name__}"
-            )
-        if not isinstance(t.validate_sql, str):
-            raise ValueError(
-                f"Task '{t.name}' validate_sql must be a string, got {type(t.validate_sql).__name__}"
-            )
-        sql_statements = (t.sql or "").strip()
-        prompt_text = (t.prompt or "").strip()
-        if sql_statements and prompt_text:
-            raise ValueError(
-                f"Task '{t.name}' must not specify both 'sql' and 'prompt'"
-            )
-        if not sql_statements and not prompt_text:
-            raise ValueError(
-                f"Task '{t.name}' must specify exactly one of 'sql' or 'prompt'"
-            )
-    return {
-        "inputs": inputs,
-        "tasks": tasks,
-        "exports": getattr(module, "EXPORTS", {}),
-        "input_columns": input_columns,
-        "input_validate_sql": input_validate_sql,
-    }
+    exports = getattr(module, "EXPORTS", {})
+    return nodes, exports
 
 
-def load_spec_from_module(module_path: str) -> dict[str, Any]:
+def load_spec_from_module(module_path: str) -> tuple[list[Node], dict]:
     """Load a workspace spec from a module path.
 
-    Returns dict with 'inputs', 'tasks', 'exports',
-    'input_columns', 'input_validate_sql' keys.
+    Returns ``(nodes, exports)`` where *nodes* is a list of :class:`Node`
+    objects and *exports* is a dict of export functions.
 
     Raises ValueError if the spec is invalid.
     """
-    module = importlib.import_module(module_path)
-    result = _parse_module(module)
-    return result
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:
+        raise ValueError(f"Cannot import spec module '{module_path}': {e}") from e
+    except Exception as e:
+        raise ValueError(f"Error loading spec module '{module_path}': {e}") from e
+    return _parse_module(module)

@@ -1,47 +1,54 @@
-"""Task definition and DAG resolution for multi-task workspaces.
+"""Node definition and DAG resolution for workspaces.
 
-A Task declares what it reads (inputs), what it produces (outputs),
-and how to validate results. Tasks form a DAG based on output->input
-dependencies. resolve_task_deps() builds the raw dependency graph;
-resolve_dag() produces topo-sorted layers for display/logging.
+A Node is the single unit of work.  Every node has a ``name`` and an
+execution mode — exactly one of ``source``, ``sql``, or ``prompt``:
 
-Example:
+- **source** — ingests data (callable, raw data, or file path) into a
+  table named ``{name}``.
+- **sql** — executes deterministic SQL that creates ``{name}_*`` views.
+- **prompt** — runs an LLM agent that creates ``{name}_*`` views.
 
-    tasks = [
-        Task(
-            name="prep",
-            inputs=["raw_rows"],
-            outputs=["rows_clean"],
-            sql="CREATE OR REPLACE VIEW rows_clean AS SELECT ...",
-            validate_sql=(
-                "CREATE OR REPLACE VIEW prep__validation AS "
-                "SELECT 'pass' AS status, 'ok' AS message"
-            ),
+Nodes form a DAG via explicit ``depends_on`` edges.  ``resolve_deps()``
+builds the raw dependency graph; ``resolve_dag()`` produces topo-sorted
+layers for display / scheduling.
+
+Example::
+
+    nodes = [
+        Node(
+            name="raw_rows",
+            source="data/rows.csv",
+            columns=["id", "amount"],
         ),
-        Task(
+        Node(
+            name="prep",
+            depends_on=["raw_rows"],
+            sql="CREATE OR REPLACE VIEW prep_clean AS SELECT * FROM raw_rows WHERE amount > 0",
+        ),
+        Node(
             name="match",
-            inputs=["rows_clean", "reference"],
-            outputs=["matches", "match_summary"],
-            prompt="Match normalized rows against a reference table...",
-            validate_sql=(
-                "CREATE OR REPLACE VIEW match__validation AS "
-                "SELECT 'pass' AS status, 'ok' AS message"
-            ),
+            depends_on=["prep"],
+            prompt="Match cleaned rows against a reference table...",
+            output_columns={"match_results": ["id", "score"]},
         ),
     ]
 
-    deps = resolve_task_deps(tasks)
-    # deps = {"prep": set(), "match": {"prep"}}
+    deps = resolve_deps(nodes)
+    # {"raw_rows": set(), "prep": set(), "match": {"prep"}}
 
-    layers = resolve_dag(tasks)
-    # layers[0] = [prep]       (no dependencies)
-    # layers[1] = [match]      (depends on prep's output)
+    layers = resolve_dag(nodes)
+    # layers[0] = [raw_rows, ...]   (no deps)
+    # layers[1] = [prep]            (depends on raw_rows)
+    # layers[2] = [match]           (depends on prep)
 """
+
+from __future__ import annotations
 
 import duckdb
 from dataclasses import dataclass, field
+from typing import Any
+
 from .sql_utils import (
-    get_parser_conn,
     split_sql_statements,
     extract_create_name,
     get_column_names,
@@ -51,19 +58,20 @@ _VALIDATION_VIEW_REQUIRED_COLS = ["status", "message"]
 _VALIDATION_STATUS_ALLOWED = {"pass", "warn", "fail"}
 MAX_INLINE_MESSAGES = 20  # Cap on messages shown inline in validation/warning output
 
-# Constants and parser helpers moved to sql_utils.py
+# Sentinel for "no source provided" (since None/0/[]/etc. could be valid data).
+_NO_SOURCE = object()
 
 
-def validation_view_prefix(task_name: str) -> str:
-    return f"{task_name}__validation"
+def validation_view_prefix(node_name: str) -> str:
+    return f"{node_name}__validation"
 
 
-def is_validation_view_for_task(view_name: str, task_name: str) -> bool:
-    """Return True if view_name is a validation view for task_name.
+def is_validation_view(view_name: str, node_name: str) -> bool:
+    """Return True if *view_name* is a validation view for *node_name*.
 
-    Convention: '{task_name}__validation' and '{task_name}__validation_*'
+    Convention: ``{node_name}__validation`` and ``{node_name}__validation_*``
     """
-    prefix = validation_view_prefix(task_name)
+    prefix = validation_view_prefix(node_name)
     return view_name == prefix or view_name.startswith(prefix + "_")
 
 
@@ -162,49 +170,70 @@ def validate_one_validation_view(
 
 
 @dataclass
-class Task:
-    """A single unit of work in a workspace.
+class Node:
+    """A single node in a workspace DAG.
+
+    Exactly one of ``source``, ``sql``, or ``prompt`` must be set,
+    determining the node type:
+
+    - **source**: Data ingestion node.  ``source`` holds a callable,
+      raw data (list[dict] / dict[str,list]), or a file path string.
+      The ingested table is named ``{name}``.
+    - **sql**: Deterministic SQL transform.  Creates views/macros
+      in the ``{name}_*`` namespace.
+    - **prompt**: LLM-driven transform.  The agent creates views
+      in the ``{name}_*`` namespace.
 
     Attributes:
-        name: Unique identifier, also used as namespace prefix for intermediate views.
-        inputs: Table/view names this task reads from. These must exist before the task runs.
-        outputs: View names this task must produce. Other tasks can depend on these.
-        Validation views: optional deterministic SQL that creates one or more views
-            named '{name}__validation' and/or '{name}__validation_*'. Any row with
-            lower(status)='fail' causes the task to fail.
-        output_columns: Optional schema check. Maps view_name -> list of required column
-            names. Validation fails if a view is missing any declared column.
-        prompt: Objective text used for LLM-driven transform tasks.
-        validate_sql: Deterministic SQL to create validation views.
+        name: Unique identifier.  For source nodes this becomes the
+            table name; for sql/prompt nodes it is the namespace prefix
+            (views must be ``{name}_*``).
+        depends_on: Node names that must complete before this node runs.
+        source: Data source for ingestion (callable / data / file path).
+            Use the sentinel ``_NO_SOURCE`` default to distinguish
+            "not provided" from ``None``-as-valid-data.
+        sql: Deterministic SQL statements.
+        prompt: LLM objective text.
+        columns: (source nodes) Required column names on the ingested
+            table.  Checked after ingestion.
+        output_columns: (sql/prompt nodes) Maps view_name → required
+            column list.  Keys define which views must exist; values
+            define required columns per view.
+        validate_sql: SQL to create ``{name}__validation*`` views.
+            Works for all node types.
     """
 
     name: str
-    inputs: list[str] = field(default_factory=list)
-    outputs: list[str] = field(default_factory=list)
-    output_columns: dict[str, list[str]] = field(default_factory=dict)
+    depends_on: list[str] = field(default_factory=list)
 
-    # Deterministic SQL (views/macros only). If provided, the workspace
-    # harness executes these statements directly.
+    # Exactly one of these three:
+    source: Any = field(default=_NO_SOURCE, repr=False)
     sql: str = ""
-
-    # LLM-driven transform prompt.
     prompt: str = ""
 
-    # Deterministic SQL used to create validation views.
+    # Schema validation
+    columns: list[str] = field(default_factory=list)
+    output_columns: dict[str, list[str]] = field(default_factory=dict)
+
+    # Validation SQL (all node types)
     validate_sql: str = ""
 
-    def transform_mode(self) -> str:
-        """Return execution mode: 'sql' or 'prompt'.
+    def node_type(self) -> str:
+        """Return ``'source'``, ``'sql'``, or ``'prompt'``."""
+        if self.source is not _NO_SOURCE:
+            return "source"
+        if self.sql:
+            return "sql"
+        return "prompt"
 
-        Spec parsing enforces exactly one of (sql, prompt) is provided.
-        """
-        return "sql" if self.sql else "prompt"
+    def is_source(self) -> bool:
+        return self.source is not _NO_SOURCE
 
     def has_validation(self) -> bool:
         return bool(self.validate_sql and self.validate_sql.strip())
 
     def sql_statements(self) -> list[str]:
-        """Return SQL statements for sql transform tasks."""
+        """Return SQL statements for sql transform nodes."""
         return split_sql_statements(self.sql)
 
     def validate_sql_statements(self) -> list[str]:
@@ -218,21 +247,52 @@ class Task:
         names: list[str] = []
         for stmt in self.validate_sql_statements():
             name = extract_create_name(stmt)
-            if name and is_validation_view_for_task(name, self.name):
+            if name and is_validation_view(name, self.name):
                 names.append(name)
         return sorted(set(names))
 
-    def validate_transform(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
-        """Validate transform outputs. Returns error messages (empty = pass).
+    # ------------------------------------------------------------------
+    # Unified output validation
+    # ------------------------------------------------------------------
 
-        Checks run in order, short-circuiting on first failure:
-        1. All declared output views/tables exist.
-        2. Output views/tables have required columns (if output_columns specified).
+    def validate_outputs(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
+        """Validate node outputs after execution.  Returns error messages.
 
-        Outputs may be views (during task execution) or tables (after
-        materialization), so both catalogs are checked.
+        For **source** nodes: checks required ``columns`` on the ingested
+        table ``{name}``.
+
+        For **sql/prompt** nodes: checks ``output_columns`` keys exist
+        as views/tables and have required columns.
         """
-        # 1. Check all declared outputs exist (views or materialized tables)
+        if self.is_source():
+            return self._validate_source_columns(conn)
+        return self._validate_output_columns(conn)
+
+    def _validate_source_columns(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
+        """Check required columns on the ingested source table."""
+        if not self.columns:
+            return []
+        actual_cols = get_column_names(conn, self.name)
+        if not actual_cols:
+            return [f"Source table '{self.name}' not found after ingestion."]
+        # Exclude internal _row_id column from display
+        display_cols = [c for c in actual_cols if c != "_row_id"]
+        actual_lower = {c.lower() for c in actual_cols}
+        missing = [c for c in self.columns if c.lower() not in actual_lower]
+        if missing:
+            label = "column" if len(missing) == 1 else "columns"
+            return [
+                f"Source table '{self.name}' is missing required {label}: "
+                f"{', '.join(missing)}. "
+                f"Actual columns: {', '.join(sorted(display_cols))}"
+            ]
+        return []
+
+    def _validate_output_columns(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
+        """Check output_columns keys exist with required columns."""
+        if not self.output_columns:
+            return []
+
         existing_views = {
             row[0]
             for row in conn.execute(
@@ -247,30 +307,31 @@ class Task:
         }
         existing = existing_views | existing_tables
 
-        missing = [o for o in self.outputs if o not in existing]
+        missing = [o for o in self.output_columns if o not in existing]
         if missing:
             return [f"Required output view '{o}' was not created." for o in missing]
 
-        # 2. Check output columns
-        if self.output_columns:
-            for view_name, required_cols in self.output_columns.items():
-                if view_name not in existing:
-                    continue  # Already caught in step 1
-                actual_cols = get_column_names(conn, view_name)
-                if not actual_cols:
-                    # This shouldn't happen if it's in existing but stay safe
-                    continue
+        errors: list[str] = []
+        for view_name, required_cols in self.output_columns.items():
+            if not required_cols:
+                continue
+            actual_cols = get_column_names(conn, view_name)
+            if not actual_cols:
+                continue
+            actual_lower = {c.lower() for c in actual_cols}
+            missing_cols = [c for c in required_cols if c.lower() not in actual_lower]
+            if missing_cols:
+                label = "column" if len(missing_cols) == 1 else "columns"
+                errors.append(
+                    f"View '{view_name}' is missing required {label}: "
+                    f"{', '.join(missing_cols)}. "
+                    f"Actual columns: {', '.join(sorted(actual_cols))}"
+                )
+        return errors
 
-                missing_cols = [c for c in required_cols if c not in actual_cols]
-                if missing_cols:
-                    label = "column" if len(missing_cols) == 1 else "columns"
-                    return [
-                        f"View '{view_name}' is missing required {label}: "
-                        f"{', '.join(missing_cols)}. "
-                        f"Actual columns: {', '.join(sorted(actual_cols))}"
-                    ]
-
-        return []
+    # ------------------------------------------------------------------
+    # Validation views (same for all node types)
+    # ------------------------------------------------------------------
 
     def validate_validation_views(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
         """Enforce validation views created by validate_sql.
@@ -279,7 +340,7 @@ class Task:
         - status: pass|warn|fail (case-insensitive)
         - message: human-readable string
 
-        Any row with lower(status)='fail' fails the task.
+        Any row with lower(status)='fail' fails the node.
         """
         views = self.validation_view_names()
         if self.has_validation() and not views:
@@ -292,7 +353,7 @@ class Task:
         errors: list[str] = []
 
         for view_name in views:
-            view_errors, fatal = self._validate_one_validation_view(conn, view_name)
+            view_errors, fatal = validate_one_validation_view(conn, view_name)
             if fatal and view_errors:
                 return view_errors
 
@@ -386,82 +447,52 @@ class Task:
 
         return total, warnings
 
-    def _validate_one_validation_view(
-        self, conn: duckdb.DuckDBPyConnection, view_name: str
-    ) -> tuple[list[str], bool]:
-        """Validate a single validation view. Delegates to module-level function."""
-        return validate_one_validation_view(conn, view_name)
+
+# ---------------------------------------------------------------------------
+# DAG resolution
+# ---------------------------------------------------------------------------
 
 
-def resolve_task_deps(tasks: list[Task]) -> dict[str, set[str]]:
-    """Build the dependency graph for tasks.
+def resolve_deps(nodes: list[Node]) -> dict[str, set[str]]:
+    """Build the dependency graph for all nodes.
 
-    Returns a mapping of task_name -> set of task names it depends on.
-
-    Raises ValueError if two tasks produce the same output view.
+    Returns ``{node_name: set_of_node_names_it_depends_on}``.
+    Only references to other nodes in *nodes* are included; unknown
+    names in ``depends_on`` are silently dropped (caught by
+    ``validate_graph`` instead).
     """
-    # Build output -> producing task mapping
-    output_to_task: dict[str, str] = {}
-    for t in tasks:
-        for o in t.outputs:
-            if o in output_to_task:
-                raise ValueError(
-                    f"Output '{o}' produced by both '{output_to_task[o]}' and '{t.name}'"
-                )
-            output_to_task[o] = t.name
-
-    # Build dependency graph: task -> set of task names it depends on
-    deps: dict[str, set[str]] = {t.name: set() for t in tasks}
-    for t in tasks:
-        for inp in t.inputs:
-            if inp in output_to_task:
-                producer = output_to_task[inp]
-                if producer != t.name:  # Don't self-depend
-                    deps[t.name].add(producer)
-
-    return deps
+    all_names = {n.name for n in nodes}
+    return {n.name: {d for d in n.depends_on if d in all_names} for n in nodes}
 
 
-def resolve_dag(tasks: list[Task]) -> list[list[Task]]:
-    """Topologically sort tasks into execution layers (for display/logging).
+def resolve_dag(nodes: list[Node]) -> list[list[Node]]:
+    """Topologically sort nodes into execution layers.
 
-    Tasks in the same layer have no dependencies on each other and can
-    run concurrently. Layer 0 has no task dependencies, layer 1 depends
+    Nodes in the same layer have no dependencies on each other and can
+    run concurrently.  Layer 0 has no dependencies, layer 1 depends
     only on layer 0, etc.
 
-    Note: Actual execution uses resolve_task_deps() for finer-grained
-    scheduling where each task starts as soon as its specific dependencies
-    complete. This function is used for display and validation only.
-
-    Raises ValueError if:
-    - Two tasks produce the same output view
-    - A cycle is detected
-    - A task input references another task's output that doesn't exist
-
-    Returns:
-        List of layers, where each layer is a list of tasks.
+    Raises ValueError if a cycle is detected.
     """
-    task_by_name = {t.name: t for t in tasks}
-    deps = {name: set(d) for name, d in resolve_task_deps(tasks).items()}
+    node_by_name = {n.name: n for n in nodes}
+    deps = {name: set(d) for name, d in resolve_deps(nodes).items()}
 
     # Kahn's algorithm producing layers
     in_degree = {name: len(d) for name, d in deps.items()}
-    layers: list[list[Task]] = []
+    layers: list[list[Node]] = []
 
-    remaining = set(task_by_name.keys())
+    remaining = set(node_by_name.keys())
 
     while remaining:
-        # Find all tasks with in_degree 0
         layer_names = sorted(n for n in remaining if in_degree[n] == 0)
 
         if not layer_names:
             cycle_members = sorted(remaining)
-            raise ValueError(f"Dependency cycle detected among tasks: {cycle_members}")
+            raise ValueError(f"Dependency cycle detected among nodes: {cycle_members}")
 
-        layer = [task_by_name[n] for n in layer_names]
+        layer = [node_by_name[n] for n in layer_names]
         layers.append(layer)
 
-        # Remove this layer and update in_degrees
         for name in layer_names:
             remaining.remove(name)
             for other in remaining:
@@ -472,29 +503,69 @@ def resolve_dag(tasks: list[Task]) -> list[list[Task]]:
     return layers
 
 
-def validate_task_graph(tasks: list[Task], available_tables: set[str]) -> list[str]:
-    """Validate that all task inputs can be satisfied.
+def validate_graph(nodes: list[Node]) -> list[str]:
+    """Validate the node graph structure.
 
-    Checks that every task input is either:
-    - An available table (ingested data)
-    - An output of another task
-
-    Returns list of error messages (empty = valid).
+    Checks:
+    1. All ``depends_on`` references point to existing node names.
+    2. No cycles (delegated to ``resolve_dag``).
+    3. ``output_columns`` keys start with ``{name}_`` (namespace).
+    4. No node name is a prefix of another (namespace collision).
+    5. Source nodes don't have ``output_columns``; sql/prompt nodes
+       don't have ``columns``.
     """
-    errors = []
+    errors: list[str] = []
+    all_names = {n.name for n in nodes}
 
-    # Collect all outputs
-    all_outputs = set()
-    for t in tasks:
-        all_outputs.update(t.outputs)
-
-    # Check all inputs are satisfiable
-    for t in tasks:
-        for inp in t.inputs:
-            if inp not in available_tables and inp not in all_outputs:
+    # 1. depends_on refs
+    for n in nodes:
+        for dep in n.depends_on:
+            if dep not in all_names:
                 errors.append(
-                    f"Task '{t.name}' requires input '{inp}' which is neither "
-                    f"an ingested table nor an output of another task."
+                    f"Node '{n.name}' depends on '{dep}' which is not a known node."
                 )
+
+    # 2. output_columns keys start with {name}_
+    for n in nodes:
+        if not n.output_columns:
+            continue
+        prefix = f"{n.name}_"
+        for key in n.output_columns:
+            if not key.startswith(prefix):
+                errors.append(
+                    f"Node '{n.name}' output_columns key '{key}' must start "
+                    f"with '{prefix}' (namespace enforcement)."
+                )
+
+    # 3. No name is a prefix of another
+    sorted_names = sorted(all_names)
+    for i, name_a in enumerate(sorted_names):
+        for name_b in sorted_names[i + 1 :]:
+            if name_b.startswith(name_a + "_"):
+                errors.append(
+                    f"Node name '{name_a}' is a prefix of '{name_b}'. "
+                    f"This would cause namespace collisions "
+                    f"('{name_b}_foo' matches both '{name_a}_*' and '{name_b}_*')."
+                )
+
+    # 4. Cross-type field misuse
+    for n in nodes:
+        if n.is_source() and n.output_columns:
+            errors.append(
+                f"Source node '{n.name}' should not have output_columns "
+                f"(use 'columns' for source schema validation)."
+            )
+        if not n.is_source() and n.columns:
+            errors.append(
+                f"Node '{n.name}' (type={n.node_type()}) should not have "
+                f"'columns' (use 'output_columns' for sql/prompt nodes)."
+            )
+
+    # 5. Cycles (only if no ref errors)
+    if not errors:
+        try:
+            resolve_dag(nodes)
+        except ValueError as e:
+            errors.append(str(e))
 
     return errors

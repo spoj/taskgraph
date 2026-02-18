@@ -5,38 +5,34 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from tests.conftest import _make_task
-from src.agent import run_sql_only_task, log_trace
-from src.ingest import ingest_table
+from tests.conftest import _make_node
+from src.agent import run_sql_node, log_trace
 from src.workspace import Workspace, persist_workspace_meta, read_workspace_meta
-from src.workspace import materialize_task_outputs
+from src.workspace import materialize_node_outputs
 
 
-class TestSqlOnlyTasks:
+class TestSqlOnlyNodes:
     def test_sql_only_task_executes_and_validates(self, conn):
-        task = _make_task(
+        node = _make_node(
             name="sql_task",
-            inputs=[],
-            outputs=["out_view"],
-            sql="CREATE VIEW out_view AS SELECT 1 AS x",
+            sql="CREATE VIEW sql_task_out AS SELECT 1 AS x",
         )
 
-        result = asyncio.run(run_sql_only_task(conn=conn, task=task))
+        result = asyncio.run(run_sql_node(conn=conn, node=node))
         assert result.success is True
 
     def test_sql_only_task_disallows_select(self, conn):
-        task = _make_task(
+        node = _make_node(
             name="sql_task",
-            outputs=["out_view"],
             sql="SELECT 1",
         )
-        result = asyncio.run(run_sql_only_task(conn=conn, task=task))
+        result = asyncio.run(run_sql_node(conn=conn, node=node))
         assert result.success is False
         assert "only allow" in result.final_message.lower()
 
     def test_sql_only_task_requires_sql(self, conn):
-        task = _make_task(name="sql_task", outputs=["sql_task__validation"], sql="")
-        result = asyncio.run(run_sql_only_task(conn=conn, task=task))
+        node = _make_node(name="sql_task", sql="")
+        result = asyncio.run(run_sql_node(conn=conn, node=node))
         assert result.success is False
 
     def test_validation_view_is_enforced(self, conn):
@@ -45,50 +41,44 @@ class TestSqlOnlyTasks:
             "CREATE VIEW mytask__validation AS "
             "SELECT 'fail' AS status, 'bad things' AS message"
         )
-        task = _make_task(
+        node = _make_node(
             name="mytask",
             validate_sql=(
                 "CREATE VIEW mytask__validation AS "
                 "SELECT 'fail' AS status, 'bad things' AS message"
             ),
         )
-        errors = task.validate_validation_views(conn)
+        errors = node.validate_validation_views(conn)
         assert errors
         assert "bad things" in "\n".join(errors)
 
     def test_validation_order_columns_before_validation_view(self, conn):
         """Column check runs before validation view enforcement."""
-        conn.execute("CREATE VIEW v AS SELECT 1 AS wrong_col")
-        task = _make_task(
-            outputs=["v"],
-            output_columns={"v": ["expected_col"]},
+        conn.execute("CREATE VIEW t_v AS SELECT 1 AS wrong_col")
+        node = _make_node(
+            output_columns={"t_v": ["expected_col"]},
         )
-        errors = task.validate_transform(conn)
+        errors = node.validate_outputs(conn)
         assert len(errors) == 1
         assert "expected_col" in errors[0]
 
 
 class TestTwoPhaseValidation:
     def test_validate_sql_runs_after_transform(self, conn):
-        task = _make_task(
+        node = _make_node(
             name="t",
-            outputs=["out"],
-            sql="CREATE VIEW out AS SELECT 1 AS x",
+            sql="CREATE VIEW t_out AS SELECT 1 AS x",
             validate_sql=(
                 "CREATE VIEW t__validation AS SELECT 'fail' AS status, 'bad' AS message"
             ),
         )
 
-        ws = Workspace(db_path=":memory:", inputs={}, tasks=[])
-        client = type("StubClient", (), {"reasoning_effort": None})()
+        ws = Workspace(db_path=":memory:")
 
         result = asyncio.run(
-            ws._execute_task(
+            ws._execute_sql_node(
                 conn=conn,
-                task=task,
-                client=client,
-                model="test",
-                max_iterations=1,
+                node=node,
             )
         )
 
@@ -117,8 +107,6 @@ class TestWorkspaceExports:
 
         ws = Workspace(
             db_path=":memory:",
-            inputs={},
-            tasks=[],
             exports={"report.csv": export_fn},
         )
         errors = ws._run_exports(conn)
@@ -134,8 +122,6 @@ class TestWorkspaceExports:
 
         ws = Workspace(
             db_path=":memory:",
-            inputs={},
-            tasks=[],
             exports={"report.csv": bad_export},
         )
         errors = ws._run_exports(conn)
@@ -156,8 +142,6 @@ class TestWorkspaceExports:
 
         ws = Workspace(
             db_path=":memory:",
-            inputs={},
-            tasks=[],
             exports={
                 "good.csv": good_export,
                 "bad.csv": bad_export,
@@ -177,8 +161,12 @@ class TestWorkspaceValidateConfig:
         """Valid task graph passes without error."""
         ws = Workspace(
             db_path=":memory:",
-            inputs={"data": []},
-            tasks=[_make_task(name="t", inputs=["data"], outputs=["out"])],
+            nodes=[
+                _make_node(name="data", source=[], sql=""),
+                _make_node(
+                    name="t", depends_on=["data"], sql="CREATE VIEW t_out AS SELECT 1"
+                ),
+            ],
         )
         ws._validate_config()  # Should not raise
 
@@ -186,10 +174,9 @@ class TestWorkspaceValidateConfig:
         """Invalid task graph raises ValueError."""
         ws = Workspace(
             db_path=":memory:",
-            inputs={},
-            tasks=[_make_task(name="t", inputs=["missing"], outputs=["out"])],
+            nodes=[_make_node(name="t", depends_on=["missing"])],
         )
-        with pytest.raises(ValueError, match="Task graph validation failed"):
+        with pytest.raises(ValueError, match="Graph validation failed"):
             ws._validate_config()
 
 
@@ -198,22 +185,22 @@ class TestWorkspaceMeta:
 
     def test_roundtrip(self, conn):
         """Write and read workspace metadata."""
-        tasks = [_make_task(name="t", prompt="test context", outputs=["out"])]
+        nodes = [_make_node(name="t", prompt="test context")]
         persist_workspace_meta(
             conn,
             model="gpt-5",
-            tasks=tasks,
-            input_row_counts={"data": 100},
+            nodes=nodes,
+            source_row_counts={"data": 100},
         )
         meta = read_workspace_meta(conn)
         assert meta["llm_model"] == "gpt-5"
         assert meta["meta_version"] == "2"
         assert "created_at_utc" in meta
-        assert "task_prompts" in meta
+        assert "node_prompts" in meta
         assert "run" in meta
 
         # Check prompts stored correctly
-        contexts = json.loads(meta["task_prompts"])
+        contexts = json.loads(meta["node_prompts"])
         assert contexts["t"] == "test context"
 
         # Check input row counts
@@ -225,7 +212,7 @@ class TestWorkspaceMeta:
         persist_workspace_meta(
             conn,
             model="m",
-            tasks=[],
+            nodes=[],
         )
         meta = read_workspace_meta(conn)
         run = json.loads(meta["run"])
@@ -236,12 +223,12 @@ class TestWorkspaceMeta:
         persist_workspace_meta(
             conn,
             model="m1",
-            tasks=[],
+            nodes=[],
         )
         persist_workspace_meta(
             conn,
             model="m2",
-            tasks=[],
+            nodes=[],
         )
         meta = read_workspace_meta(conn)
         assert meta["llm_model"] == "m2"
@@ -255,27 +242,27 @@ class TestWorkspaceMeta:
     def test_full_prompts_stored(self, conn):
         """Full prompts are stored without truncation."""
         long_context = "x" * 1000
-        tasks = [_make_task(name="t", prompt=long_context, outputs=["out"])]
+        nodes = [_make_node(name="t", prompt=long_context, sql="")]
         persist_workspace_meta(
             conn,
             model="m",
-            tasks=tasks,
+            nodes=nodes,
         )
         meta = read_workspace_meta(conn)
-        contexts = json.loads(meta["task_prompts"])
+        contexts = json.loads(meta["node_prompts"])
         assert contexts["t"] == long_context
         assert len(contexts["t"]) == 1000
 
 
-class TestMaterializeTaskOutputs:
-    """Tests for materialize_task_outputs: view-to-table conversion."""
+class TestMaterializeNodeOutputs:
+    """Tests for materialize_node_outputs: view-to-table conversion."""
 
     def test_materializes_output_view_as_table(self, conn):
         """Output view is converted to a table with identical data."""
-        conn.execute("CREATE VIEW out AS SELECT 1 AS x, 'hello' AS y")
-        task = _make_task(name="t", outputs=["out"])
+        conn.execute("CREATE VIEW t_out AS SELECT 1 AS x, 'hello' AS y")
+        node = _make_node(name="t")
 
-        n = materialize_task_outputs(conn, task)
+        n = materialize_node_outputs(conn, node)
 
         assert n == 1
         # View should be gone
@@ -285,7 +272,7 @@ class TestMaterializeTaskOutputs:
                 "SELECT view_name FROM duckdb_views() WHERE internal = false"
             ).fetchall()
         }
-        assert "out" not in views
+        assert "t_out" not in views
         # Table should exist with same data
         tables = {
             r[0]
@@ -293,91 +280,84 @@ class TestMaterializeTaskOutputs:
                 "SELECT table_name FROM duckdb_tables() WHERE internal = false"
             ).fetchall()
         }
-        assert "out" in tables
-        row = conn.execute("SELECT x, y FROM out").fetchone()
+        assert "t_out" in tables
+        row = conn.execute("SELECT x, y FROM t_out").fetchone()
         assert row == (1, "hello")
 
     def test_preserves_sql_in_view_definitions(self, conn):
         """Original view SQL is visible in _view_definitions (derived from _trace)."""
-        sql = "CREATE VIEW out AS SELECT 42 AS val"
+        sql = "CREATE VIEW t_out AS SELECT 42 AS val"
         conn.execute(sql)
-        log_trace(conn, sql, success=True, task_name="t")
-        task = _make_task(name="t", outputs=["out"])
+        log_trace(conn, sql, success=True, node_name="t")
+        node = _make_node(name="t")
 
-        materialize_task_outputs(conn, task)
+        materialize_node_outputs(conn, node)
 
         rows = conn.execute(
-            "SELECT task, view_name, sql FROM _view_definitions"
+            "SELECT node, view_name, sql FROM _view_definitions"
         ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] == "t"
-        assert rows[0][1] == "out"
+        assert rows[0][1] == "t_out"
         assert "42" in rows[0][2]
 
     def test_multiple_outputs(self, conn):
         """All declared outputs are materialized."""
-        sql_a = "CREATE VIEW a AS SELECT 1 AS x"
-        sql_b = "CREATE VIEW b AS SELECT 2 AS x"
+        sql_a = "CREATE VIEW t_a AS SELECT 1 AS x"
+        sql_b = "CREATE VIEW t_b AS SELECT 2 AS x"
         conn.execute(sql_a)
         conn.execute(sql_b)
-        log_trace(conn, sql_a, success=True, task_name="t")
-        log_trace(conn, sql_b, success=True, task_name="t")
-        task = _make_task(name="t", outputs=["a", "b"])
+        log_trace(conn, sql_a, success=True, node_name="t")
+        log_trace(conn, sql_b, success=True, node_name="t")
+        node = _make_node(name="t")
 
-        n = materialize_task_outputs(conn, task)
+        n = materialize_node_outputs(conn, node)
 
         assert n == 2
-        assert conn.execute("SELECT x FROM a").fetchone() == (1,)
-        assert conn.execute("SELECT x FROM b").fetchone() == (2,)
+        assert conn.execute("SELECT x FROM t_a").fetchone() == (1,)
+        assert conn.execute("SELECT x FROM t_b").fetchone() == (2,)
         defs = conn.execute(
             "SELECT view_name FROM _view_definitions ORDER BY view_name"
         ).fetchall()
-        assert [r[0] for r in defs] == ["a", "b"]
+        assert [r[0] for r in defs] == ["t_a", "t_b"]
 
-    def test_skips_missing_views(self, conn):
-        """If a declared output doesn't exist (task failed), it's skipped."""
-        conn.execute("CREATE VIEW a AS SELECT 1 AS x")
-        task = _make_task(name="t", outputs=["a", "nonexistent"])
-
-        n = materialize_task_outputs(conn, task)
-
-        assert n == 1  # Only 'a' was materialized
-
-    def test_intermediate_views_untouched(self, conn):
-        """Namespace-prefixed intermediate views are NOT materialized."""
+    def test_intermediate_views_materialized(self, conn):
+        """All namespace-prefixed views are materialized (no distinction between intermediate and output)."""
         conn.execute("CREATE VIEW t_step1 AS SELECT 1 AS x")
-        conn.execute("CREATE VIEW out AS SELECT x FROM t_step1")
-        task = _make_task(name="t", outputs=["out"])
+        conn.execute("CREATE VIEW t_out AS SELECT x FROM t_step1")
+        node = _make_node(name="t")
 
-        materialize_task_outputs(conn, task)
+        n = materialize_node_outputs(conn, node)
 
-        # Intermediate view should still be a view
-        views = {
+        # Both views should be materialized
+        assert n == 2
+        tables = {
             r[0]
             for r in conn.execute(
-                "SELECT view_name FROM duckdb_views() WHERE internal = false"
+                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
             ).fetchall()
         }
-        assert "t_step1" in views
+        assert "t_step1" in tables
+        assert "t_out" in tables
 
     def test_materialized_data_matches_original(self, conn):
         """Multi-row view data is preserved exactly after materialization."""
         conn.execute(
-            "CREATE VIEW out AS "
+            "CREATE VIEW t_out AS "
             "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS t(id, name)"
         )
-        task = _make_task(name="t", outputs=["out"])
+        node = _make_node(name="t")
 
-        materialize_task_outputs(conn, task)
+        materialize_node_outputs(conn, node)
 
-        rows = conn.execute("SELECT id, name FROM out ORDER BY id").fetchall()
+        rows = conn.execute("SELECT id, name FROM t_out ORDER BY id").fetchall()
         assert rows == [(1, "a"), (2, "b"), (3, "c")]
 
     def test_downstream_view_reads_materialized_table(self, conn):
         """A downstream view referencing a materialized output still works."""
         conn.execute("CREATE VIEW upstream_out AS SELECT 10 AS val")
-        task = _make_task(name="upstream", outputs=["upstream_out"])
-        materialize_task_outputs(conn, task)
+        node = _make_node(name="upstream")
+        materialize_node_outputs(conn, node)
 
         # Now create a downstream view that reads the (now-table) output
         conn.execute(
@@ -386,56 +366,54 @@ class TestMaterializeTaskOutputs:
         row = conn.execute("SELECT doubled FROM downstream_step").fetchone()
         assert row == (20,)
 
-    def test_validate_transform_works_after_materialization(self, conn):
-        """validate_transform accepts materialized tables as valid outputs."""
-        conn.execute("CREATE VIEW out AS SELECT 1 AS x, 2 AS y")
-        task = _make_task(
+    def test_validate_outputs_works_after_materialization(self, conn):
+        """validate_outputs accepts materialized tables as valid outputs."""
+        conn.execute("CREATE VIEW t_out AS SELECT 1 AS x, 2 AS y")
+        node = _make_node(
             name="t",
-            outputs=["out"],
-            output_columns={"out": ["x", "y"]},
+            output_columns={"t_out": ["x", "y"]},
         )
 
         # Validate before materialization (view)
-        assert task.validate_transform(conn) == []
+        assert node.validate_outputs(conn) == []
 
         # Materialize
-        materialize_task_outputs(conn, task)
+        materialize_node_outputs(conn, node)
 
         # Validate after materialization (table)
-        assert task.validate_transform(conn) == []
+        assert node.validate_outputs(conn) == []
 
     def test_idempotent_on_already_materialized(self, conn):
         """Calling materialize twice skips already-materialized outputs."""
-        conn.execute("CREATE VIEW out AS SELECT 1 AS x")
-        task = _make_task(name="t", outputs=["out"])
+        conn.execute("CREATE VIEW t_out AS SELECT 1 AS x")
+        node = _make_node(name="t")
 
-        n1 = materialize_task_outputs(conn, task)
+        n1 = materialize_node_outputs(conn, node)
         assert n1 == 1
 
         # Second call: view is gone, so it's skipped
-        n2 = materialize_task_outputs(conn, task)
+        n2 = materialize_node_outputs(conn, node)
         assert n2 == 0
 
         # Data still intact
-        assert conn.execute("SELECT x FROM out").fetchone() == (1,)
+        assert conn.execute("SELECT x FROM t_out").fetchone() == (1,)
 
     def test_materializes_validation_views(self, conn):
         """Validation views are materialized alongside output views."""
-        conn.execute("CREATE VIEW out AS SELECT 1 AS x")
+        conn.execute("CREATE VIEW t_out AS SELECT 1 AS x")
         conn.execute(
             "CREATE VIEW t__validation AS "
             "SELECT 'pass' AS status, 'all good' AS message"
         )
-        task = _make_task(
+        node = _make_node(
             name="t",
-            outputs=["out"],
             validate_sql=(
                 "CREATE VIEW t__validation AS "
                 "SELECT 'pass' AS status, 'all good' AS message"
             ),
         )
 
-        n = materialize_task_outputs(conn, task)
+        n = materialize_node_outputs(conn, node)
 
         assert n == 2  # output + validation view
         # Both should be tables now
@@ -445,7 +423,7 @@ class TestMaterializeTaskOutputs:
                 "SELECT view_name FROM duckdb_views() WHERE internal = false"
             ).fetchall()
         }
-        assert "out" not in views
+        assert "t_out" not in views
         assert "t__validation" not in views
         tables = {
             r[0]
@@ -453,7 +431,7 @@ class TestMaterializeTaskOutputs:
                 "SELECT table_name FROM duckdb_tables() WHERE internal = false"
             ).fetchall()
         }
-        assert "out" in tables
+        assert "t_out" in tables
         assert "t__validation" in tables
         # Data intact
         row = conn.execute("SELECT status, message FROM t__validation").fetchone()
@@ -461,7 +439,7 @@ class TestMaterializeTaskOutputs:
 
     def test_materializes_multiple_validation_views(self, conn):
         """Multiple validation views (e.g. t__validation, t__validation_extra) are materialized."""
-        conn.execute("CREATE VIEW out AS SELECT 1 AS x")
+        conn.execute("CREATE VIEW t_out AS SELECT 1 AS x")
         conn.execute(
             "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
         )
@@ -469,9 +447,8 @@ class TestMaterializeTaskOutputs:
             "CREATE VIEW t__validation_extra AS "
             "SELECT 'warn' AS status, 'heads up' AS message"
         )
-        task = _make_task(
+        node = _make_node(
             name="t",
-            outputs=["out"],
             validate_sql=(
                 "CREATE VIEW t__validation AS "
                 "SELECT 'pass' AS status, 'ok' AS message; "
@@ -480,16 +457,16 @@ class TestMaterializeTaskOutputs:
             ),
         )
 
-        n = materialize_task_outputs(conn, task)
+        n = materialize_node_outputs(conn, node)
 
-        assert n == 3  # out + t__validation + t__validation_extra
+        assert n == 3  # t_out + t__validation + t__validation_extra
         tables = {
             r[0]
             for r in conn.execute(
                 "SELECT table_name FROM duckdb_tables() WHERE internal = false"
             ).fetchall()
         }
-        assert {"out", "t__validation", "t__validation_extra"} <= tables
+        assert {"t_out", "t__validation", "t__validation_extra"} <= tables
 
     def test_validation_warnings_works_after_materialization(self, conn):
         """validation_warnings() reads from materialized validation tables."""
@@ -497,9 +474,8 @@ class TestMaterializeTaskOutputs:
             "CREATE VIEW t__validation AS "
             "SELECT 'warn' AS status, 'watch out' AS message"
         )
-        task = _make_task(
+        node = _make_node(
             name="t",
-            outputs=[],
             validate_sql=(
                 "CREATE VIEW t__validation AS "
                 "SELECT 'warn' AS status, 'watch out' AS message"
@@ -507,10 +483,10 @@ class TestMaterializeTaskOutputs:
         )
 
         # Materialize the validation view
-        materialize_task_outputs(conn, task)
+        materialize_node_outputs(conn, node)
 
         # validation_warnings should still work (reads from table now)
-        total, warnings = task.validation_warnings(conn)
+        total, warnings = node.validation_warnings(conn)
         assert total == 1
         assert len(warnings) == 1
         assert "watch out" in warnings[0]
@@ -519,17 +495,16 @@ class TestMaterializeTaskOutputs:
         """Validation view SQL is visible in _view_definitions (derived from _trace)."""
         sql = "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
         conn.execute(sql)
-        log_trace(conn, sql, success=True, task_name="t")
-        task = _make_task(
+        log_trace(conn, sql, success=True, node_name="t")
+        node = _make_node(
             name="t",
-            outputs=[],
             validate_sql=sql,
         )
 
-        materialize_task_outputs(conn, task)
+        materialize_node_outputs(conn, node)
 
         rows = conn.execute(
-            "SELECT view_name, sql FROM _view_definitions WHERE task = 't'"
+            "SELECT view_name, sql FROM _view_definitions WHERE node = 't'"
         ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] == "t__validation"
@@ -537,15 +512,15 @@ class TestMaterializeTaskOutputs:
 
     def test_view_definitions_excludes_dropped_views(self, conn):
         """_view_definitions omits views whose last trace action is DROP."""
-        create_sql = "CREATE VIEW dropped_v AS SELECT 1 AS x"
-        drop_sql = "DROP VIEW dropped_v"
-        keep_sql = "CREATE VIEW kept_v AS SELECT 2 AS x"
+        create_sql = "CREATE VIEW t_dropped_v AS SELECT 1 AS x"
+        drop_sql = "DROP VIEW t_dropped_v"
+        keep_sql = "CREATE VIEW t_kept_v AS SELECT 2 AS x"
         conn.execute(create_sql)
-        log_trace(conn, create_sql, success=True, task_name="t")
+        log_trace(conn, create_sql, success=True, node_name="t")
         conn.execute(drop_sql)
-        log_trace(conn, drop_sql, success=True, task_name="t")
+        log_trace(conn, drop_sql, success=True, node_name="t")
         conn.execute(keep_sql)
-        log_trace(conn, keep_sql, success=True, task_name="t")
+        log_trace(conn, keep_sql, success=True, node_name="t")
 
         names = [
             r[0]
@@ -553,20 +528,20 @@ class TestMaterializeTaskOutputs:
                 "SELECT view_name FROM _view_definitions ORDER BY view_name"
             ).fetchall()
         ]
-        assert "dropped_v" not in names
-        assert "kept_v" in names
+        assert "t_dropped_v" not in names
+        assert "t_kept_v" in names
 
     def test_leftover_tmp_table_cleaned_up(self, conn):
         """A leftover _materialize_tmp_ table from a crashed run doesn't block."""
-        conn.execute("CREATE TABLE _materialize_tmp_out AS SELECT 999 AS stale")
-        conn.execute("CREATE VIEW out AS SELECT 1 AS x")
-        task = _make_task(name="t", outputs=["out"])
+        conn.execute("CREATE TABLE _materialize_tmp_t_out AS SELECT 999 AS stale")
+        conn.execute("CREATE VIEW t_out AS SELECT 1 AS x")
+        node = _make_node(name="t")
 
-        n = materialize_task_outputs(conn, task)
+        n = materialize_node_outputs(conn, node)
 
         assert n == 1
         # Stale tmp table replaced, final table has correct data
-        assert conn.execute("SELECT x FROM out").fetchone() == (1,)
+        assert conn.execute("SELECT x FROM t_out").fetchone() == (1,)
         # No leftover tmp table
         tables = {
             r[0]
@@ -574,4 +549,4 @@ class TestMaterializeTaskOutputs:
                 "SELECT table_name FROM duckdb_tables() WHERE internal = false"
             ).fetchall()
         }
-        assert "_materialize_tmp_out" not in tables
+        assert "_materialize_tmp_t_out" not in tables
