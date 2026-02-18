@@ -122,7 +122,7 @@ WHERE m.gl_id IS NULL;
 """
 
 MATCH_CONFIDENT_VALIDATE_SQL = """\
-CREATE VIEW match_confident__validation AS
+CREATE OR REPLACE VIEW match_confident__validation AS
 SELECT 'fail' AS status,
        'bank_id ' || bank_id || ' matched ' || cnt || 'x' AS message
 FROM (SELECT bank_id, COUNT(*) AS cnt FROM match_confident_matched GROUP BY bank_id)
@@ -186,7 +186,7 @@ Batch deposits: one row per GL component, match_type='batch'.
 """
 
 MATCH_HARD_VALIDATE_SQL = """\
-CREATE VIEW match_hard__validation AS
+CREATE OR REPLACE VIEW match_hard__validation AS
 WITH bank_agg AS (
     SELECT bank_id, COUNT(*) AS cnt,
            COUNT(*) FILTER (WHERE match_type != 'batch') AS non_batch,
@@ -259,7 +259,7 @@ SELECT
 """
 
 REPORT_VALIDATE_SQL = """\
-CREATE VIEW report__validation AS
+CREATE OR REPLACE VIEW report__validation AS
 SELECT 'fail' AS status,
        'Bank count mismatch: ' || bc || ' != ' || mc || ' + ' || ub AS message
 FROM (
