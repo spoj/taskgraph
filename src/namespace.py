@@ -7,10 +7,10 @@ project's naming conventions:
 - ``Namespace.for_node(node)`` — node transform: ``{name}_*``
   prefix only, validation views forbidden.
 - ``Namespace.for_validation(node)`` — validation SQL:
-  ``{name}__validation`` + ``{name}__validation_*`` prefix.
+  ``{name}__validation_*`` prefix.
 - ``Namespace.for_source_validation(input_name)`` — source node
   validation SQL:
-  ``{input}__validation`` + ``{input}__validation_*`` prefix.
+  ``{input}__validation_*`` prefix.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ class Namespace:
 
         Allows only ``{node.name}_*`` prefixed views (underscore required —
         bare ``{node.name}`` is NOT a valid view name).  Blocks validation
-        views — those are created separately by ``validate_sql``.
+        views — those are created separately by the validation phase.
         """
         return cls(
             allowed_names=frozenset(),
@@ -70,7 +70,7 @@ class Namespace:
             forbidden=lambda name: is_validation_view(name, node.name),
             forbidden_msg=(
                 "Validation views cannot be created during transform; "
-                "they are created by validate_sql."
+                "they are created by validation."
             ),
         )
 
@@ -78,12 +78,11 @@ class Namespace:
     def for_validation(cls, node: Node) -> Namespace:
         """Namespace for node validation SQL execution.
 
-        Allows ``{node.name}__validation`` and
-        ``{node.name}__validation_*`` prefixed names.
+        Allows only ``{node.name}__validation_*`` prefixed names.
         """
         base = f"{node.name}__validation"
         return cls(
-            allowed_names=frozenset({base}),
+            allowed_names=frozenset(),
             prefix=base,
         )
 
@@ -91,7 +90,7 @@ class Namespace:
     def for_source_validation(cls, input_name: str) -> Namespace:
         """Namespace for source node validation SQL execution."""
         base = f"{input_name}__validation"
-        return cls(allowed_names=frozenset({base}), prefix=base)
+        return cls(allowed_names=frozenset(), prefix=base)
 
     # --- Name checking ---
 

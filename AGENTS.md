@@ -31,10 +31,9 @@ same greedy DAG executor as sql/prompt nodes.
 - `src/agent.py` — node agent: prompt-based SQL transform, SQL execution with namespace enforcement, `persist_node_meta`, `run_node_agent`, `run_sql_node`, `run_validate_sql`, `validate_node_complete`
 - `src/agent_loop.py` — generic async agent loop with concurrent tool execution
 - `src/api.py` — OpenRouter client. Connection pooling, cache_control on last message (Anthropic only), reasoning_effort
-- `src/diff.py` — View catalog diffing: before/after snapshots of `duckdb_views().sql`, structured change reporting (created/modified/dropped), persistence to `_changes` table, terminal formatting
 - `src/namespace.py` — `Namespace` class: DDL name enforcement for nodes and validation. Factory methods `for_node()`, `for_validation()`, `for_source_validation()` encode naming conventions. Single `check_name()` entry point used by `is_sql_allowed()`.
 - `src/sql_utils.py` — shared SQL utilities: parser connection, statement splitting, column schema queries, CREATE name extraction
-- `src/workspace.py` — Workspace orchestrator: resolve DAG, run nodes with greedy scheduling, per-node change tracking, view materialization, unified post-execution flow
+- `src/workspace.py` — Workspace orchestrator: resolve DAG, run nodes with greedy scheduling, view materialization, unified post-execution flow
 - `src/ingest.py` — Ingestion: DataFrame/list[dict]/dict[str,list] or file paths -> DuckDB with _row_id PK
 - `src/spec.py` — spec loader: parses `NODES` list from Python modules, validates fields, resolves file paths
 - `scripts/cli.py` — CLI entry point: `tg init`, `tg run`, `tg show`
@@ -50,7 +49,7 @@ NODES = [
         "name": "invoices",
         "source": "data/invoices.xlsx#Sheet1",   # callable, raw data, or file path
         "columns": ["id", "amount", "date"],      # optional: required columns
-        "validate_sql": "CREATE OR REPLACE VIEW invoices__validation AS ...",  # optional
+        "validate": {"main": "SELECT ..."},  # optional
     },
     # Source node — callable
     {
@@ -70,7 +69,7 @@ NODES = [
         "depends_on": ["prep", "rates"],
         "prompt": "Match invoices against rates...",
         "output_columns": {"match_results": ["id", "score"]},
-        "validate_sql": "CREATE OR REPLACE VIEW match__validation AS ...",
+        "validate": {"main": "SELECT ..."},
     },
 ]
 
@@ -79,7 +78,7 @@ EXPORTS = {"report.xlsx": fn(conn, path), ...}  # optional export functions
 
 ### Node fields
 
-All nodes: `name`, `depends_on`, `validate_sql`.
+All nodes: `name`, `depends_on`, `validate`.
 Source nodes: `source`, `columns`.
 SQL/prompt nodes: `sql` OR `prompt`, `output_columns`.
 
@@ -90,7 +89,7 @@ SQL/prompt nodes: `sql` OR `prompt`, `output_columns`.
 - `prompt` — LLM objective text (string).
 - `columns` — (source nodes only) required column names checked after ingestion.
 - `output_columns` — (sql/prompt nodes only) maps `view_name -> [required_columns]`. Keys define which views must exist; values define required columns per view. Keys must start with `{name}_`.
-- `validate_sql` — SQL to create `{name}__validation*` views. Works for all node types.
+- `validate` — validation queries: `dict[check_name, query]`. Each query is wrapped into a view named `{name}__validation_{check_name}`.
 
 **Allowed libraries in spec modules**: stdlib (pathlib, csv, json, etc.), polars, openpyxl.
 No other third-party imports. Spec modules should be pure data + ingestion logic.
@@ -122,7 +121,6 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 | `_node_meta` | `node` | `node VARCHAR`, `meta_json VARCHAR` | Per-node run metadata (model, iterations, tokens, elapsed, validation status) |
 | `_trace` | `id` (sequence) | `id`, `timestamp`, `node VARCHAR`, `source VARCHAR`, `query`, `success`, `error`, `row_count`, `elapsed_ms` | SQL execution log |
 | `_workspace_meta` | `key` | `key VARCHAR`, `value VARCHAR` | Workspace-level metadata (model, prompts, timing, spec info) |
-| `_changes` | — | `node VARCHAR`, `view_name`, `kind`, `sql_before`, `sql_after`, `cols_before`, `cols_after`, `rows_before`, `rows_after` | View change history |
 
 ### Derived views
 
@@ -136,7 +134,7 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 |-------|--------|
 | `agent` | LLM agent tool calls (prompt nodes) |
 | `sql_node` | Deterministic SQL node execution |
-| `node_validation` | `validate_sql` execution |
+| `node_validation` | Validation view definition |
 | `input_validation` | (reserved — referenced in docstrings only) |
 
 ### Workspace metadata keys
@@ -163,10 +161,9 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 All node types go through the same unified post-execution flow in `run_one()` (inside `Workspace.run()`):
 
 1. **Execute** — type-specific: ingest (source), run SQL (sql), run agent (prompt).
-2. **Validate** — `validate_node_complete(conn, node)`: validates outputs, runs validate_sql, checks validation views. Identical call for ALL node types.
-3. **Snapshot** — `snapshot_views()` taken before materialization to capture view changes.
-4. **Materialize** — `materialize_node_outputs(conn, node)`: discovers all `{name}_*` views and materializes them. Source nodes simply have no `{name}_*` output views, so the unified code naturally handles them.
-5. **Persist metadata** — `persist_node_meta(conn, node_name, meta)`: writes per-node run metadata for ALL node types.
+2. **Validate** — `validate_node_complete(conn, node)`: validates outputs, defines validation views (from `validate`), checks validation views. Identical call for ALL node types.
+3. **Materialize** — `materialize_node_outputs(conn, node)`: discovers all `{name}_*` views and materializes them. Source nodes simply have no `{name}_*` output views, so the unified code naturally handles them.
+4. **Persist metadata** — `persist_node_meta(conn, node_name, meta)`: writes per-node run metadata for ALL node types.
 
 No per-type `_post_execute()` or `_materialize_node()` wrappers. The `run_sql_node()` and `run_node_agent()` functions ONLY execute their work — they do NOT validate or persist metadata.
 
@@ -175,14 +172,14 @@ No per-type `_post_execute()` or `_materialize_node()` wrappers. The `run_sql_no
 - **Token circuit breaker** (`agent_loop.py`): `DEFAULT_MAX_TOKENS = 20_000_000` (20M). Checked after each LLM call (prompt + completion combined). Returns `AgentResult(success=False)` if exceeded. Configurable via `max_tokens` param on `run_agent_loop()`.
 - **Per-query timeout** (`agent.py`): `DEFAULT_QUERY_TIMEOUT_S = 30`. Uses `threading.Timer` + `conn.interrupt()`. Catches `duckdb.InterruptException`, connection stays usable. Configurable via `query_timeout_s` param on `execute_sql()`.
 - **Output schema validation** (`task.py`): `output_columns: dict[str, list[str]]` on `Node`. Runs after view existence check, before validation view enforcement. Queries `information_schema.columns` and checks required columns are present.
-- **Node validation views** (`task.py`): nodes can declare `validate_sql` that creates `{name}__validation` / `{name}__validation_*` views with columns `status`, `message`. Any row with status='fail' fails the node.
+- **Node validation views** (`task.py`): nodes can declare `validate: dict[check_name, query]` which becomes `{name}__validation_{check_name}` views with columns `status`, `message`. Any row with status='fail' fails the node.
 - **Source column validation** (`task.py`): source nodes declare `columns: list[str]` — checked after ingestion against the actual table schema.
 
 ## Key Functions and Classes
 
 ### `src/task.py`
 
-- `Node` — dataclass: `name`, `depends_on`, `source`, `sql`, `prompt`, `columns`, `output_columns`, `validate_sql`
+- `Node` — dataclass: `name`, `depends_on`, `source`, `sql`, `prompt`, `columns`, `output_columns`, `validate`
 - `Node.node_type()` — returns `"source"`, `"sql"`, or `"prompt"`
 - `Node.is_source()` — `self.source is not _NO_SOURCE`
 - `Node.validate_outputs(conn)` — unified: dispatches to `_validate_source_columns` or `_validate_output_columns`
@@ -195,8 +192,8 @@ No per-type `_post_execute()` or `_materialize_node()` wrappers. The `run_sql_no
 
 - `run_node_agent(conn, node, client, model, max_iterations)` — run LLM agent for a prompt node
 - `run_sql_node(conn, node)` — execute deterministic SQL node
-- `run_validate_sql(conn, node)` — execute validate_sql with validation namespace
-- `validate_node_complete(conn, node)` — full validation (outputs + validate_sql + validation views)
+- `run_validate_sql(conn, node)` — define validation views from `node.validate`
+- `validate_node_complete(conn, node)` — full validation (outputs + validate + validation views)
 - `persist_node_meta(conn, node_name, meta)` — write to `_node_meta` table
 - `execute_sql(conn, query, namespace, node_name, ...)` — SQL execution with namespace enforcement, timeout, size cap
 - `is_sql_allowed(query, namespace, ddl_only)` — statement type + name checking
@@ -233,12 +230,7 @@ just run --spec specs/main.py -o output.db          # file path auto-resolved
 just run --spec tests.diamond_dag -o output.db -m anthropic/claude-sonnet-4 --reasoning-effort medium
 ```
 
-After each node completes, view changes are reported inline:
-- `+ view_name  N cols, N rows` — created views
-- `~ view_name` with compact SQL diff — modified views
-- `- view_name` — dropped views
-
-Changes are also persisted to the `_changes` table in the output `.db` for later querying.
+After each node completes, the runner logs per-node status. For audit/lineage, query `_trace` and `_view_definitions` in the output `.db`.
 
 ### `taskgraph show`
 Visualize a spec's structure: node DAG with type tags ([source], [sql], [prompt]), tree view, per-node details (dependencies, outputs, validation), graph errors, exports. Accepts file paths like `run`. When given a `.db` file, displays workspace metadata instead.

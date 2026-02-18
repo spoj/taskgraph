@@ -65,6 +65,47 @@ def parse_one_statement(sql_text: str) -> ParsedStatement:
     return ParsedStatement(sql=stmt.query.strip(), stmt_type=stmt.type)
 
 
+def strip_leading_sql_comments(sql: str) -> str:
+    """Strip leading SQL comments and whitespace.
+
+    DuckDB's parser preserves leading comments in ``extract_statements().query``.
+    Our DDL name extraction regexes are intentionally anchored to the start of a
+    statement, so we must remove leading comments first.
+
+    Supports:
+    - Line comments: ``-- ...`` (to end of line)
+    - Block comments: ``/* ... */`` (non-nested)
+    """
+    s = sql or ""
+    i = 0
+    n = len(s)
+
+    while True:
+        # Skip whitespace
+        while i < n and s[i].isspace():
+            i += 1
+
+        # Line comment
+        if s.startswith("--", i):
+            j = s.find("\n", i + 2)
+            if j == -1:
+                return ""  # comment-only
+            i = j + 1
+            continue
+
+        # Block comment
+        if s.startswith("/*", i):
+            j = s.find("*/", i + 2)
+            if j == -1:
+                return ""  # unterminated comment
+            i = j + 2
+            continue
+
+        break
+
+    return s[i:]
+
+
 @dataclass(frozen=True)
 class DdlTarget:
     """DDL target extracted from a CREATE/DROP statement."""
@@ -101,6 +142,7 @@ def extract_ddl_target(sql: str) -> DdlTarget | None:
     Returns None if *sql* is not a CREATE/DROP of a VIEW or MACRO.
     The returned target's *name* may be None if extraction fails.
     """
+    sql = strip_leading_sql_comments(sql)
     m = DDL_CREATE_TARGET_RE.match(sql or "")
     if m:
         kind = (m.group("kind") or "").upper()
@@ -132,8 +174,11 @@ def extract_create_name(sql: str) -> str | None:
 
 # Shared regex strings for the derived _view_definitions view.
 # These are embedded into SQL via single-quoted literals.
-VIEW_TRACE_CREATE_RE = r"(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-VIEW_TRACE_DROP_RE = r"(?i)^\s*DROP\s+VIEW\s+(?:IF\s+EXISTS\s+)?"
+# Note: these patterns are used inside DuckDB regexp_* functions to derive
+# _view_definitions from the raw _trace.query strings. Queries may include
+# leading SQL comments, so we match CREATE/DROP VIEW anywhere in the string.
+VIEW_TRACE_CREATE_RE = r"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+VIEW_TRACE_DROP_RE = r"(?i)DROP\s+VIEW\s+(?:IF\s+EXISTS\s+)?"
 VIEW_TRACE_NAME_EXTRACT_RE = r'(?i)VIEW\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?"?(\w+)"?'
 
 

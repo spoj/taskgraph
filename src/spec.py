@@ -10,13 +10,19 @@ present (exactly one required):
 - **sql** — deterministic SQL transform.
 - **prompt** — LLM-driven transform.
 
-All nodes share: ``name``, ``depends_on``, ``validate_sql``.
+All nodes share: ``name``, ``depends_on``, and optional ``validate``.
 Source nodes additionally: ``source``, ``columns``.
 SQL/prompt nodes additionally: ``sql`` OR ``prompt``, ``output_columns``.
+
+Validation is expressed as a mapping of ``check_name -> query``.
+Each query is wrapped by Taskgraph into a validation view named:
+
+  ``{node}__validation_{check_name}``
 """
 
 import importlib
 import importlib.util
+import re
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -27,16 +33,18 @@ from .ingest import (
     parse_file_path,
     parse_file_string,
 )
-from .task import Node, _NO_SOURCE, validate_node_name
+from .task import Node, validate_node_name
 
-_SOURCE_FIELDS = {"name", "depends_on", "source", "columns", "validate_sql"}
+from .sql_utils import SqlParseError, parse_one_statement
+
+_SOURCE_FIELDS = {"name", "depends_on", "source", "columns", "validate"}
 _SQL_PROMPT_FIELDS = {
     "name",
     "depends_on",
     "sql",
     "prompt",
     "output_columns",
-    "validate_sql",
+    "validate",
 }
 
 
@@ -173,16 +181,60 @@ def _parse_module(module: ModuleType) -> tuple[list[Node], dict[str, Any]]:
                     )
             kwargs["output_columns"] = oc
 
-        if "validate_sql" in raw:
-            vs = raw["validate_sql"]
-            if not isinstance(vs, str):
+        if "validate" in raw:
+            val = raw["validate"]
+            if not isinstance(val, dict):
                 raise ValueError(
-                    f"Node '{name}': validate_sql must be a string, "
-                    f"got {type(vs).__name__}"
+                    f"Node '{name}': validate must be a dict mapping suffix -> query, "
+                    f"got {type(val).__name__}"
                 )
-            vs = vs.strip()
-            if vs:
-                kwargs["validate_sql"] = vs
+
+            validate: dict[str, str] = {}
+            for suffix, query in val.items():
+                if not isinstance(suffix, str):
+                    raise ValueError(
+                        f"Node '{name}': validate keys must be strings (suffixes)."
+                    )
+                if not isinstance(query, str):
+                    raise ValueError(
+                        f"Node '{name}': validate['{suffix}'] must be a string query."
+                    )
+                suffix = suffix.strip()
+                query = query.strip()
+                if not suffix:
+                    raise ValueError(
+                        f"Node '{name}': validate keys must be non-empty strings (e.g. 'main')."
+                    )
+                if suffix and not re.match(r"^[A-Za-z0-9_]+$", suffix):
+                    raise ValueError(
+                        f"Node '{name}': validate suffix '{suffix}' must match [A-Za-z0-9_]+."
+                    )
+                if "__" in suffix:
+                    raise ValueError(
+                        f"Node '{name}': validate suffix '{suffix}' must not contain '__'."
+                    )
+                if not query:
+                    raise ValueError(
+                        f"Node '{name}': validate['{suffix}'] must be a non-empty query."
+                    )
+
+                # Ensure the query is syntactically valid inside CREATE VIEW.
+                # Parsing does not bind names, so it can reference tables/views
+                # that are created at runtime.
+                wrapped = (
+                    f"CREATE VIEW __tg_validate_tmp AS {query.rstrip(';').strip()}"
+                )
+                try:
+                    parse_one_statement(wrapped)
+                except SqlParseError as e:
+                    raise ValueError(
+                        f"Node '{name}': validate['{suffix}'] must be a single query usable in CREATE VIEW: {e}"
+                    ) from e
+
+                validate[suffix] = query
+
+            if validate:
+                kwargs["validate"] = validate
 
         nodes.append(Node(**kwargs))
 

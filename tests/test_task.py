@@ -114,11 +114,11 @@ class TestValidateOutputs:
     def test_validation_view_pass(self, conn):
         """Validation view passes when it contains no fail rows."""
         conn.execute(
-            "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
+            "CREATE VIEW t__validation_main AS SELECT 'pass' AS status, 'ok' AS message"
         )
         node = _make_node(
             name="t",
-            validate_sql="CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message",
+            validate={"main": "SELECT 'pass' AS status, 'ok' AS message"},
         )
         errors = node.validate_validation_views(conn)
         assert errors == []
@@ -126,11 +126,11 @@ class TestValidateOutputs:
     def test_validation_view_fail(self, conn):
         """Validation view fails when it contains any fail row."""
         conn.execute(
-            "CREATE VIEW t__validation AS SELECT 'fail' AS status, 'bad' AS message"
+            "CREATE VIEW t__validation_main AS SELECT 'fail' AS status, 'bad' AS message"
         )
         node = _make_node(
             name="t",
-            validate_sql="CREATE VIEW t__validation AS SELECT 'fail' AS status, 'bad' AS message",
+            validate={"main": "SELECT 'fail' AS status, 'bad' AS message"},
         )
         errors = node.validate_validation_views(conn)
         assert errors
@@ -145,10 +145,10 @@ class TestValidateOutputs:
         )
         node = _make_node(
             name="t",
-            validate_sql=(
-                "CREATE VIEW t__validation_a AS SELECT 'pass' AS status, 'ok' AS message;"
-                "CREATE VIEW t__validation_b AS SELECT 'fail' AS status, 'nope' AS message"
-            ),
+            validate={
+                "a": "SELECT 'pass' AS status, 'ok' AS message",
+                "b": "SELECT 'fail' AS status, 'nope' AS message",
+            },
         )
         errors = node.validate_validation_views(conn)
         assert errors
@@ -167,15 +167,15 @@ class TestValidateOutputs:
 
     def test_discover_validation_objects(self, conn):
         conn.execute(
-            "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
+            "CREATE VIEW t__validation_main AS SELECT 'pass' AS status, 'ok' AS message"
         )
         conn.execute(
             "CREATE VIEW t__validation_extra AS SELECT 'pass' AS status, 'ok' AS message"
         )
         conn.execute("CREATE VIEW other_view AS SELECT 1 AS x")
         assert discover_validation_objects(conn, "t") == [
-            "t__validation",
             "t__validation_extra",
+            "t__validation_main",
         ]
 
     def test_validate_graph_rejects_double_underscore_in_name(self):

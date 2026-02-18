@@ -17,7 +17,7 @@ Node types:
 
 After execution, ALL nodes go through the same post-execution flow:
 1. Validate outputs (``node.validate_outputs(conn)``)
-2. Execute validate_sql if present (create validation views)
+2. Define validation views if configured
 3. Check validation views (``node.validate_validation_views(conn)``)
 4. Materialize all ``{name}_*`` views (source nodes simply have none)
 
@@ -44,14 +44,8 @@ from typing import Any, Callable
 from .agent_loop import AgentResult, DEFAULT_MAX_ITERATIONS
 from .api import OpenRouterClient, DEFAULT_MODEL
 from .catalog import count_rows, list_views, view_exists
-from .diff import (
-    snapshot_views,
-    diff_snapshots,
-    format_changes,
-)
 from .infra import (
     init_infra,
-    persist_changes,
     persist_node_meta,
     persist_workspace_meta,
     read_workspace_meta,
@@ -373,7 +367,6 @@ class Workspace:
                     node.node_type(),
                 )
                 node_start = time.time()
-                before = snapshot_views(conn)
 
                 # --- Phase 1: Execute (type-specific) ---
                 if node.is_source():
@@ -417,10 +410,6 @@ class Workspace:
                             usage=result.usage,
                         )
 
-                # Snapshot BEFORE materialization to capture view changes
-                after = snapshot_views(conn)
-                changes = diff_snapshots(before, after)
-
                 # Materialize on success (all node types)
                 if result.success:
                     n = materialize_node_outputs(conn, node)
@@ -453,12 +442,6 @@ class Workspace:
                 if not result.success:
                     node_meta["error"] = result.final_message
                 persist_node_meta(conn, node.name, node_meta)
-
-                if changes:
-                    persist_changes(conn, node.name, changes)
-                    change_summary = format_changes(node.name, changes)
-                    if change_summary:
-                        log.info("%s", change_summary)
 
                 return node.name, result
 

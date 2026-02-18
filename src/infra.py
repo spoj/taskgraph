@@ -4,7 +4,6 @@ Centralizes creation/migration and persistence for workspace-internal tables:
 - _trace (+ _trace_seq, _view_definitions)
 - _node_meta
 - _workspace_meta
-- _changes
 """
 
 from __future__ import annotations
@@ -31,7 +30,6 @@ def init_infra(conn: duckdb.DuckDBPyConnection) -> None:
     ensure_trace(conn)
     ensure_node_meta(conn)
     ensure_workspace_meta(conn)
-    ensure_changes(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -236,58 +234,5 @@ def upsert_workspace_meta(
         VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """,
-        rows,
-    )
-
-
-# ---------------------------------------------------------------------------
-# View changes
-# ---------------------------------------------------------------------------
-
-
-def ensure_changes(conn: duckdb.DuckDBPyConnection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS _changes (
-            node        VARCHAR,
-            view_name   VARCHAR,
-            kind        VARCHAR,
-            sql_before  VARCHAR,
-            sql_after   VARCHAR,
-            cols_before VARCHAR,
-            cols_after  VARCHAR,
-            rows_before INTEGER,
-            rows_after  INTEGER
-        )
-        """
-    )
-
-
-def persist_changes(
-    conn: duckdb.DuckDBPyConnection, node_name: str, changes: list[Any]
-) -> None:
-    """Append view changes to the _changes table."""
-    ensure_changes(conn)
-    if not changes:
-        return
-
-    rows: list[tuple[Any, ...]] = []
-    for c in changes:
-        rows.append(
-            (
-                node_name,
-                c.view_name,
-                c.kind,
-                c.sql_before,
-                c.sql_after,
-                json.dumps([list(t) for t in c.cols_before]) if c.cols_before else None,
-                json.dumps([list(t) for t in c.cols_after]) if c.cols_after else None,
-                c.rows_before,
-                c.rows_after,
-            )
-        )
-
-    conn.executemany(
-        "INSERT INTO _changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )

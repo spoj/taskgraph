@@ -121,8 +121,7 @@ LEFT JOIN match_confident_matched m ON g.id = m.gl_id
 WHERE m.gl_id IS NULL;
 """
 
-MATCH_CONFIDENT_VALIDATE_SQL = """\
-CREATE OR REPLACE VIEW match_confident__validation AS
+MATCH_CONFIDENT_VALIDATE = """\
 SELECT 'fail' AS status,
        'bank_id ' || bank_id || ' matched ' || cnt || 'x' AS message
 FROM (SELECT bank_id, COUNT(*) AS cnt FROM match_confident_matched GROUP BY bank_id)
@@ -185,8 +184,7 @@ Must include ALL match_confident_matched rows plus any new batch/tolerance match
 Batch deposits: one row per GL component, match_type='batch'.
 """
 
-MATCH_HARD_VALIDATE_SQL = """\
-CREATE OR REPLACE VIEW match_hard__validation AS
+MATCH_HARD_VALIDATE = """\
 WITH bank_agg AS (
     SELECT bank_id, COUNT(*) AS cnt,
            COUNT(*) FILTER (WHERE match_type != 'batch') AS non_batch,
@@ -258,8 +256,7 @@ SELECT
     (SELECT COUNT(*) FROM offsetting_pairs) AS offsetting_pairs;
 """
 
-REPORT_VALIDATE_SQL = """\
-CREATE OR REPLACE VIEW report__validation AS
+REPORT_VALIDATE = """\
 SELECT 'fail' AS status,
        'Bank count mismatch: ' || bc || ' != ' || mc || ' + ' || ub AS message
 FROM (
@@ -304,7 +301,7 @@ NODES = [
     {
         "name": "match_confident",
         "sql": MATCH_CONFIDENT_SQL,
-        "validate_sql": MATCH_CONFIDENT_VALIDATE_SQL,
+        "validate": {"main": MATCH_CONFIDENT_VALIDATE},
         "depends_on": ["normalize"],
         "output_columns": {
             "match_confident_matched": [
@@ -325,7 +322,7 @@ NODES = [
     {
         "name": "match_hard",
         "prompt": MATCH_HARD_INTENT,
-        "validate_sql": MATCH_HARD_VALIDATE_SQL,
+        "validate": {"main": MATCH_HARD_VALIDATE},
         "depends_on": ["normalize", "match_confident", "offsetting"],
         "output_columns": {
             "match_hard_all_matched": [
@@ -341,7 +338,7 @@ NODES = [
     {
         "name": "report",
         "sql": REPORT_SQL,
-        "validate_sql": REPORT_VALIDATE_SQL,
+        "validate": {"main": REPORT_VALIDATE},
         "depends_on": ["normalize", "match_hard", "offsetting"],
     },
 ]

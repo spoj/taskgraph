@@ -241,7 +241,7 @@ class TestSourceNodeValidation:
 
     In the unified node model, source nodes use:
     - ``columns`` for required column checks (via Node.validate_outputs)
-    - ``validate_sql`` for SQL validation (via run_validate_sql + validate_validation_views)
+    - ``validate`` queries for validation views (via run_validate_sql + validate_validation_views)
     - ``validate_node_complete()`` + ``materialize_node_outputs()`` for the full flow
     """
 
@@ -290,17 +290,14 @@ class TestSourceNodeValidation:
         assert len(errors) == 1
         assert "_row_id" not in errors[0]
 
-    def test_source_columns_short_circuits_before_validate_sql(self, conn):
-        """Column errors are found before validate_sql would run."""
+    def test_source_columns_short_circuits_before_validation(self, conn):
+        """Column errors are found before validation would run."""
         ingest_table(conn, [{"x": 1}], "t")
         node = Node(
             name="t",
             source=[],
             columns=["missing"],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW t__validation AS "
-                "SELECT 'fail' AS status, 'should not run' AS message"
-            ),
+            validate={"main": "SELECT 'fail' AS status, 'should not run' AS message"},
         )
         # validate_outputs catches the column error first
         errors = node.validate_outputs(conn)
@@ -313,10 +310,9 @@ class TestSourceNodeValidation:
         node = Node(
             name="data",
             source=[],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW data__validation AS "
-                "SELECT 'pass' AS status, 'all values positive' AS message"
-            ),
+            validate={
+                "main": "SELECT 'pass' AS status, 'all values positive' AS message"
+            },
         )
         errors = run_validate_sql(conn=conn, node=node)
         assert errors == []
@@ -329,12 +325,13 @@ class TestSourceNodeValidation:
         node = Node(
             name="data",
             source=[],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW data__validation AS "
-                "SELECT 'fail' AS status, "
-                "'negative value for id=' || CAST(id AS VARCHAR) AS message "
-                "FROM data WHERE val < 0"
-            ),
+            validate={
+                "main": (
+                    "SELECT 'fail' AS status, "
+                    "'negative value for id=' || CAST(id AS VARCHAR) AS message "
+                    "FROM data WHERE val < 0"
+                )
+            },
         )
         errors = run_validate_sql(conn=conn, node=node)
         assert errors == []  # SQL execution succeeds
@@ -347,11 +344,9 @@ class TestSourceNodeValidation:
         node = Node(
             name="bad",
             source=[],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW bad__validation AS "
-                "SELECT 'fail' AS status, x AS message "
-                "FROM nonexistent_table"
-            ),
+            validate={
+                "main": ("SELECT 'fail' AS status, x AS message FROM nonexistent_table")
+            },
         )
         errors = run_validate_sql(conn=conn, node=node)
         assert len(errors) == 1
@@ -365,15 +360,16 @@ class TestSourceNodeValidation:
         node = Node(
             name="items",
             source=[],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW items__validation AS "
-                "SELECT 'fail' AS status, "
-                "'bad status for id=' || CAST(id AS VARCHAR) AS message "
-                "FROM items WHERE status = 'bad' "
-                "UNION ALL "
-                "SELECT 'pass' AS status, 'ok' AS message "
-                "FROM items WHERE status = 'ok'"
-            ),
+            validate={
+                "main": (
+                    "SELECT 'fail' AS status, "
+                    "'bad status for id=' || CAST(id AS VARCHAR) AS message "
+                    "FROM items WHERE status = 'bad' "
+                    "UNION ALL "
+                    "SELECT 'pass' AS status, 'ok' AS message "
+                    "FROM items WHERE status = 'ok'"
+                )
+            },
         )
         errors = run_validate_sql(conn=conn, node=node)
         assert errors == []
@@ -387,33 +383,18 @@ class TestSourceNodeValidation:
         node = Node(
             name="t",
             source=[],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW t__validation AS "
-                "SELECT 'fail' AS status, 'error1' AS message; "
-                "CREATE OR REPLACE VIEW t__validation_extra AS "
-                "SELECT 'fail' AS status, 'error2' AS message"
-            ),
+            validate={
+                "main": "SELECT 'fail' AS status, 'error1' AS message",
+                "extra": "SELECT 'fail' AS status, 'error2' AS message",
+            },
         )
         errors = run_validate_sql(conn=conn, node=node)
         assert errors == []
         errors = node.validate_validation_views(conn)
         assert len(errors) >= 1
-        assert "error1" in errors[0]
-
-    def test_validate_sql_wrong_view_name(self, conn):
-        """Validation SQL creating wrong-named view is blocked by namespace."""
-        ingest_table(conn, [{"id": 1}], "t")
-        node = Node(
-            name="t",
-            source=[],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW wrong_name AS "
-                "SELECT 'pass' AS status, 'ok' AS message"
-            ),
-        )
-        # run_validate_sql uses namespace enforcement: wrong_name is not t__validation*
-        errors = run_validate_sql(conn=conn, node=node)
-        assert len(errors) == 1
+        all_err = "\n".join(errors)
+        assert "error1" in all_err
+        assert "error2" in all_err
 
     def test_post_execute_materializes_validation_views(self, conn):
         """Validation views are materialized as tables after passing."""
@@ -421,10 +402,7 @@ class TestSourceNodeValidation:
         node = Node(
             name="t",
             source=[],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW t__validation AS "
-                "SELECT 'pass' AS status, 'ok' AS message"
-            ),
+            validate={"main": "SELECT 'pass' AS status, 'ok' AS message"},
         )
         # Run validation (creates validation views), then materialize
         errors = validate_node_complete(conn, node)
@@ -437,7 +415,7 @@ class TestSourceNodeValidation:
                 "SELECT view_name FROM duckdb_views() WHERE internal = false"
             ).fetchall()
         }
-        assert "t__validation" not in views
+        assert "t__validation_main" not in views
         # Table should exist with same data
         tables = {
             row[0]
@@ -445,8 +423,8 @@ class TestSourceNodeValidation:
                 "SELECT table_name FROM duckdb_tables() WHERE internal = false"
             ).fetchall()
         }
-        assert "t__validation" in tables
-        row = conn.execute("SELECT status, message FROM t__validation").fetchone()
+        assert "t__validation_main" in tables
+        row = conn.execute("SELECT status, message FROM t__validation_main").fetchone()
         assert row == ("pass", "ok")
 
     def test_validate_sql_preserves_definition(self, conn):
@@ -455,10 +433,7 @@ class TestSourceNodeValidation:
         node = Node(
             name="data",
             source=[],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW data__validation AS "
-                "SELECT 'pass' AS status, 'all good' AS message"
-            ),
+            validate={"main": "SELECT 'pass' AS status, 'all good' AS message"},
         )
         errors = run_validate_sql(conn=conn, node=node)
         assert errors == []
@@ -468,7 +443,7 @@ class TestSourceNodeValidation:
         ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] == "data"  # label = node name
-        assert rows[0][1] == "data__validation"
+        assert rows[0][1] == "data__validation_main"
         assert "all good" in rows[0][2]
 
     def test_post_execute_multiple_validation_views(self, conn):
@@ -477,12 +452,10 @@ class TestSourceNodeValidation:
         node = Node(
             name="t",
             source=[],
-            validate_sql=(
-                "CREATE OR REPLACE VIEW t__validation AS "
-                "SELECT 'pass' AS status, 'ok' AS message; "
-                "CREATE OR REPLACE VIEW t__validation_extra AS "
-                "SELECT 'pass' AS status, 'also ok' AS message"
-            ),
+            validate={
+                "main": "SELECT 'pass' AS status, 'ok' AS message",
+                "extra": "SELECT 'pass' AS status, 'also ok' AS message",
+            },
         )
         errors = validate_node_complete(conn, node)
         assert not errors
@@ -493,11 +466,11 @@ class TestSourceNodeValidation:
                 "SELECT table_name FROM duckdb_tables() WHERE internal = false"
             ).fetchall()
         }
-        assert "t__validation" in tables
+        assert "t__validation_main" in tables
         assert "t__validation_extra" in tables
 
     def test_no_validation_returns_empty(self, conn):
-        """Source node with no columns or validate_sql passes validation."""
+        """Source node with no columns or validate passes validation."""
         ingest_table(conn, [{"x": 1}], "t")
         node = Node(name="t", source=[])
         errors = node.validate_outputs(conn)

@@ -18,7 +18,7 @@ from .api import OpenRouterClient, create_model_callable, DEFAULT_MODEL
 from .catalog import list_tables, list_views
 from .infra import log_trace, persist_node_meta, ensure_trace as init_trace_table
 from .namespace import Namespace
-from .task import Node
+from .task import Node, validation_view_prefix
 from .sql_utils import (
     get_column_schema,
     SqlParseError,
@@ -372,13 +372,13 @@ def build_transform_prompt(
     ]
 
     if node.has_validation():
-        parts.extend(
-            [
-                "",
-                f"VALIDATION SQL (runs after transform; creates {node.name}__validation* views):",
-                node.validate_sql,
-            ]
+        parts.append("")
+        parts.append(
+            f"VALIDATION (each query is wrapped into {node.name}__validation_<check_name> views):"
         )
+        for check_name, query in sorted(node.validation_queries().items()):
+            view_name = f"{validation_view_prefix(node.name)}_{check_name}"
+            parts.extend([f"- {view_name}:", query])
 
     parts.extend(
         [
@@ -525,48 +525,43 @@ def run_validate_sql(
     conn: duckdb.DuckDBPyConnection,
     node: Node,
 ) -> list[str]:
-    """Execute validate_sql statements with validation namespace restrictions.
+    """Define validation views for a node.
+
+    Validation is specified as a mapping of ``check_name -> query`` on the node.
+    Each entry becomes a view named:
+      - ``{name}__validation_{check_name}``
 
     Returns a list of error messages (empty = success).
     """
-    statements = node.validate_sql_statements()
-    if not statements:
+    validate = node.validation_queries()
+    if not validate:
         return []
 
     vns = Namespace.for_validation(node)
 
-    # Idempotency: validate_sql is frequently executed multiple times within a
-    # single node run (agent-loop validation retries + workspace post-check).
-    # To avoid leaking "CREATE OR REPLACE" requirements into specs, we clear
-    # any prior {name}__validation* views before running validate_sql.
-    base = f"{node.name}__validation"
-    prefix = base + "_"
-    existing = [
-        v
-        for v in list_views(conn, exclude_prefixes=())
-        if v == base or v.startswith(prefix)
-    ]
-    for view_name in existing:
-        execute_sql(
-            conn,
-            f'DROP VIEW IF EXISTS "{view_name}"',
-            namespace=vns,
-            node_name=node.name,
-            ddl_only=True,
-            source="node_validation",
-        )
+    tables = set(list_tables(conn, exclude_prefixes=()))
 
-    for q in statements:
+    for check_name, query in sorted(validate.items()):
+        view_name = f"{validation_view_prefix(node.name)}_{check_name}"
+
+        # If a validation view was already materialized into a table, don't
+        # attempt to re-create it as a view.
+        if view_name in tables:
+            continue
+
+        q = query.rstrip(";").strip()
+        ddl = f'CREATE OR REPLACE VIEW "{view_name}" AS\n{q}'
         result = execute_sql(
             conn,
-            q,
+            ddl,
             namespace=vns,
             node_name=node.name,
             ddl_only=True,
             source="node_validation",
         )
         if not result.get("success", False):
-            return [str(result.get("error") or "validate_sql execution failed")]
+            err = str(result.get("error") or "Validation view definition failed")
+            return [f"{view_name}: {err}"]
 
     return []
 
@@ -580,13 +575,17 @@ def validate_node_complete(
     if errors:
         return errors
     if node.has_validation():
-        # validate_sql defines views; once created successfully, we can re-evaluate
-        # them without re-running the DDL on every validation attempt.
-        if not node._validation_sql_ready:
-            errors = run_validate_sql(conn=conn, node=node)
-            if errors:
-                return errors
-            node._validation_sql_ready = True
+        # Define validation views once; subsequent validations just re-evaluate.
+        base = validation_view_prefix(node.name)
+        expected = [f"{base}_{k}" for k in node.validation_queries().keys()]
+        if expected:
+            existing = set(list_views(conn, exclude_prefixes=())) | set(
+                list_tables(conn, exclude_prefixes=())
+            )
+            if not all(v in existing for v in expected):
+                errors = run_validate_sql(conn=conn, node=node)
+                if errors:
+                    return errors
         errors = node.validate_validation_views(conn)
         if errors:
             return errors

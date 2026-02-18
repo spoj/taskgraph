@@ -69,7 +69,8 @@ def validation_view_prefix(node_name: str) -> str:
 def is_validation_view(view_name: str, node_name: str) -> bool:
     """Return True if *view_name* is a validation view for *node_name*.
 
-    Convention: ``{node_name}__validation`` and ``{node_name}__validation_*``
+    Convention: ``{node_name}__validation`` (reserved) and
+    ``{node_name}__validation_*``.
     """
     prefix = validation_view_prefix(node_name)
     return view_name == prefix or view_name.startswith(prefix + "_")
@@ -98,11 +99,11 @@ def discover_validation_objects(
     names: set[str] = set()
 
     for name in list_views(conn, exclude_prefixes=()):
-        if name == base or name.startswith(prefix):
+        if name.startswith(prefix):
             names.add(name)
 
     for name in list_tables(conn, exclude_prefixes=()):
-        if name == base or name.startswith(prefix):
+        if name.startswith(prefix):
             names.add(name)
 
     return sorted(names)
@@ -245,8 +246,10 @@ class Node:
         output_columns: (sql/prompt nodes) Maps view_name → required
             column list.  Keys define which views must exist; values
             define required columns per view.
-        validate_sql: SQL to create ``{name}__validation*`` views.
-            Works for all node types.
+        validate: Optional validation query definitions.
+            A mapping of ``check_name -> query``. Each query is wrapped as:
+
+              ``CREATE OR REPLACE VIEW <node>__validation_<check_name> AS <query>``
     """
 
     name: str
@@ -261,16 +264,8 @@ class Node:
     columns: list[str] = field(default_factory=list)
     output_columns: dict[str, list[str]] = field(default_factory=dict)
 
-    # Validation SQL (all node types)
-    validate_sql: str = ""
-
-    # Runtime-only state (not part of spec contract)
-    _validation_sql_ready: bool = field(
-        default=False,
-        init=False,
-        repr=False,
-        compare=False,
-    )
+    # Validation (all node types): check_name -> query
+    validate: dict[str, str] = field(default_factory=dict)
 
     def node_type(self) -> str:
         """Return ``'source'``, ``'sql'``, or ``'prompt'``."""
@@ -284,15 +279,15 @@ class Node:
         return self.source is not _NO_SOURCE
 
     def has_validation(self) -> bool:
-        return bool(self.validate_sql and self.validate_sql.strip())
+        return bool(self.validate)
 
     def sql_statements(self) -> list[str]:
         """Return SQL statements for sql transform nodes."""
         return split_sql_statements(self.sql)
 
-    def validate_sql_statements(self) -> list[str]:
-        """Return SQL statements for validation SQL."""
-        return split_sql_statements(self.validate_sql)
+    def validation_queries(self) -> dict[str, str]:
+        """Return the validation query mapping (check_name -> query)."""
+        return dict(self.validate)
 
     # ------------------------------------------------------------------
     # Output validation (unified for all node types)
@@ -340,7 +335,7 @@ class Node:
     # ------------------------------------------------------------------
 
     def validate_validation_views(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
-        """Enforce validation views created by validate_sql.
+        """Enforce validation views created by node validation.
 
         Each validation view must have columns:
         - status: pass|warn|fail (case-insensitive)
@@ -354,7 +349,7 @@ class Node:
         views = discover_validation_objects(conn, self.name)
         if not views:
             return [
-                f"validate_sql did not create any '{validation_view_prefix(self.name)}' views."
+                f"Validation is configured but no '{validation_view_prefix(self.name)}_*' objects exist."
             ]
 
         errors: list[str] = []

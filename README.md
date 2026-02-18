@@ -3,21 +3,20 @@
 Taskgraph runs deterministic SQL and prompt-based transforms against your data and writes auditable DuckDB SQL views into a single workspace database.
 
 You define a "workspace spec" (a Python module) that declares:
-- `INPUTS`: how to load data into DuckDB tables
-- `TASKS`: a DAG of tasks; each task runs via `sql` (deterministic SQL) or `prompt` (LLM transform) and produces one or more SQL views. Optional `validate_sql` runs after the transform to create validation views.
-- `EXPORTS` (optional): functions that materialize reports (CSV/XLSX/etc.) from the finished workspace
+- `NODES`: a list of nodes — each either a **source** node (`source`) or a **transform** node (`sql` or `prompt`). Nodes form a DAG via `depends_on`.
+- `EXPORTS` (optional): functions that export files (CSV/XLSX/etc.) from the finished workspace
 
-The result is one portable `.db` file containing the raw inputs, all agent-created views, validation results, and an execution trace.
+The result is one portable `.db` file containing the raw inputs, materialized outputs, validation results, and an execution trace (with view definitions in `_view_definitions`).
 
 ```
-spec module -> ingest -> DAG -> tasks (concurrent) -> validate -> export -> output.db
+spec module -> ingest -> DAG -> nodes (concurrent) -> validate -> materialize -> export -> output.db
 ```
 
 ## What Problem It Solves
 
-- **Reproducible, reviewable work**: outputs are SQL view definitions stored in the database.
+- **Reproducible, reviewable work**: outputs are materialized tables; the SQL used to define them is recorded via `_trace` / `_view_definitions`.
 - **Strong guardrails**: agents can only `CREATE VIEW`/`CREATE MACRO` (no tables, no inserts) and are namespace-restricted per node.
-- **Fast iteration**: views are late-binding; tweak upstream logic and downstream results update automatically.
+- **Fast iteration**: views are late-binding during execution; after each node passes validation, its `{name}_*` views are materialized into tables.
 
 ## Quick Start
 
@@ -34,7 +33,7 @@ uv run taskgraph init
 uv run taskgraph run
 
 # Inspect results
-duckdb output.db "SELECT * FROM duckdb_views() WHERE internal = false"
+duckdb output.db "SELECT table_name FROM duckdb_tables() WHERE internal = false ORDER BY 1"
 ```
 
 If you already have a spec module in your package:

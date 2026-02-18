@@ -47,8 +47,9 @@ from src.api import (
 from src.catalog import count_rows_display, list_tables, list_views
 from src.ingest import FileInput
 from src.agent_loop import DEFAULT_MAX_ITERATIONS
+from src.infra import read_workspace_meta
 from src.spec import load_spec_from_module, resolve_module_path
-from src.workspace import Workspace, read_workspace_meta
+from src.workspace import Workspace
 from src.task import (
     Node,
     resolve_dag,
@@ -567,53 +568,39 @@ def _report_run_summary(output: Path, nodes: list[Node]) -> None:
         tables = set(list_tables(conn, exclude_prefixes=("_",)))
         all_outputs = views | tables
 
-        # --- Change report from _changes table ---
-        has_changes = False
-        try:
-            change_rows = conn.execute(
-                "SELECT node, view_name, kind, sql_before, sql_after, "
-                "cols_before, cols_after, rows_before, rows_after "
-                "FROM _changes ORDER BY node, view_name"
-            ).fetchall()
-            has_changes = bool(change_rows)
-        except duckdb.Error:
-            pass
+        click.echo(
+            f"\nOutputs: {len(all_outputs)} ({len(tables)} materialized, {len(views)} views)"
+        )
 
-        if not has_changes:
-            # Fallback: no _changes table, show basic view listing
-            click.echo(
-                f"\nOutputs: {len(all_outputs)} ({len(tables)} materialized, {len(views)} views)"
-            )
-
-            source_nodes = [n for n in nodes if n.is_source()]
-            if source_nodes:
-                click.echo("\n  Sources:")
-                for node in source_nodes:
-                    if node.name in tables:
-                        click.echo(
-                            f"    {node.name}: {count_rows_display(conn, node.name)} rows"
-                        )
-
-            for node in nodes:
-                if node.is_source():
-                    continue
-                if node.output_columns:
-                    node_output_names = list(node.output_columns.keys())
-                else:
-                    prefix = f"{node.name}_"
-                    node_output_names = sorted(
-                        n for n in all_outputs if n.startswith(prefix)
+        source_nodes = [n for n in nodes if n.is_source()]
+        if source_nodes:
+            click.echo("\n  Sources:")
+            for node in source_nodes:
+                if node.name in tables:
+                    click.echo(
+                        f"    {node.name}: {count_rows_display(conn, node.name)} rows"
                     )
-                if not node_output_names:
-                    continue
-                click.echo(f"\n  {node.name}:")
-                for output_name in node_output_names:
-                    if output_name in all_outputs:
-                        click.echo(
-                            f"    {output_name}: {count_rows_display(conn, output_name)} rows"
-                        )
-                    else:
-                        click.echo(f"    {output_name}: MISSING")
+
+        for node in nodes:
+            if node.is_source():
+                continue
+            if node.output_columns:
+                node_output_names = list(node.output_columns.keys())
+            else:
+                prefix = f"{node.name}_"
+                node_output_names = sorted(
+                    n for n in all_outputs if n.startswith(prefix)
+                )
+            if not node_output_names:
+                continue
+            click.echo(f"\n  {node.name}:")
+            for output_name in node_output_names:
+                if output_name in all_outputs:
+                    click.echo(
+                        f"    {output_name}: {count_rows_display(conn, output_name)} rows"
+                    )
+                else:
+                    click.echo(f"    {output_name}: MISSING")
 
         # --- Warnings and errors (always shown, all node types) ---
         for node in nodes:
@@ -769,8 +756,8 @@ def show(target: Path | None, spec: str | None):
             ns = len(n.output_columns)
             parts.append(f"{ns} output schema{'s' if ns > 1 else ''}")
         if n.has_validation():
-            ns = len(n.validate_sql_statements())
-            parts.append(f"validate_sql: {ns} stmt{'s' if ns != 1 else ''}")
+            ns = len(n.validation_queries())
+            parts.append(f"validate: {ns} quer{'y' if ns == 1 else 'ies'}")
         if parts:
             val_lines.append(f"  {n.name}: {', '.join(parts)}")
 

@@ -49,6 +49,28 @@ class TestNamespaceEnforcement:
         )
         assert ok
 
+    def test_create_view_with_leading_line_comment_allowed(self):
+        """Leading SQL comments should not break DDL target extraction."""
+        ok, err = is_sql_allowed(
+            "-- comment\nCREATE VIEW output AS SELECT 1",
+            namespace=_ns({"output"}, "task1"),
+        )
+        assert ok, err
+
+    def test_create_view_with_leading_block_comment_allowed(self):
+        ok, err = is_sql_allowed(
+            "/* comment */\nCREATE VIEW output AS SELECT 1",
+            namespace=_ns({"output"}, "task1"),
+        )
+        assert ok, err
+
+    def test_drop_view_with_leading_comment_allowed(self):
+        ok, err = is_sql_allowed(
+            "-- comment\nDROP VIEW IF EXISTS output",
+            namespace=_ns({"output"}, "task1"),
+        )
+        assert ok, err
+
     def test_create_view_namespaced_prefix(self):
         """CREATE VIEW with task name prefix is allowed."""
         ok, err = is_sql_allowed(
@@ -214,7 +236,7 @@ class TestNamespaceEnforcement:
         ok, err = is_sql_allowed("EXPLAIN SELECT 1")
         assert ok
 
-    def test_execute_sql_namespace_blocks(self, conn):
+    def test_execute_sql_namespace_blocks(self, conn: duckdb.DuckDBPyConnection):
         """execute_sql() returns error for namespace-violating queries."""
         result = execute_sql(
             conn,
@@ -225,7 +247,7 @@ class TestNamespaceEnforcement:
         assert not result["success"]
         assert "forbidden" in result["error"]
 
-    def test_execute_sql_namespace_allows(self, conn):
+    def test_execute_sql_namespace_allows(self, conn: duckdb.DuckDBPyConnection):
         """execute_sql() allows queries within namespace."""
         result = execute_sql(
             conn,
@@ -235,7 +257,7 @@ class TestNamespaceEnforcement:
         )
         assert result["success"]
 
-    def test_execute_sql_select_returns_data(self, conn):
+    def test_execute_sql_select_returns_data(self, conn: duckdb.DuckDBPyConnection):
         """execute_sql() returns columns and rows for SELECT."""
         conn.execute("CREATE TABLE t (id INT, name VARCHAR)")
         conn.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
@@ -245,7 +267,7 @@ class TestNamespaceEnforcement:
         assert result["row_count"] == 2
         assert result["rows"] == [(1, "alice"), (2, "bob")]
 
-    def test_execute_sql_logs_trace(self, conn):
+    def test_execute_sql_logs_trace(self, conn: duckdb.DuckDBPyConnection):
         """execute_sql() logs to _trace table."""
         execute_sql(conn, "SELECT 42", node_name="test_task", query_timeout_s=0)
         rows = conn.execute(
@@ -254,19 +276,19 @@ class TestNamespaceEnforcement:
         assert len(rows) == 1
         assert rows[0] == ("test_task", True)
 
-    def test_execute_sql_logs_source(self, conn):
+    def test_execute_sql_logs_source(self, conn: duckdb.DuckDBPyConnection):
         """execute_sql() records the source column in _trace."""
         execute_sql(conn, "SELECT 1", node_name="t", query_timeout_s=0, source="agent")
         rows = conn.execute("SELECT source FROM _trace WHERE node = 't'").fetchall()
         assert rows == [("agent",)]
 
-    def test_execute_sql_source_none_by_default(self, conn):
+    def test_execute_sql_source_none_by_default(self, conn: duckdb.DuckDBPyConnection):
         """source defaults to NULL when not provided."""
         execute_sql(conn, "SELECT 1", node_name="t", query_timeout_s=0)
         rows = conn.execute("SELECT source FROM _trace WHERE node = 't'").fetchall()
         assert rows == [(None,)]
 
-    def test_execute_sql_logs_error_trace(self, conn):
+    def test_execute_sql_logs_error_trace(self, conn: duckdb.DuckDBPyConnection):
         """execute_sql() logs failed queries to _trace."""
         execute_sql(
             conn,
@@ -289,13 +311,13 @@ class TestQueryTimeout:
         """Default timeout is 30s."""
         assert DEFAULT_QUERY_TIMEOUT_S == 30
 
-    def test_fast_query_completes(self, conn):
+    def test_fast_query_completes(self, conn: duckdb.DuckDBPyConnection):
         """A fast query completes normally within timeout."""
         result = execute_sql(conn, "SELECT 42 AS answer", query_timeout_s=5)
         assert result["success"]
         assert result["rows"] == [(42,)]
 
-    def test_slow_query_interrupted(self, conn):
+    def test_slow_query_interrupted(self, conn: duckdb.DuckDBPyConnection):
         """A slow query is interrupted by the timeout timer."""
         # Cross join on large ranges — reliably slow and interruptible
         result = execute_sql(
@@ -306,12 +328,12 @@ class TestQueryTimeout:
         assert not result["success"]
         assert "timed out" in result["error"].lower()
 
-    def test_timeout_zero_disables(self, conn):
+    def test_timeout_zero_disables(self, conn: duckdb.DuckDBPyConnection):
         """query_timeout_s=0 disables the timeout."""
         result = execute_sql(conn, "SELECT 1", query_timeout_s=0)
         assert result["success"]
 
-    def test_connection_usable_after_timeout(self, conn):
+    def test_connection_usable_after_timeout(self, conn: duckdb.DuckDBPyConnection):
         """Connection remains usable after a timeout."""
         # First: timeout via cross join
         result1 = execute_sql(
@@ -326,7 +348,7 @@ class TestQueryTimeout:
         assert result2["success"]
         assert result2["rows"] == [(1,)]
 
-    def test_timeout_logs_to_trace(self, conn):
+    def test_timeout_logs_to_trace(self, conn: duckdb.DuckDBPyConnection):
         """Timed out queries are logged in _trace."""
         execute_sql(
             conn,
@@ -462,7 +484,7 @@ class TestIsAnthropicModel:
 class TestPersistNodeMeta:
     """Tests for persist_node_meta: per-node metadata persistence."""
 
-    def test_basic_write_and_read(self, conn):
+    def test_basic_write_and_read(self, conn: duckdb.DuckDBPyConnection):
         """Writes metadata and reads it back."""
         from src.agent import persist_node_meta
 
@@ -476,7 +498,7 @@ class TestPersistNodeMeta:
         assert meta["model"] == "gpt-5"
         assert meta["iterations"] == 3
 
-    def test_overwrites_previous(self, conn):
+    def test_overwrites_previous(self, conn: duckdb.DuckDBPyConnection):
         """Writing meta for the same task overwrites previous values."""
         from src.agent import persist_node_meta
 
@@ -492,7 +514,7 @@ class TestPersistNodeMeta:
         assert meta["extra"] == "new"
         assert set(meta.keys()) == {"v", "extra"}
 
-    def test_multiple_nodes_isolated(self, conn):
+    def test_multiple_nodes_isolated(self, conn: duckdb.DuckDBPyConnection):
         """Different nodes have independent metadata."""
         from src.agent import persist_node_meta
 
@@ -510,7 +532,7 @@ class TestPersistNodeMeta:
         assert json.loads(a_row[0])["x"] == 1
         assert json.loads(b_row[0])["x"] == 2
 
-    def test_json_serialization(self, conn):
+    def test_json_serialization(self, conn: duckdb.DuckDBPyConnection):
         """Complex values are JSON-serialized."""
         from src.agent import persist_node_meta
 
@@ -595,13 +617,13 @@ class TestJsonDefault:
 class TestResultSizeCap:
     """Tests for execute_sql result size limiting."""
 
-    def test_small_result_passes(self, conn):
+    def test_small_result_passes(self, conn: duckdb.DuckDBPyConnection):
         """Results under the cap are returned normally."""
         result = execute_sql(conn, "SELECT 1 AS x", max_result_chars=1000)
         assert result["success"] is True
         assert result["rows"] == [(1,)]
 
-    def test_large_result_rejected(self, conn):
+    def test_large_result_rejected(self, conn: duckdb.DuckDBPyConnection):
         """Results exceeding the cap return an error."""
         conn.execute(
             "CREATE TABLE big AS SELECT i, repeat('x', 100) AS txt FROM range(500) t(i)"
@@ -611,7 +633,7 @@ class TestResultSizeCap:
         assert "too large" in result["error"].lower()
         assert "500 rows" in result["error"]
 
-    def test_limit_zero_disables(self, conn):
+    def test_limit_zero_disables(self, conn: duckdb.DuckDBPyConnection):
         """max_result_chars=0 disables the check."""
         conn.execute(
             "CREATE TABLE big AS SELECT i, repeat('x', 100) AS txt FROM range(500) t(i)"
@@ -620,7 +642,7 @@ class TestResultSizeCap:
         assert result["success"] is True
         assert result["row_count"] == 500
 
-    def test_create_view_not_affected(self, conn):
+    def test_create_view_not_affected(self, conn: duckdb.DuckDBPyConnection):
         """CREATE VIEW (no result rows) is never affected by size cap."""
         result = execute_sql(
             conn,
@@ -708,11 +730,11 @@ class TestNamespace:
         assert not ok
         assert "match" in err
 
-    def test_for_validation_allows_base_name(self):
-        """for_validation() allows {node}__validation."""
+    def test_for_validation_blocks_base_name(self):
+        """for_validation() blocks bare {node}__validation (must be suffixed)."""
         node = _make_node(name="match")
         ns = Namespace.for_validation(node)
-        assert ns.is_name_allowed("match__validation")
+        assert not ns.is_name_allowed("match__validation")
 
     def test_for_validation_allows_prefixed(self):
         """for_validation() allows {node}__validation_* names."""
@@ -727,10 +749,10 @@ class TestNamespace:
         ns = Namespace.for_validation(node)
         assert not ns.is_name_allowed("match_result")
 
-    def test_for_input_allows_base_name(self):
-        """for_source_validation() allows {input}__validation."""
+    def test_for_input_blocks_base_name(self):
+        """for_source_validation() blocks bare {input}__validation (must be suffixed)."""
         ns = Namespace.for_source_validation("invoices")
-        assert ns.is_name_allowed("invoices__validation")
+        assert not ns.is_name_allowed("invoices__validation")
 
     def test_for_input_allows_prefixed(self):
         """for_source_validation() allows {input}__validation_* names."""
@@ -753,7 +775,7 @@ class TestNamespace:
     def test_check_name_returns_ok_for_valid(self):
         """check_name returns (True, '') for valid names."""
         ns = Namespace.for_source_validation("invoices")
-        ok, err = ns.check_name("invoices__validation", "view", "create")
+        ok, err = ns.check_name("invoices__validation_main", "view", "create")
         assert ok
         assert err == ""
 

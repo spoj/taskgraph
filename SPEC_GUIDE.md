@@ -87,10 +87,9 @@ NODES = [
             "One invoice matches at most one payment; leave unmatched invoices out."
         ),
         "output_columns": {"match_results": ["invoice_row_id", "payment_row_id", "match_reason"]},
-        "validate_sql": """
-            CREATE OR REPLACE VIEW match__validation AS
-            SELECT 'pass' AS status, 'ok' AS message
-        """,
+        "validate": {
+            "main": "SELECT 'pass' AS status, 'ok' AS message",
+        },
     },
 ]
 ```
@@ -136,7 +135,7 @@ Accepted return types from callables:
 
 ### Input nodes with validation
 
-Input nodes can include optional `columns` and `validate_sql` fields:
+Input nodes can include optional `columns` and `validate` fields:
 
 ```python
 NODES = [
@@ -144,15 +143,16 @@ NODES = [
         "name": "invoices",
         "source": "data/invoices.xlsx#Sheet1",
         "columns": ["id", "amount", "date", "vendor"],
-        "validate_sql": """
-            CREATE OR REPLACE VIEW invoices__validation AS
-            SELECT 'fail' AS status,
-                   'null amount at id=' || CAST(id AS VARCHAR) AS message
-            FROM invoices WHERE amount IS NULL
-            UNION ALL
-            SELECT 'pass' AS status, 'ok' AS message
-            WHERE NOT EXISTS (SELECT 1 FROM invoices WHERE amount IS NULL)
-        """,
+        "validate": {
+            "null_amounts": """
+                SELECT 'fail' AS status,
+                       'null amount at id=' || CAST(id AS VARCHAR) AS message
+                FROM invoices WHERE amount IS NULL
+                UNION ALL
+                SELECT 'pass' AS status, 'ok' AS message
+                WHERE NOT EXISTS (SELECT 1 FROM invoices WHERE amount IS NULL)
+            """,
+        },
     },
 ]
 ```
@@ -162,7 +162,7 @@ NODES = [
 | `name` | `str` | Yes | Table name in DuckDB |
 | `source` | callable, raw data, or file path | Yes | Data source |
 | `columns` | `list[str]` | No | Required columns. Checked after ingestion, before tasks. Missing columns abort the run. |
-| `validate_sql` | `str` | No | SQL that creates `{input_name}__validation*` views with `status` and `message` columns. Same contract as task `validate_sql`. On success, validation views are materialized as tables; on failure, validation views remain as views for debugging. |
+| `validate` | `dict[str,str]` | No | Mapping of `check_name -> query`. Each query is wrapped into a view named `{input_name}__validation_{check_name}` and must return `status` and `message` columns. On success, validation views are materialized as tables; on failure, validation views remain as views for debugging. |
 
 Node type is determined by the presence of `source` vs `sql`/`prompt` keys.
 
@@ -214,11 +214,9 @@ Task nodes are part of the same `NODES` list. Each task has exactly one transfor
 
 All views created by a task must be namespaced as `{name}_*` (underscore required — bare `{name}` is NOT a valid view name).
 
-Validation is optional and deterministic via `validate_sql`, which runs after the transform to create `{task_name}__validation*` views. Validation views are not listed in `output_columns`.
+Validation is optional and deterministic via `validate`, which runs after the transform to define one or more validation views named `{task_name}__validation_<check_name>`. Validation views are not listed in `output_columns`.
 
-Taskgraph treats `validate_sql` as a definition step: it runs once per node (after required outputs exist) to create `{name}__validation*` views, then re-evaluates those views on subsequent validation attempts.
-
-If `validate_sql` must be retried due to an execution error, Taskgraph clears any existing `{name}__validation*` views first so plain `CREATE VIEW ...__validation AS ...` is safe (you do not need to remember `OR REPLACE`).
+Taskgraph treats validation as a definition step: it defines missing validation views, then re-evaluates those views on subsequent validation attempts.
 
 ```python
 NODES = [
@@ -231,10 +229,9 @@ NODES = [
         "output_columns": {
             "match_results": ["invoice_row_id", "payment_row_id", "match_reason"],
         },
-        "validate_sql": """
-            CREATE OR REPLACE VIEW match__validation AS
-            SELECT 'pass' AS status, 'ok' AS message
-        """,
+        "validate": {
+            "main": "SELECT 'pass' AS status, 'ok' AS message",
+        },
     },
     {
         "name": "summary",
@@ -251,7 +248,7 @@ NODES = [
 | `name` | `str` | Yes | Unique identifier. Also the namespace prefix — all views must be named `{name}_*`. |
 | `sql` | `str` | Exactly one of `sql` or `prompt` | Deterministic statements executed directly (views/macros only). Multiple statements are allowed in one string and will be split by DuckDB's parser. |
 | `prompt` | `str` | Exactly one of `sql` or `prompt` | Objective text for LLM-driven transforms. |
-| `validate_sql` | `str` | No | Deterministic SQL that creates `{name}__validation*` views. Runs after the transform. |
+| `validate` | `dict[str,str]` | No | Mapping of `check_name -> query`. Each query is wrapped into a view named `{name}__validation_{check_name}` and must return `status` and `message` columns. |
 | `depends_on` | `list[str]` | No | Node names (input or task) that must complete before this task runs. Used for DAG scheduling. |
 | `output_columns` | `dict[str, list[str]]` | No | Required views and their columns. Keys must start with `{name}_`. Checks names only, not types. Extra columns are fine. |
 
@@ -277,12 +274,12 @@ The agent receives:
 
 1. A system prompt describing DuckDB SQL syntax, constraints, and workflow guidance.
 2. A user message containing:
-   - The task name
-   - Your `prompt` text
-   - Input tables with schemas (from `depends_on` references)
-   - Required output views (with expected columns, if declared via `output_columns`)
-   - `validate_sql` (if provided)
-   - Naming rules: the agent can create views/macros named `{name}_*` (e.g., node `match` can create `match_step1`, `match_candidates`, etc.)
+    - The task name
+    - Your `prompt` text
+    - Input tables with schemas (from `depends_on` references)
+    - Required output views (with expected columns, if declared via `output_columns`)
+    - `validate` (if provided)
+    - Naming rules: the agent can create views/macros named `{name}_*` (e.g., node `match` can create `match_step1`, `match_candidates`, etc.)
     
    If validation fails, the agent receives validation feedback and can retry within the iteration budget (default 200).
 
@@ -355,9 +352,9 @@ If `output_columns` is specified, each listed column must be present in the view
 View 'output' is missing required column(s): left_ids. Actual columns: category, count
 ```
 
-### 3. Validation SQL
+### 3. Validation
 
-Task validation is expressed by `validate_sql`, which runs after the transform and creates one or more views named `{name}__validation` and/or `{name}__validation_*`.
+Task validation is expressed by `validate`, which runs after the transform and defines one or more views named `{name}__validation_<check_name>`.
 
 Contract:
 - The view must have columns `status` and `message`.
@@ -368,7 +365,6 @@ Recommended pattern:
 
 ```sql
 -- One row per issue (fail) with a human-readable message
-CREATE OR REPLACE VIEW match__validation AS
 SELECT 'fail' AS status, 'unmatched invoice _row_id=' || CAST(i._row_id AS VARCHAR) AS message
 FROM invoices i
 LEFT JOIN matches m ON m.invoice_row_id = i._row_id
@@ -616,7 +612,7 @@ Include everything you would put in a code review checklist:
 - tolerances for numeric comparisons
 - how to break ties
 
-Then enforce it with `output_columns` and `validate_sql` validation views.
+Then enforce it with `output_columns` and `validate` validation queries.
 
 ### Weak vs strong prompt
 
@@ -670,7 +666,7 @@ Include these columns in the output for audit purposes:
 
 Stronger validation catches issues earlier and makes prompt-node retries more effective. Prefer failing fast with precise, actionable messages.
 
-- Use `validate_sql` views that check completeness, totals, and uniqueness.
+- Use `validate` queries that check completeness, totals, and uniqueness.
 - Use `output_columns` to enforce schema contracts immediately.
 - Keep validation errors concise and actionable.
 
@@ -683,8 +679,7 @@ Stronger validation catches issues earlier and makes prompt-node retries more ef
 Write `warn` thresholds at the quality level you want to monitor:
 
 ```sql
--- This validation view emits a warning when match rate drops below 90%
-CREATE OR REPLACE VIEW match__validation AS
+-- This validation query emits a warning when match rate drops below 90%
 SELECT
   CASE WHEN pct < 0.90 THEN 'warn' ELSE 'pass' END AS status,
   format('Match rate {:.1f}%', pct * 100) AS message

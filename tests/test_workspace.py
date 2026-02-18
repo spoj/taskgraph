@@ -36,17 +36,14 @@ class TestSqlOnlyNodes:
         assert result.success is False
 
     def test_validation_view_is_enforced(self, conn):
-        # Validation views are enforced when validate_sql declares them
+        # Validation views are enforced when validate is configured
         conn.execute(
-            "CREATE VIEW mytask__validation AS "
+            "CREATE VIEW mytask__validation_main AS "
             "SELECT 'fail' AS status, 'bad things' AS message"
         )
         node = _make_node(
             name="mytask",
-            validate_sql=(
-                "CREATE VIEW mytask__validation AS "
-                "SELECT 'fail' AS status, 'bad things' AS message"
-            ),
+            validate={"main": "SELECT 'fail' AS status, 'bad things' AS message"},
         )
         errors = node.validate_validation_views(conn)
         assert errors
@@ -68,9 +65,7 @@ class TestTwoPhaseValidation:
         node = _make_node(
             name="t",
             sql="CREATE VIEW t_out AS SELECT 1 AS x",
-            validate_sql=(
-                "CREATE VIEW t__validation AS SELECT 'fail' AS status, 'bad' AS message"
-            ),
+            validate={"main": "SELECT 'fail' AS status, 'bad' AS message"},
         )
 
         result = asyncio.run(run_sql_node(conn=conn, node=node))
@@ -89,7 +84,7 @@ class TestTwoPhaseValidation:
                 "SELECT view_name FROM duckdb_views() WHERE internal = false"
             ).fetchall()
         }
-        assert "t__validation" in views
+        assert "t__validation_main" in views
 
 
 class TestWorkspaceExports:
@@ -400,15 +395,12 @@ class TestMaterializeNodeOutputs:
         """Validation views are materialized alongside output views."""
         conn.execute("CREATE VIEW t_out AS SELECT 1 AS x")
         conn.execute(
-            "CREATE VIEW t__validation AS "
+            "CREATE VIEW t__validation_main AS "
             "SELECT 'pass' AS status, 'all good' AS message"
         )
         node = _make_node(
             name="t",
-            validate_sql=(
-                "CREATE VIEW t__validation AS "
-                "SELECT 'pass' AS status, 'all good' AS message"
-            ),
+            validate={"main": "SELECT 'pass' AS status, 'all good' AS message"},
         )
 
         n = materialize_node_outputs(conn, node)
@@ -422,7 +414,7 @@ class TestMaterializeNodeOutputs:
             ).fetchall()
         }
         assert "t_out" not in views
-        assert "t__validation" not in views
+        assert "t__validation_main" not in views
         tables = {
             r[0]
             for r in conn.execute(
@@ -430,16 +422,16 @@ class TestMaterializeNodeOutputs:
             ).fetchall()
         }
         assert "t_out" in tables
-        assert "t__validation" in tables
+        assert "t__validation_main" in tables
         # Data intact
-        row = conn.execute("SELECT status, message FROM t__validation").fetchone()
+        row = conn.execute("SELECT status, message FROM t__validation_main").fetchone()
         assert row == ("pass", "all good")
 
     def test_materializes_multiple_validation_views(self, conn):
         """Multiple validation views (e.g. t__validation, t__validation_extra) are materialized."""
         conn.execute("CREATE VIEW t_out AS SELECT 1 AS x")
         conn.execute(
-            "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
+            "CREATE VIEW t__validation_main AS SELECT 'pass' AS status, 'ok' AS message"
         )
         conn.execute(
             "CREATE VIEW t__validation_extra AS "
@@ -447,12 +439,10 @@ class TestMaterializeNodeOutputs:
         )
         node = _make_node(
             name="t",
-            validate_sql=(
-                "CREATE VIEW t__validation AS "
-                "SELECT 'pass' AS status, 'ok' AS message; "
-                "CREATE VIEW t__validation_extra AS "
-                "SELECT 'warn' AS status, 'heads up' AS message"
-            ),
+            validate={
+                "main": "SELECT 'pass' AS status, 'ok' AS message",
+                "extra": "SELECT 'warn' AS status, 'heads up' AS message",
+            },
         )
 
         n = materialize_node_outputs(conn, node)
@@ -464,20 +454,17 @@ class TestMaterializeNodeOutputs:
                 "SELECT table_name FROM duckdb_tables() WHERE internal = false"
             ).fetchall()
         }
-        assert {"t_out", "t__validation", "t__validation_extra"} <= tables
+        assert {"t_out", "t__validation_main", "t__validation_extra"} <= tables
 
     def test_validation_warnings_works_after_materialization(self, conn):
         """validation_warnings() reads from materialized validation tables."""
         conn.execute(
-            "CREATE VIEW t__validation AS "
+            "CREATE VIEW t__validation_main AS "
             "SELECT 'warn' AS status, 'watch out' AS message"
         )
         node = _make_node(
             name="t",
-            validate_sql=(
-                "CREATE VIEW t__validation AS "
-                "SELECT 'warn' AS status, 'watch out' AS message"
-            ),
+            validate={"main": "SELECT 'warn' AS status, 'watch out' AS message"},
         )
 
         # Materialize the validation view
@@ -491,13 +478,12 @@ class TestMaterializeNodeOutputs:
 
     def test_validation_view_sql_preserved(self, conn):
         """Validation view SQL is visible in _view_definitions (derived from _trace)."""
-        sql = "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
+        sql = (
+            "CREATE VIEW t__validation_main AS SELECT 'pass' AS status, 'ok' AS message"
+        )
         conn.execute(sql)
         log_trace(conn, sql, success=True, node_name="t")
-        node = _make_node(
-            name="t",
-            validate_sql=sql,
-        )
+        node = _make_node(name="t")
 
         materialize_node_outputs(conn, node)
 
@@ -505,7 +491,7 @@ class TestMaterializeNodeOutputs:
             "SELECT view_name, sql FROM _view_definitions WHERE node = 't'"
         ).fetchall()
         assert len(rows) == 1
-        assert rows[0][0] == "t__validation"
+        assert rows[0][0] == "t__validation_main"
         assert "pass" in rows[0][1]
 
     def test_view_definitions_excludes_dropped_views(self, conn):

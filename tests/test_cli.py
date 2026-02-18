@@ -61,8 +61,8 @@ class TestLoadSpec:
         assert len(transform_nodes) == 1
         assert transform_nodes[0].name == "t1"
 
-    def test_source_node_with_columns_and_validate_sql(self, tmp_path):
-        """Source nodes with columns and validate_sql are parsed."""
+    def test_source_node_with_columns_and_validate(self, tmp_path):
+        """Source nodes with columns and validate are parsed."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(
@@ -72,7 +72,9 @@ class TestLoadSpec:
             '        "name": "tbl",\n'
             '        "source": [{"a": 1, "b": 2}],\n'
             '        "columns": ["a", "b"],\n'
-            "        \"validate_sql\": \"CREATE OR REPLACE VIEW tbl__validation AS SELECT CASE WHEN COUNT(*) > 0 THEN 'fail' ELSE 'pass' END AS status, 'null a' AS message FROM tbl WHERE a IS NULL\",\n"
+            '        "validate": {\n'
+            "            \"main\": \"SELECT CASE WHEN COUNT(*) > 0 THEN 'fail' ELSE 'pass' END AS status, 'null a' AS message FROM tbl WHERE a IS NULL\"\n"
+            "        },\n"
             "    },\n"
             '    {"name": "t", "depends_on": ["tbl"], '
             '"sql": "CREATE OR REPLACE VIEW t_o AS SELECT 1 AS x"},\n'
@@ -83,7 +85,9 @@ class TestLoadSpec:
         tbl_node = [n for n in nodes if n.name == "tbl"][0]
         assert tbl_node.is_source()
         assert tbl_node.columns == ["a", "b"]
-        assert "tbl__validation" in tbl_node.validate_sql
+        assert tbl_node.validation_queries() == {
+            "main": "SELECT CASE WHEN COUNT(*) > 0 THEN 'fail' ELSE 'pass' END AS status, 'null a' AS message FROM tbl WHERE a IS NULL"
+        }
         assert tbl_node.source == [{"a": 1, "b": 2}]
 
     def test_file_input_parsed_relative_to_spec(self, tmp_path):
@@ -113,7 +117,7 @@ class TestLoadSpec:
         assert file_input.path == (data_dir / "sales.csv").resolve()
 
     def test_simple_source_no_validation(self, tmp_path):
-        """Simple source nodes (no validate_sql) have no validation metadata."""
+        """Simple source nodes (no validate) have no validation metadata."""
         from src.spec import load_spec_from_module
 
         module_path = _write_spec_module(

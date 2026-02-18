@@ -125,34 +125,35 @@ NODES = [
                 SUM(amount) AS total_amount
             FROM categorize_detail;
             """,
-        "validate_sql": """
-            CREATE OR REPLACE VIEW categorize__validation AS
-            WITH
-            exp AS (SELECT COUNT(*) AS cnt FROM expenses),
-            cat AS (SELECT COUNT(*) AS cnt FROM categorize_detail),
-            sumcat AS (SELECT SUM(amount) AS total_amount FROM categorize_detail),
-            tot AS (SELECT total FROM expected_total)
-            SELECT
-                'fail' AS status,
-                'missing rows: expected ' || CAST(exp.cnt AS VARCHAR) ||
-                ' got ' || CAST(cat.cnt AS VARCHAR) AS message
-            FROM exp, cat
-            WHERE exp.cnt <> cat.cnt
+        "validate": {
+            "main": """
+                WITH
+                exp AS (SELECT COUNT(*) AS cnt FROM expenses),
+                cat AS (SELECT COUNT(*) AS cnt FROM categorize_detail),
+                sumcat AS (SELECT SUM(amount) AS total_amount FROM categorize_detail),
+                tot AS (SELECT total FROM expected_total)
+                SELECT
+                    'fail' AS status,
+                    'missing rows: expected ' || CAST(exp.cnt AS VARCHAR) ||
+                    ' got ' || CAST(cat.cnt AS VARCHAR) AS message
+                FROM exp, cat
+                WHERE exp.cnt <> cat.cnt
 
-            UNION ALL
-            SELECT
-                'fail' AS status,
-                'total mismatch: expected ' || CAST(tot.total AS VARCHAR) ||
-                ' got ' || CAST(sumcat.total_amount AS VARCHAR) AS message
-            FROM tot, sumcat
-            WHERE ABS(tot.total - sumcat.total_amount) > 0.01
+                UNION ALL
+                SELECT
+                    'fail' AS status,
+                    'total mismatch: expected ' || CAST(tot.total AS VARCHAR) ||
+                    ' got ' || CAST(sumcat.total_amount AS VARCHAR) AS message
+                FROM tot, sumcat
+                WHERE ABS(tot.total - sumcat.total_amount) > 0.01
 
-            UNION ALL
-            SELECT 'pass' AS status, 'ok' AS message
-            FROM exp, cat, tot, sumcat
-            WHERE exp.cnt = cat.cnt
-              AND ABS(tot.total - sumcat.total_amount) <= 0.01
-            """,
+                UNION ALL
+                SELECT 'pass' AS status, 'ok' AS message
+                FROM exp, cat, tot, sumcat
+                WHERE exp.cnt = cat.cnt
+                  AND ABS(tot.total - sumcat.total_amount) <= 0.01
+            """
+        },
         "output_columns": {
             "categorize_detail": ["category"],
             "categorize_summary": ["category", "item_count", "total_amount"],
