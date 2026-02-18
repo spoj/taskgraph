@@ -48,9 +48,9 @@ import duckdb
 from dataclasses import dataclass, field
 from typing import Any
 
+from .catalog import list_tables, list_views
 from .sql_utils import (
     split_sql_statements,
-    extract_create_name,
     get_column_names,
 )
 
@@ -75,25 +75,99 @@ def is_validation_view(view_name: str, node_name: str) -> bool:
     return view_name == prefix or view_name.startswith(prefix + "_")
 
 
+def validate_node_name(name: str) -> str | None:
+    """Validate a node name, returning an error message or None."""
+    if "__" in name:
+        return (
+            f"Node name '{name}' must not contain '__' "
+            "(reserved for __validation views)."
+        )
+    return None
+
+
+def discover_validation_objects(
+    conn: duckdb.DuckDBPyConnection, node_name: str
+) -> list[str]:
+    """Discover validation objects for *node_name* from the catalog.
+
+    Includes both views and tables so this works both before and after
+    materialization.
+    """
+    base = validation_view_prefix(node_name)
+    prefix = base + "_"
+    names: set[str] = set()
+
+    for name in list_views(conn, exclude_prefixes=()):
+        if name == base or name.startswith(prefix):
+            names.add(name)
+
+    for name in list_tables(conn, exclude_prefixes=()):
+        if name == base or name.startswith(prefix):
+            names.add(name)
+
+    return sorted(names)
+
+
+def _query_validation_rows(
+    conn: duckdb.DuckDBPyConnection,
+    view_name: str,
+    status_filter: str,
+    limit: int | None = None,
+) -> tuple[list[str], set[str]]:
+    """Query a validation view for rows matching a status, return (messages, evidence_views).
+
+    Assumes the view has 'status' and 'message' columns (caller must verify).
+    """
+    actual_cols = get_column_names(conn, view_name)
+    has_evidence = "evidence_view" in {c.lower() for c in actual_cols}
+
+    cols = "status, message, evidence_view" if has_evidence else "status, message"
+    query = (
+        f"SELECT {cols} FROM \"{view_name}\" WHERE lower(status) = '{status_filter}'"
+    )
+    if limit is not None:
+        query += f" LIMIT {limit}"
+
+    try:
+        rows = conn.execute(query).fetchall()
+    except duckdb.Error:
+        return [], set()
+
+    msgs: list[str] = []
+    evidence_views: set[str] = set()
+    for row in rows:
+        msgs.append(str(row[1]))
+        if has_evidence and row[2]:
+            evidence_views.add(str(row[2]))
+    return msgs, evidence_views
+
+
+def _format_validation_block(
+    view_name: str, msgs: list[str], evidence_views: set[str], total: int, label: str
+) -> str:
+    """Format a validation message block with header and sample."""
+    header = f"{label} in '{view_name}' ({total})"
+    if evidence_views:
+        header += f" [evidence: {', '.join(sorted(evidence_views))}]"
+    sample = msgs[:MAX_INLINE_MESSAGES]
+    detail = "\n".join(f"  {m}" for m in sample)
+    if total > MAX_INLINE_MESSAGES:
+        detail += f"\n  ... and {total - MAX_INLINE_MESSAGES} more"
+    return f"{header}:\n{detail}"
+
+
 def validate_one_validation_view(
     conn: duckdb.DuckDBPyConnection, view_name: str
 ) -> tuple[list[str], bool]:
     """Validate a single validation view.
 
     Returns (errors, fatal).
-    - fatal=True indicates a schema/query/contract problem that should stop immediately.
+    - fatal=True indicates a schema/query/contract problem.
     - fatal=False with errors means validation 'fail' rows were found.
-
-    The view must have columns 'status' and 'message'.
-    Allowed status values: 'pass', 'warn', 'fail' (case-insensitive).
-    Any row with lower(status)='fail' is reported as an error.
     """
     actual_cols = get_column_names(conn, view_name)
     if not actual_cols:
-        return (
-            [f"Validation view '{view_name}' not found."],
-            True,
-        )
+        return ([f"Validation view '{view_name}' not found."], True)
 
     actual_lower = {c.lower() for c in actual_cols}
     missing = [c for c in _VALIDATION_VIEW_REQUIRED_COLS if c not in actual_lower]
@@ -127,44 +201,16 @@ def validate_one_validation_view(
             True,
         )
 
-    has_evidence_view = "evidence_view" in actual_lower
-
-    try:
-        if has_evidence_view:
-            rows = conn.execute(
-                f'SELECT status, message, evidence_view FROM "{view_name}" '
-                "WHERE lower(status) = 'fail'"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                f'SELECT status, message FROM "{view_name}" '
-                "WHERE lower(status) = 'fail'"
-            ).fetchall()
-    except duckdb.Error as e:
-        return ([f"Validation view query error for '{view_name}': {e}"], True)
-
-    if rows:
-        msgs: list[str] = []
-        evidence_views: set[str] = set()
-        if has_evidence_view:
-            for _status, msg, ev in rows:
-                msgs.append(str(msg))
-                if ev:
-                    evidence_views.add(str(ev))
-        else:
-            msgs = [str(msg) for _status, msg in rows]
-
-        count = len(msgs)
-        header = f"Failures in '{view_name}' ({count})"
-        if evidence_views:
-            header += f" [evidence: {', '.join(sorted(evidence_views))}]"
-
-        sample = msgs[:MAX_INLINE_MESSAGES]
-        detail = "\n".join(f"  {m}" for m in sample)
-        if count > MAX_INLINE_MESSAGES:
-            detail += f"\n  ... and {count - MAX_INLINE_MESSAGES} more"
-
-        return ([f"{header}:\n{detail}"], False)
+    msgs, evidence_views = _query_validation_rows(conn, view_name, "fail")
+    if msgs:
+        return (
+            [
+                _format_validation_block(
+                    view_name, msgs, evidence_views, len(msgs), "Failures"
+                )
+            ],
+            False,
+        )
 
     return ([], False)
 
@@ -240,92 +286,44 @@ class Node:
         """Return SQL statements for validation SQL."""
         return split_sql_statements(self.validate_sql)
 
-    def validation_view_names(self) -> list[str]:
-        """Return validation view names derived from validate_sql."""
-        if not self.has_validation():
-            return []
-        names: list[str] = []
-        for stmt in self.validate_sql_statements():
-            name = extract_create_name(stmt)
-            if name and is_validation_view(name, self.name):
-                names.append(name)
-        return sorted(set(names))
-
     # ------------------------------------------------------------------
-    # Unified output validation
+    # Output validation (unified for all node types)
     # ------------------------------------------------------------------
 
-    def validate_outputs(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
-        """Validate node outputs after execution.  Returns error messages.
+    def _required_schema(self) -> dict[str, list[str]]:
+        """Build unified schema map: ``{name: [required_columns]}``.
 
-        For **source** nodes: checks required ``columns`` on the ingested
-        table ``{name}``.
-
-        For **sql/prompt** nodes: checks ``output_columns`` keys exist
-        as views/tables and have required columns.
+        Source nodes: ``{self.name: self.columns}``.
+        SQL/prompt nodes: ``self.output_columns``.
         """
         if self.is_source():
-            return self._validate_source_columns(conn)
-        return self._validate_output_columns(conn)
+            return {self.name: self.columns} if self.columns else {}
+        return self.output_columns
 
-    def _validate_source_columns(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
-        """Check required columns on the ingested source table."""
-        if not self.columns:
+    def validate_outputs(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
+        """Validate node outputs: required tables/views exist with required columns."""
+        schema = self._required_schema()
+        if not schema:
             return []
-        actual_cols = get_column_names(conn, self.name)
-        if not actual_cols:
-            return [f"Source table '{self.name}' not found after ingestion."]
-        # Exclude internal _row_id column from display
-        display_cols = [c for c in actual_cols if c != "_row_id"]
-        actual_lower = {c.lower() for c in actual_cols}
-        missing = [c for c in self.columns if c.lower() not in actual_lower]
-        if missing:
-            label = "column" if len(missing) == 1 else "columns"
-            return [
-                f"Source table '{self.name}' is missing required {label}: "
-                f"{', '.join(missing)}. "
-                f"Actual columns: {', '.join(sorted(display_cols))}"
-            ]
-        return []
-
-    def _validate_output_columns(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
-        """Check output_columns keys exist with required columns."""
-        if not self.output_columns:
-            return []
-
-        existing_views = {
-            row[0]
-            for row in conn.execute(
-                "SELECT view_name FROM duckdb_views() WHERE internal = false"
-            ).fetchall()
-        }
-        existing_tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-            ).fetchall()
-        }
-        existing = existing_views | existing_tables
-
-        missing = [o for o in self.output_columns if o not in existing]
-        if missing:
-            return [f"Required output view '{o}' was not created." for o in missing]
 
         errors: list[str] = []
-        for view_name, required_cols in self.output_columns.items():
+        for name, required_cols in schema.items():
+            actual_cols = get_column_names(conn, name)
+            if not actual_cols:
+                errors.append(f"Required output '{name}' was not created.")
+                continue
             if not required_cols:
                 continue
-            actual_cols = get_column_names(conn, view_name)
-            if not actual_cols:
-                continue
+            # Hide internal _row_id from display (added by ingestion)
+            display_cols = [c for c in actual_cols if c != "_row_id"]
             actual_lower = {c.lower() for c in actual_cols}
-            missing_cols = [c for c in required_cols if c.lower() not in actual_lower]
-            if missing_cols:
-                label = "column" if len(missing_cols) == 1 else "columns"
+            missing = [c for c in required_cols if c.lower() not in actual_lower]
+            if missing:
+                label = "column" if len(missing) == 1 else "columns"
                 errors.append(
-                    f"View '{view_name}' is missing required {label}: "
-                    f"{', '.join(missing_cols)}. "
-                    f"Actual columns: {', '.join(sorted(actual_cols))}"
+                    f"Output '{name}' is missing required {label}: "
+                    f"{', '.join(missing)}. "
+                    f"Actual columns: {', '.join(sorted(display_cols))}"
                 )
         return errors
 
@@ -342,13 +340,14 @@ class Node:
 
         Any row with lower(status)='fail' fails the node.
         """
-        views = self.validation_view_names()
-        if self.has_validation() and not views:
+        if not self.has_validation():
+            return []
+
+        views = discover_validation_objects(conn, self.name)
+        if not views:
             return [
                 f"validate_sql did not create any '{validation_view_prefix(self.name)}' views."
             ]
-        if not views:
-            return []
 
         errors: list[str] = []
 
@@ -365,12 +364,11 @@ class Node:
     def validation_warnings(
         self, conn: duckdb.DuckDBPyConnection, limit: int | None = None
     ) -> tuple[int, list[str]]:
-        """Return (total_warning_count, warning_messages) from validation views.
+        """Return (total_warning_count, warning_messages) from validation views."""
+        if not self.has_validation():
+            return 0, []
 
-        Assumes validation views exist and are well-formed.
-        Pass limit=None for no truncation.
-        """
-        views = self.validation_view_names()
+        views = discover_validation_objects(conn, self.name)
         if not views:
             return 0, []
 
@@ -380,11 +378,7 @@ class Node:
 
         for view_name in views:
             actual = get_column_names(conn, view_name)
-            if not actual:
-                continue
-
-            actual_lower = {c.lower() for c in actual}
-            if "status" not in actual_lower or "message" not in actual_lower:
+            if not actual or not {"status", "message"} <= {c.lower() for c in actual}:
                 continue
 
             try:
@@ -402,46 +396,15 @@ class Node:
             if remaining is not None and remaining <= 0:
                 continue
 
-            has_evidence_view = "evidence_view" in actual_lower
-
-            try:
-                if has_evidence_view:
-                    query = (
-                        f'SELECT status, message, evidence_view FROM "{view_name}" '
-                        "WHERE lower(status) = 'warn'"
+            msgs, evidence_views = _query_validation_rows(
+                conn, view_name, "warn", limit=remaining
+            )
+            if msgs:
+                warnings.append(
+                    _format_validation_block(
+                        view_name, msgs, evidence_views, view_count, "Warnings via"
                     )
-                else:
-                    query = (
-                        f'SELECT status, message FROM "{view_name}" '
-                        "WHERE lower(status) = 'warn'"
-                    )
-                if remaining is not None:
-                    query += f" LIMIT {remaining}"
-                rows = conn.execute(query).fetchall()
-            except duckdb.Error:
-                continue
-
-            if rows:
-                msgs: list[str] = []
-                evidence_views: set[str] = set()
-                if has_evidence_view:
-                    for _status, msg, ev in rows:
-                        msgs.append(str(msg))
-                        if ev:
-                            evidence_views.add(str(ev))
-                else:
-                    msgs = [str(msg) for _status, msg in rows]
-
-                header = f"Warnings via '{view_name}' ({view_count} row(s))"
-                if evidence_views:
-                    header += f" [evidence: {', '.join(sorted(evidence_views))}]"
-
-                sample = msgs[:MAX_INLINE_MESSAGES]
-                detail = "\n".join(f"  {m}" for m in sample)
-                if view_count > MAX_INLINE_MESSAGES:
-                    detail += f"\n  ... and {view_count - MAX_INLINE_MESSAGES} more"
-
-                warnings.append(f"{header}:\n{detail}")
+                )
                 if remaining is not None:
                     remaining -= len(msgs)
 
@@ -516,6 +479,27 @@ def validate_graph(nodes: list[Node]) -> list[str]:
     """
     errors: list[str] = []
     all_names = {n.name for n in nodes}
+
+    # 0. Node name restrictions
+    for n in nodes:
+        msg = validate_node_name(n.name)
+        if msg:
+            errors.append(msg)
+
+    # 0b. Exactly one mode must be set: source/sql/prompt
+    for n in nodes:
+        modes: list[str] = []
+        if n.is_source():
+            modes.append("source")
+        if n.sql and n.sql.strip():
+            modes.append("sql")
+        if n.prompt and n.prompt.strip():
+            modes.append("prompt")
+        if len(modes) != 1:
+            errors.append(
+                f"Node '{n.name}' must have exactly one of: source, sql, prompt. "
+                f"Found: {modes or '(none)'}"
+            )
 
     # 1. depends_on refs
     for n in nodes:

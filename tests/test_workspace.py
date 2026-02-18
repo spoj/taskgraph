@@ -6,7 +6,7 @@ import duckdb
 import pytest
 
 from tests.conftest import _make_node
-from src.agent import run_sql_node, log_trace
+from src.agent import run_sql_node, log_trace, validate_node_complete
 from src.workspace import Workspace, persist_workspace_meta, read_workspace_meta
 from src.workspace import materialize_node_outputs
 
@@ -73,17 +73,15 @@ class TestTwoPhaseValidation:
             ),
         )
 
-        ws = Workspace(db_path=":memory:")
+        result = asyncio.run(run_sql_node(conn=conn, node=node))
 
-        result = asyncio.run(
-            ws._execute_sql_node(
-                conn=conn,
-                node=node,
-            )
-        )
+        # SQL execution itself succeeds
+        assert result.success is True
 
-        assert result.success is False
-        assert "bad" in result.final_message
+        # But unified validation catches the failure
+        errors = validate_node_complete(conn, node)
+        assert len(errors) > 0
+        assert any("bad" in e for e in errors)
 
         views = {
             row[0]

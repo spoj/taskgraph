@@ -160,14 +160,15 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 
 ## Post-Execution Flow
 
-All node types go through the same unified post-execution flow in `_post_execute()`:
+All node types go through the same unified post-execution flow in `run_one()` (inside `Workspace.run()`):
 
-1. **Validate outputs** — `node.validate_outputs(conn)`: source nodes check `columns` on the ingested table; sql/prompt nodes check `output_columns` keys exist with required columns.
-2. **Run validate_sql** — if present, creates `{name}__validation*` views via `run_validate_sql()`.
-3. **Check validation views** — `node.validate_validation_views(conn)`: each validation view must have `status` and `message` columns; any row with `lower(status)='fail'` fails the node.
-4. **Materialize** — source nodes: only validation views (table already exists); sql/prompt nodes: all `{name}_*` views + validation views.
+1. **Execute** — type-specific: ingest (source), run SQL (sql), run agent (prompt).
+2. **Validate** — `validate_node_complete(conn, node)`: validates outputs, runs validate_sql, checks validation views. Identical call for ALL node types.
+3. **Snapshot** — `snapshot_views()` taken before materialization to capture view changes.
+4. **Materialize** — `materialize_node_outputs(conn, node)`: discovers all `{name}_*` views and materializes them. Source nodes simply have no `{name}_*` output views, so the unified code naturally handles them.
+5. **Persist metadata** — `persist_node_meta(conn, node_name, meta)`: writes per-node run metadata for ALL node types.
 
-Snapshot timing: `snapshot_views()` is taken BEFORE materialization in `run_one()` to capture view changes accurately.
+No per-type `_post_execute()` or `_materialize_node()` wrappers. The `run_sql_node()` and `run_node_agent()` functions ONLY execute their work — they do NOT validate or persist metadata.
 
 ## Robustness Features
 

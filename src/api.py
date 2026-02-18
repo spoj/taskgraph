@@ -27,15 +27,26 @@ MAX_ERROR_DETAIL_CHARS = (
     500  # Truncation limit for error details in log/exception messages
 )
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 
 log = logging.getLogger(__name__)
 
 
+def get_openrouter_api_key() -> str | None:
+    """Return the OpenRouter API key from the environment, if set."""
+    key = os.environ.get(OPENROUTER_API_KEY_ENV)
+    return key if key else None
+
+
+def has_openrouter_api_key() -> bool:
+    return get_openrouter_api_key() is not None
+
+
 def get_headers() -> dict[str, str]:
     """Get API request headers."""
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    api_key = get_openrouter_api_key()
     if not api_key:
-        raise ValueError("OPENROUTER_API_KEY environment variable is required")
+        raise ValueError(f"{OPENROUTER_API_KEY_ENV} environment variable is required")
 
     return {
         "Authorization": f"Bearer {api_key}",

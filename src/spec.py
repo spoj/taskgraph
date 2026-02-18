@@ -27,7 +27,7 @@ from .ingest import (
     parse_file_path,
     parse_file_string,
 )
-from .task import Node, _NO_SOURCE
+from .task import Node, _NO_SOURCE, validate_node_name
 
 _SOURCE_FIELDS = {"name", "depends_on", "source", "columns", "validate_sql"}
 _SQL_PROMPT_FIELDS = {
@@ -61,7 +61,7 @@ def _resolve_source_path(source: Any, spec_dir: Path) -> Any:
     return source
 
 
-def _parse_module(module: ModuleType) -> tuple[list[Node], dict]:
+def _parse_module(module: ModuleType) -> tuple[list[Node], dict[str, Any]]:
     """Parse NODES and EXPORTS from a loaded module.
 
     Returns ``(nodes, exports)`` where *nodes* is a list of :class:`Node`
@@ -92,6 +92,11 @@ def _parse_module(module: ModuleType) -> tuple[list[Node], dict]:
         name = name.strip()
         if not name:
             raise ValueError(f"NODES[{i}] 'name' must not be empty.")
+
+        name_err = validate_node_name(name)
+        if name_err:
+            raise ValueError(name_err)
+
         if name in seen_names:
             raise ValueError(f"Duplicate node name: '{name}'.")
         seen_names.add(name)
@@ -144,23 +149,14 @@ def _parse_module(module: ModuleType) -> tuple[list[Node], dict]:
                     )
                 kwargs["columns"] = cols
 
-        elif mode == "sql":
-            sql_val = raw["sql"]
-            if not isinstance(sql_val, str):
-                raise ValueError(f"Node '{name}': sql must be a non-empty string.")
-            sql_val = sql_val.strip()
-            if not sql_val:
-                raise ValueError(f"Node '{name}': sql must be a non-empty string.")
-            kwargs["sql"] = sql_val
-
-        elif mode == "prompt":
-            prompt_val = raw["prompt"]
-            if not isinstance(prompt_val, str):
-                raise ValueError(f"Node '{name}': prompt must be a non-empty string.")
-            prompt_val = prompt_val.strip()
-            if not prompt_val:
-                raise ValueError(f"Node '{name}': prompt must be a non-empty string.")
-            kwargs["prompt"] = prompt_val
+        elif mode in ("sql", "prompt"):
+            val = raw[mode]
+            if not isinstance(val, str):
+                raise ValueError(f"Node '{name}': {mode} must be a non-empty string.")
+            val = val.strip()
+            if not val:
+                raise ValueError(f"Node '{name}': {mode} must be a non-empty string.")
+            kwargs[mode] = val
 
         if "output_columns" in raw:
             oc = raw["output_columns"]
@@ -191,10 +187,12 @@ def _parse_module(module: ModuleType) -> tuple[list[Node], dict]:
         nodes.append(Node(**kwargs))
 
     exports = getattr(module, "EXPORTS", {})
+    if not isinstance(exports, dict):
+        raise ValueError("EXPORTS must be a dict mapping path -> function.")
     return nodes, exports
 
 
-def load_spec_from_module(module_path: str) -> tuple[list[Node], dict]:
+def load_spec_from_module(module_path: str) -> tuple[list[Node], dict[str, Any]]:
     """Load a workspace spec from a module path.
 
     Returns ``(nodes, exports)`` where *nodes* is a list of :class:`Node`

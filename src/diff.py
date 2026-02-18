@@ -10,10 +10,12 @@ the agent actually wrote.
 """
 
 import difflib
-import json
 import logging
 import duckdb
 from dataclasses import dataclass
+
+from .catalog import count_rows, list_views_with_sql
+from .infra import persist_changes
 from .sql_utils import get_column_schema
 
 log = logging.getLogger(__name__)
@@ -55,10 +57,7 @@ def snapshot_views(conn: duckdb.DuckDBPyConnection) -> dict[str, ViewSnapshot]:
     snapshots: dict[str, ViewSnapshot] = {}
 
     try:
-        views = conn.execute(
-            "SELECT view_name, sql FROM duckdb_views() "
-            "WHERE internal = false AND view_name[1] != '_'"
-        ).fetchall()
+        views = list_views_with_sql(conn, exclude_prefixes=("_",))
     except duckdb.Error:
         return snapshots
 
@@ -67,11 +66,8 @@ def snapshot_views(conn: duckdb.DuckDBPyConnection) -> dict[str, ViewSnapshot]:
         columns = get_column_schema(conn, view_name)
 
         # Get row count (cheap — DuckDB optimizes COUNT(*) on views)
-        try:
-            row = conn.execute(f'SELECT COUNT(*) FROM "{view_name}"').fetchone()
-            row_count = int(row[0]) if row else 0
-        except duckdb.Error:
-            row_count = 0
+        row_count = count_rows(conn, view_name)
+        row_count = row_count if row_count is not None else 0
 
         snapshots[view_name] = ViewSnapshot(
             name=view_name,
@@ -87,62 +83,37 @@ def diff_snapshots(
     before: dict[str, ViewSnapshot],
     after: dict[str, ViewSnapshot],
 ) -> list[ViewChange]:
-    """Diff two catalog snapshots. Returns only changed views.
-
-    Compares SQL definitions to detect modifications. Views with
-    identical SQL are omitted from the result.
-    """
+    """Diff two catalog snapshots. Returns only changed views."""
     changes: list[ViewChange] = []
 
-    all_names = sorted(set(before.keys()) | set(after.keys()))
-
-    for name in all_names:
-        b = before.get(name)
-        a = after.get(name)
+    for name in sorted(set(before) | set(after)):
+        b, a = before.get(name), after.get(name)
 
         if b is None and a is not None:
-            # Created
-            changes.append(
-                ViewChange(
-                    view_name=name,
-                    kind="created",
-                    sql_before=None,
-                    sql_after=a.sql,
-                    cols_before=None,
-                    cols_after=a.columns,
-                    rows_before=None,
-                    rows_after=a.row_count,
-                )
-            )
+            kind = "created"
         elif b is not None and a is None:
-            # Dropped
-            changes.append(
-                ViewChange(
-                    view_name=name,
-                    kind="dropped",
-                    sql_before=b.sql,
-                    sql_after=None,
-                    cols_before=b.columns,
-                    cols_after=None,
-                    rows_before=b.row_count,
-                    rows_after=None,
-                )
+            kind = "dropped"
+        elif (
+            b is not None
+            and a is not None
+            and _normalize_sql(b.sql) != _normalize_sql(a.sql)
+        ):
+            kind = "modified"
+        else:
+            continue
+
+        changes.append(
+            ViewChange(
+                view_name=name,
+                kind=kind,
+                sql_before=b.sql if b else None,
+                sql_after=a.sql if a else None,
+                cols_before=b.columns if b else None,
+                cols_after=a.columns if a else None,
+                rows_before=b.row_count if b else None,
+                rows_after=a.row_count if a else None,
             )
-        elif b is not None and a is not None:
-            # Check if SQL changed
-            if _normalize_sql(b.sql) != _normalize_sql(a.sql):
-                changes.append(
-                    ViewChange(
-                        view_name=name,
-                        kind="modified",
-                        sql_before=b.sql,
-                        sql_after=a.sql,
-                        cols_before=b.columns,
-                        cols_after=a.columns,
-                        rows_before=b.row_count,
-                        rows_after=a.row_count,
-                    )
-                )
+        )
 
     return changes
 
@@ -256,68 +227,3 @@ def format_changes(node_name: str, changes: list[ViewChange]) -> str:
                     lines.append(f"      {dl}")
 
     return "\n".join(lines)
-
-
-def format_all_changes(node_changes: list[tuple[str, list[ViewChange]]]) -> str:
-    """Format changes for all nodes into a single terminal block.
-
-    Args:
-        node_changes: List of (node_name, changes) pairs in execution order.
-
-    Returns formatted string, or empty string if no changes anywhere.
-    """
-    sections: list[str] = []
-    for node_name, changes in node_changes:
-        section = format_changes(node_name, changes)
-        if section:
-            sections.append(section)
-
-    if not sections:
-        return ""
-
-    return "Changes:\n" + "\n".join(sections)
-
-
-def persist_changes(
-    conn: duckdb.DuckDBPyConnection,
-    node_name: str,
-    changes: list[ViewChange],
-) -> None:
-    """Write view changes to the _changes table in the output database."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS _changes (
-            node        VARCHAR,
-            view_name   VARCHAR,
-            kind        VARCHAR,
-            sql_before  VARCHAR,
-            sql_after   VARCHAR,
-            cols_before VARCHAR,
-            cols_after  VARCHAR,
-            rows_before INTEGER,
-            rows_after  INTEGER
-        )
-    """)
-
-    if not changes:
-        return
-
-    rows = []
-    for c in changes:
-        rows.append(
-            (
-                node_name,
-                c.view_name,
-                c.kind,
-                c.sql_before,
-                c.sql_after,
-                json.dumps([list(t) for t in c.cols_before]) if c.cols_before else None,
-                json.dumps([list(t) for t in c.cols_after]) if c.cols_after else None,
-                c.rows_before,
-                c.rows_after,
-            )
-        )
-
-    conn.executemany(
-        "INSERT INTO _changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        rows,
-    )

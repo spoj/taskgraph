@@ -18,8 +18,8 @@ from src.ingest import (
     parse_file_string,
 )
 from src.task import Node
-from src.agent import run_validate_sql
-from src.workspace import Workspace
+from src.agent import run_validate_sql, validate_node_complete
+from src.workspace import Workspace, materialize_node_outputs
 
 
 class TestIngestion:
@@ -237,12 +237,12 @@ class TestIngestion:
 
 class TestSourceNodeValidation:
     """Tests for source node validation via Node.validate_outputs() and
-    the unified _post_execute() flow in Workspace.
+    the unified post-execution flow (validate_node_complete + materialize).
 
     In the unified node model, source nodes use:
     - ``columns`` for required column checks (via Node.validate_outputs)
     - ``validate_sql`` for SQL validation (via run_validate_sql + validate_validation_views)
-    - ``Workspace._post_execute()`` for the full validation + materialization flow
+    - ``validate_node_complete()`` + ``materialize_node_outputs()`` for the full flow
     """
 
     def test_source_columns_pass(self, conn):
@@ -273,7 +273,7 @@ class TestSourceNodeValidation:
         node = Node(name="nonexistent", source=[], columns=["col1"])
         errors = node.validate_outputs(conn)
         assert len(errors) == 1
-        assert "not found" in errors[0].lower()
+        assert "was not created" in errors[0].lower()
 
     def test_source_columns_extra_columns_ok(self, conn):
         """Extra columns beyond required are fine."""
@@ -416,7 +416,7 @@ class TestSourceNodeValidation:
         assert len(errors) == 1
 
     def test_post_execute_materializes_validation_views(self, conn):
-        """_post_execute materializes validation views as tables after passing."""
+        """Validation views are materialized as tables after passing."""
         ingest_table(conn, [{"id": 1}], "t")
         node = Node(
             name="t",
@@ -426,11 +426,10 @@ class TestSourceNodeValidation:
                 "SELECT 'pass' AS status, 'ok' AS message"
             ),
         )
-        ws = Workspace(db_path=":memory:", nodes=[node])
-        # Manually run validate_sql then post_execute
-        run_validate_sql(conn=conn, node=node)
-        success, msg = ws._post_execute(conn, node)
-        assert success, msg
+        # Run validation (creates validation views), then materialize
+        errors = validate_node_complete(conn, node)
+        assert not errors
+        materialize_node_outputs(conn, node)
         # View should be gone (materialized into a table)
         views = {
             row[0]
@@ -473,7 +472,7 @@ class TestSourceNodeValidation:
         assert "all good" in rows[0][2]
 
     def test_post_execute_multiple_validation_views(self, conn):
-        """Multiple validation views are all materialized via _post_execute."""
+        """Multiple validation views are all materialized."""
         ingest_table(conn, [{"id": 1}], "t")
         node = Node(
             name="t",
@@ -485,10 +484,9 @@ class TestSourceNodeValidation:
                 "SELECT 'pass' AS status, 'also ok' AS message"
             ),
         )
-        ws = Workspace(db_path=":memory:", nodes=[node])
-        run_validate_sql(conn=conn, node=node)
-        success, msg = ws._post_execute(conn, node)
-        assert success, msg
+        errors = validate_node_complete(conn, node)
+        assert not errors
+        materialize_node_outputs(conn, node)
         tables = {
             row[0]
             for row in conn.execute(

@@ -19,8 +19,7 @@ After execution, ALL nodes go through the same post-execution flow:
 1. Validate outputs (``node.validate_outputs(conn)``)
 2. Execute validate_sql if present (create validation views)
 3. Check validation views (``node.validate_validation_views(conn)``)
-4. Materialize views (sql/prompt: all ``{name}_*`` views; source: none,
-   already a table — only validation views if they passed)
+4. Materialize all ``{name}_*`` views (source nodes simply have none)
 
 Usage:
 
@@ -38,36 +37,39 @@ import json
 import logging
 import duckdb
 import time
-import sys
-import platform
-import importlib.metadata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from .agent_loop import AgentResult, DEFAULT_MAX_ITERATIONS
 from .api import OpenRouterClient, DEFAULT_MODEL
+from .catalog import count_rows, list_views, view_exists
 from .diff import (
     snapshot_views,
     diff_snapshots,
     format_changes,
+)
+from .infra import (
+    init_infra,
     persist_changes,
+    persist_node_meta,
+    persist_workspace_meta,
+    read_workspace_meta,
+    upsert_workspace_meta,
 )
 from .ingest import FileInput, ingest_file, ingest_table
 from .agent import (
-    init_trace_table,
+    _simple_result,
     run_node_agent,
     run_sql_node,
-    run_validate_sql,
+    validate_node_complete,
 )
 from .task import (
     Node,
     resolve_dag,
     resolve_deps,
     validate_graph,
-    is_validation_view,
 )
-from .sql_utils import get_column_schema
 
 log = logging.getLogger(__name__)
 
@@ -76,127 +78,7 @@ InputValue = Any  # Callable[[], TableData] | TableData | FileInput
 ExportFn = Callable[[duckdb.DuckDBPyConnection, Path], None]
 
 
-# --- Workspace metadata ---
-
-
-def persist_workspace_meta(
-    conn: duckdb.DuckDBPyConnection,
-    model: str,
-    nodes: list[Node],
-    reasoning_effort: str | None = None,
-    max_iterations: int | None = None,
-    source_row_counts: dict[str, int] | None = None,
-    spec_module: str | None = None,
-) -> None:
-    """Write workspace-level metadata to _workspace_meta.
-
-    Contract: store enough information to make a workspace:
-    - auditable (what was asked, what ran, when, with which runtime/model)
-    - reproducible (spec identity)
-    - debuggable (inputs overview + run parameters)
-
-    Values are stored as strings. Most complex values are JSON.
-    """
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS _workspace_meta (
-            key VARCHAR PRIMARY KEY,
-            value VARCHAR
-        )
-    """)
-    conn.execute("DELETE FROM _workspace_meta")
-
-    # Extract prompts from prompt nodes
-    node_prompts = {n.name: n.prompt for n in (nodes or []) if n.prompt}
-
-    created_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    source_tables = list(sorted(source_row_counts.keys())) if source_row_counts else []
-    source_schemas: dict[str, list[dict[str, str]]] = {}
-    if source_tables:
-        for table in source_tables:
-            rows_cols = get_column_schema(conn, table)
-            source_schemas[table] = [{"name": r[0], "type": r[1]} for r in rows_cols]
-
-    try:
-        tg_version = importlib.metadata.version("taskgraph")
-    except Exception:
-        tg_version = "unknown"
-
-    rows: list[tuple[str, str]] = [
-        ("meta_version", "2"),
-        ("created_at_utc", created_at_utc),
-        ("taskgraph_version", tg_version),
-        ("python_version", sys.version.split()[0]),
-        ("platform", platform.platform()),
-        ("node_prompts", json.dumps(node_prompts, sort_keys=True)),
-        ("llm_model", model),
-    ]
-
-    if reasoning_effort:
-        rows.append(("llm_reasoning_effort", reasoning_effort))
-    if max_iterations is not None:
-        rows.append(("llm_max_iterations", str(max_iterations)))
-
-    if source_row_counts:
-        rows.append(
-            ("inputs_row_counts", json.dumps(source_row_counts, sort_keys=True))
-        )
-        rows.append(("inputs_schema", json.dumps(source_schemas, sort_keys=True)))
-
-    run_context: dict[str, Any] = {"mode": "run"}
-    rows.append(("run", json.dumps(run_context, sort_keys=True)))
-
-    spec: dict[str, Any] = {}
-    if spec_module:
-        spec["module"] = spec_module
-    if spec:
-        rows.append(("spec", json.dumps(spec, sort_keys=True)))
-
-    conn.executemany("INSERT INTO _workspace_meta (key, value) VALUES (?, ?)", rows)
-
-
-def read_workspace_meta(conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
-    """Read workspace metadata. Returns empty dict if table doesn't exist."""
-    try:
-        return dict(conn.execute("SELECT key, value FROM _workspace_meta").fetchall())
-    except duckdb.Error:
-        return {}
-
-
-def upsert_workspace_meta(
-    conn: duckdb.DuckDBPyConnection, rows: list[tuple[str, str]]
-) -> None:
-    """Upsert additional workspace metadata rows.
-
-    Unlike persist_workspace_meta(), this does not clear existing keys.
-    """
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS _workspace_meta (
-            key VARCHAR PRIMARY KEY,
-            value VARCHAR
-        )
-    """)
-    conn.executemany(
-        """
-        INSERT INTO _workspace_meta (key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        rows,
-    )
-
-
 # --- View materialization ---
-
-
-def _drop_views(conn: duckdb.DuckDBPyConnection, view_names: list[str]) -> None:
-    """Drop a list of views (best-effort cleanup)."""
-    for name in view_names:
-        try:
-            conn.execute(f'DROP VIEW IF EXISTS "{name}"')
-        except duckdb.Error:
-            pass
 
 
 def materialize_views(
@@ -221,21 +103,12 @@ def materialize_views(
     Returns the number of views materialized.
     """
     # Deduplicate while preserving order
-    seen: set[str] = set()
-    unique_names: list[str] = []
-    for name in view_names:
-        if name not in seen:
-            seen.add(name)
-            unique_names.append(name)
+    unique_names = list(dict.fromkeys(view_names))
 
     materialized = 0
     for view_name in unique_names:
         # Check the view exists before attempting materialization
-        rows = conn.execute(
-            "SELECT 1 FROM duckdb_views() WHERE internal = false AND view_name = ?",
-            [view_name],
-        ).fetchall()
-        if not rows:
+        if not view_exists(conn, view_name):
             continue  # View doesn't exist (node may have failed or already materialized)
 
         # Materialize: create table from view, drop view, rename table.
@@ -265,42 +138,16 @@ def materialize_node_outputs(
 ) -> int:
     """Materialize a node's output views as tables.
 
-    After a node completes and passes validation, views are discovered
-    from the DB catalog and materialized as tables so downstream nodes
-    read pre-computed data instead of re-evaluating the entire upstream
-    view chain on every query.
-
-    What gets materialized depends on node type:
-
-    - **Source nodes**: only validation views (the ingested table already
-      exists).
-    - **SQL/prompt nodes**: all ``{node.name}_*`` views (excluding
-      validation views) plus validation views.
+    After a node completes and passes validation, all ``{name}_*`` views
+    (output views + validation views) are discovered from the catalog and
+    materialized.  This is the same logic for ALL node types — source
+    nodes simply won't have ``{name}_*`` output views (they produce a
+    table, not views), so the unified code naturally handles them.
 
     Returns the number of views materialized.
     """
     prefix = f"{node.name}_"
-    all_views = conn.execute(
-        "SELECT view_name FROM duckdb_views() WHERE internal = false"
-    ).fetchall()
-
-    if node.is_source():
-        # Source nodes: only validation views need materialization
-        validation_views = [
-            v[0] for v in all_views if is_validation_view(v[0], node.name)
-        ]
-        view_names = sorted(validation_views)
-    else:
-        # SQL/prompt nodes: all {name}_* views (excluding validation) + validation views
-        node_views = [
-            v[0]
-            for v in all_views
-            if v[0].startswith(prefix) and not is_validation_view(v[0], node.name)
-        ]
-        validation_views = [
-            v[0] for v in all_views if is_validation_view(v[0], node.name)
-        ]
-        view_names = sorted(node_views) + sorted(validation_views)
+    view_names = [v for v in list_views(conn) if v.startswith(prefix)]
 
     return materialize_views(conn, view_names)
 
@@ -369,59 +216,30 @@ class Workspace:
         else:
             ingest_table(conn, value, node.name)
 
-        row = conn.execute(f'SELECT COUNT(*) FROM "{node.name}"').fetchone()
-        count = row[0] if row else 0
+        count = count_rows(conn, node.name)
+        count = count if count is not None else 0
         if count == 0:
             log.warning("  %s: 0 rows (empty table)", node.name)
         else:
             log.info("  %s: %d rows", node.name, count)
         return count
 
-    # ------------------------------------------------------------------
-    # Post-execution flow (unified for all node types)
-    # ------------------------------------------------------------------
+    async def _execute_source_node(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        node: Node,
+        client: Any | None,
+    ) -> tuple[AgentResult, int | None]:
+        """Execute a source node: ingest data.
 
-    def _post_execute(
-        self, conn: duckdb.DuckDBPyConnection, node: Node
-    ) -> tuple[bool, str]:
-        """Unified post-execution: validate outputs, run validate_sql, check
-        validation views, materialize.
-
-        Returns (success, error_message).
+        Returns:
+            (AgentResult, row_count or None on failure)
         """
-        # 1. Validate outputs (columns for source, output_columns for sql/prompt)
-        errors = node.validate_outputs(conn)
-        if errors:
-            return False, "\n".join(f"- {e}" for e in errors)
-
-        # 2. Run validate_sql if present
-        if node.has_validation():
-            val_errors = run_validate_sql(conn=conn, node=node)
-            if val_errors:
-                return False, "\n".join(f"- {e}" for e in val_errors)
-
-            # 3. Check validation views
-            errors = node.validate_validation_views(conn)
-            if errors:
-                return False, "\n".join(f"- {e}" for e in errors)
-
-        # 4. Materialize
-        self._materialize_node(conn, node)
-        return True, ""
-
-    def _materialize_node(self, conn: duckdb.DuckDBPyConnection, node: Node) -> int:
-        """Materialize views for a node after successful validation.
-
-        Delegates to :func:`materialize_node_outputs` which handles both
-        source nodes (only validation views) and sql/prompt nodes (all
-        ``{name}_*`` views + validation views).
-
-        Returns the number of views materialized.
-        """
-        n = materialize_node_outputs(conn, node)
-        if n:
-            log.debug("[%s] Materialized %d view(s)", node.name, n)
-        return n
+        try:
+            row_count = await self._ingest_node(conn, node, client)
+        except Exception as e:
+            return _simple_result(False, f"Source ingestion failed: {e}"), None
+        return _simple_result(True, f"OK ({row_count} rows)"), row_count
 
     # ------------------------------------------------------------------
     # DAG execution
@@ -496,81 +314,6 @@ class Workspace:
         return results, all_success
 
     # ------------------------------------------------------------------
-    # Node execution (dispatches by type)
-    # ------------------------------------------------------------------
-
-    async def _execute_source_node(
-        self,
-        conn: duckdb.DuckDBPyConnection,
-        node: Node,
-        client: Any | None,
-    ) -> AgentResult:
-        """Execute a source node: ingest data, return AgentResult."""
-        start_time = time.time()
-        try:
-            row_count = await self._ingest_node(conn, node, client)
-        except Exception as e:
-            elapsed = time.time() - start_time
-            return AgentResult(
-                success=False,
-                final_message=f"Source ingestion failed: {e}",
-                iterations=0,
-                messages=[],
-                tool_calls_count=0,
-            )
-
-        # Post-execution: validate outputs + validate_sql + materialize
-        success, err_msg = self._post_execute(conn, node)
-        if not success:
-            return AgentResult(
-                success=False,
-                final_message=err_msg,
-                iterations=0,
-                messages=[],
-                tool_calls_count=0,
-            )
-
-        return AgentResult(
-            success=True,
-            final_message=f"OK ({row_count} rows)",
-            iterations=0,
-            messages=[],
-            tool_calls_count=0,
-        )
-
-    async def _execute_sql_node(
-        self,
-        conn: duckdb.DuckDBPyConnection,
-        node: Node,
-    ) -> AgentResult:
-        """Execute a SQL node and return its result.
-
-        Validation (outputs + validate_sql) runs inside run_sql_node.
-        Post-execution materialization is handled by the caller.
-        """
-        return await run_sql_node(conn=conn, node=node)
-
-    async def _execute_prompt_node(
-        self,
-        conn: duckdb.DuckDBPyConnection,
-        node: Node,
-        client: OpenRouterClient,
-        model: str,
-        max_iterations: int,
-    ) -> AgentResult:
-        """Execute a prompt node (LLM agent) and return its result.
-
-        Validation runs inside the agent loop.
-        """
-        return await run_node_agent(
-            conn=conn,
-            node=node,
-            client=client,
-            model=model,
-            max_iterations=max_iterations,
-        )
-
-    # ------------------------------------------------------------------
     # Exports
     # ------------------------------------------------------------------
 
@@ -618,7 +361,7 @@ class Workspace:
             db_path.unlink()
         conn = duckdb.connect(str(db_path))
         try:
-            init_trace_table(conn)
+            init_infra(conn)
 
             # Track row counts for source nodes (populated during execution)
             source_row_counts: dict[str, int] = {}
@@ -629,41 +372,87 @@ class Workspace:
                     node.name,
                     node.node_type(),
                 )
+                node_start = time.time()
                 before = snapshot_views(conn)
 
+                # --- Phase 1: Execute (type-specific) ---
                 if node.is_source():
-                    result = await self._execute_source_node(conn, node, client)
-                    # Track row count for metadata
-                    if result.success:
-                        try:
-                            row = conn.execute(
-                                f'SELECT COUNT(*) FROM "{node.name}"'
-                            ).fetchone()
-                            source_row_counts[node.name] = row[0] if row else 0
-                        except duckdb.Error:
-                            pass
+                    result, row_count = await self._execute_source_node(
+                        conn, node, client
+                    )
+                    if result.success and row_count is not None:
+                        source_row_counts[node.name] = row_count
                 elif node.node_type() == "sql":
-                    result = await self._execute_sql_node(conn, node)
+                    result = await run_sql_node(conn=conn, node=node)
                 elif node.node_type() == "prompt":
                     if client is None:
                         raise RuntimeError(
                             f"Node '{node.name}' requires an OpenRouterClient"
                         )
-                    result = await self._execute_prompt_node(
-                        conn, node, client, model, max_iterations
+                    result = await run_node_agent(
+                        conn=conn,
+                        node=node,
+                        client=client,
+                        model=model,
+                        max_iterations=max_iterations,
                     )
                 else:
                     raise RuntimeError(f"Unknown node type: {node.node_type()}")
+
+                # --- Phase 2: Unified post-execution (ALL node types) ---
+                # Validate → materialize → persist metadata.
+                # Prompt nodes run validation inside their agent loop, but
+                # source and sql nodes need it here.  Running it uniformly
+                # for all types is safe: for prompt nodes that already
+                # passed, validate_node_complete is a cheap re-check.
+                if result.success:
+                    errors = validate_node_complete(conn, node)
+                    if errors:
+                        result = AgentResult(
+                            success=False,
+                            final_message="\n".join(f"- {e}" for e in errors),
+                            iterations=result.iterations,
+                            messages=result.messages,
+                            tool_calls_count=result.tool_calls_count,
+                            usage=result.usage,
+                        )
 
                 # Snapshot BEFORE materialization to capture view changes
                 after = snapshot_views(conn)
                 changes = diff_snapshots(before, after)
 
-                # Materialize on success (sql/prompt nodes only — source
-                # nodes handle materialization inside _execute_source_node
-                # via _post_execute)
-                if result.success and not node.is_source():
-                    self._materialize_node(conn, node)
+                # Materialize on success (all node types)
+                if result.success:
+                    n = materialize_node_outputs(conn, node)
+                    if n:
+                        log.debug("[%s] Materialized %d view(s)", node.name, n)
+
+                # Persist per-node metadata (all node types)
+                elapsed_s = time.time() - node_start
+                ntype = node.node_type()
+                node_meta: dict[str, Any] = {
+                    "node_type": ntype,
+                    "depends_on": node.depends_on,
+                    "iterations": result.iterations,
+                    "tool_calls": result.tool_calls_count,
+                    "elapsed_s": round(elapsed_s, 1),
+                    "validation": "PASSED" if result.success else "FAILED",
+                    "prompt_tokens": result.usage["prompt_tokens"],
+                    "completion_tokens": result.usage["completion_tokens"],
+                    "cache_read_tokens": result.usage["cache_read_tokens"],
+                    "reasoning_tokens": result.usage["reasoning_tokens"],
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "model": model if ntype == "prompt" else ntype,
+                }
+                if ntype == "prompt":
+                    node_meta["reasoning_effort"] = (
+                        client.reasoning_effort if client else None
+                    )
+                if ntype in ("prompt", "sql"):
+                    node_meta["output_columns"] = dict(node.output_columns)
+                if not result.success:
+                    node_meta["error"] = result.final_message
+                persist_node_meta(conn, node.name, node_meta)
 
                 if changes:
                     persist_changes(conn, node.name, changes)

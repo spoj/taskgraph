@@ -38,7 +38,13 @@ _cwd = str(Path.cwd())
 if _cwd not in sys.path:
     sys.path.insert(0, _cwd)
 
-from src.api import OpenRouterClient, DEFAULT_MODEL
+from src.api import (
+    DEFAULT_MODEL,
+    OPENROUTER_API_KEY_ENV,
+    OpenRouterClient,
+    has_openrouter_api_key,
+)
+from src.catalog import count_rows_display, list_tables, list_views
 from src.ingest import FileInput
 from src.agent_loop import DEFAULT_MAX_ITERATIONS
 from src.spec import load_spec_from_module, resolve_module_path
@@ -60,8 +66,50 @@ def _meta_json(meta: dict[str, str], key: str) -> dict[str, Any]:
     return json.loads(raw) if raw else {}
 
 
+def _describe_node(n: Node, include_validation: bool = False) -> str:
+    """One-line description of a node for display.
+
+    Produces a string like:
+      ``[source] (data.csv) columns: id, amt``
+      ``[sql] depends on: raw  -> prep_clean(id, amount)``
+      ``[prompt] depends on: prep  -> match_results(id, score) validate=yes``
+
+    Works identically for all node types.
+    """
+    parts: list[str] = [f"[{n.node_type()}]"]
+
+    # Source description
+    if n.is_source():
+        src = n.source
+        if callable(src) and not isinstance(src, FileInput):
+            parts.append("(callable)")
+        elif isinstance(src, FileInput):
+            parts.append(f"({src.path})")
+        elif isinstance(src, str):
+            parts.append(f"({src})")
+        elif isinstance(src, list):
+            parts.append(f"({len(src)} rows)")
+        elif isinstance(src, dict):
+            parts.append("(dict)")
+
+    # Columns (source) or output_columns (sql/prompt) — shown for all types
+    if n.columns:
+        parts.append(f"columns: {', '.join(n.columns)}")
+    if n.depends_on:
+        parts.append(f"depends on: {', '.join(n.depends_on)}")
+    if n.output_columns:
+        out_parts = []
+        for o, cols in n.output_columns.items():
+            out_parts.append(f"{o}({', '.join(cols)})" if cols else o)
+        parts.append(" -> " + ", ".join(out_parts))
+    if include_validation and n.has_validation():
+        parts.append("validate=yes")
+
+    return "  ".join(parts)
+
+
 def _require_openrouter_api_key() -> None:
-    if os.environ.get("OPENROUTER_API_KEY"):
+    if has_openrouter_api_key():
         return
 
     hint = (
@@ -69,7 +117,7 @@ def _require_openrouter_api_key() -> None:
         if DOTENV_PATH
         else "Set OPENROUTER_API_KEY in your environment or in a .env in the current directory (or a parent directory)."
     )
-    raise click.ClickException(f"OPENROUTER_API_KEY is required. {hint}")
+    raise click.ClickException(f"{OPENROUTER_API_KEY_ENV} is required. {hint}")
 
 
 @click.group()
@@ -311,47 +359,14 @@ def _format_node_tree(nodes: list[Node]) -> list[str]:
 
     roots = sorted([name for name, parents in deps.items() if not parents])
 
-    def _fmt_details(n: Node) -> str:
-        ntype = n.node_type()
-        parts: list[str] = [f"[{ntype}]"]
-
-        if ntype == "source":
-            # Describe the source
-            src = n.source
-            if callable(src) and not isinstance(src, FileInput):
-                parts.append("(callable)")
-            elif isinstance(src, FileInput):
-                parts.append(f"({src.path})")
-            elif isinstance(src, str):
-                parts.append(f"({src})")
-            elif isinstance(src, (list, dict)):
-                if isinstance(src, list):
-                    parts.append(f"({len(src)} rows)")
-                else:
-                    parts.append("(dict)")
-            if n.columns:
-                parts.append(f"columns: {', '.join(n.columns)}")
-        else:
-            # sql or prompt node
-            if n.depends_on:
-                dep_s = ", ".join(n.depends_on)
-                parts.append(f"depends on: {dep_s}")
-            if n.output_columns:
-                out_parts = []
-                for o, cols in n.output_columns.items():
-                    out_parts.append(f"{o}({', '.join(cols)})" if cols else o)
-                parts.append(" -> " + ", ".join(out_parts))
-            if n.has_validation():
-                parts.append("validate=yes")
-
-        return "  ".join(parts)
-
     lines: list[str] = []
 
     def _emit(name: str, prefix: str, is_last: bool, stack: set[str], seen: set[str]):
         n = node_by_name[name]
         branch = "`- " if is_last else "|- "
-        lines.append(f"{prefix}{branch}{name}  {_fmt_details(n)}")
+        lines.append(
+            f"{prefix}{branch}{name}  {_describe_node(n, include_validation=True)}"
+        )
 
         if name in stack:
             lines.append(f"{prefix}{'   ' if is_last else '|  '}[cycle]")
@@ -486,8 +501,7 @@ def run(
         spec_module=spec,
     )
 
-    source_nodes = [n for n in nodes if n.is_source()]
-    transform_nodes = [n for n in nodes if not n.is_source()]
+    source_count = sum(1 for n in nodes if n.is_source())
 
     log.info("Spec: %s", spec)
     log.info("Output: %s", output)
@@ -495,8 +509,8 @@ def run(
     log.info(
         "Nodes: %d (%d sources, %d transforms)",
         len(nodes),
-        len(source_nodes),
-        len(transform_nodes),
+        source_count,
+        len(nodes) - source_count,
     )
 
     # Show node tree before running
@@ -510,7 +524,8 @@ def run(
     needs_llm = any(n.node_type() == "prompt" for n in nodes)
     needs_pdf = any(
         isinstance(n.source, FileInput) and n.source.format == "pdf"
-        for n in source_nodes
+        for n in nodes
+        if n.is_source()
     )
     needs_client = needs_llm or needs_pdf
     if needs_client:
@@ -548,17 +563,8 @@ def _report_run_summary(output: Path, nodes: list[Node]) -> None:
         return
 
     try:
-        view_rows = conn.execute(
-            "SELECT view_name FROM duckdb_views() WHERE internal = false"
-        ).fetchall()
-        views = {row[0] for row in view_rows}
-
-        # Also check materialized tables (outputs are converted to tables
-        # after node completion for performance).
-        table_rows = conn.execute(
-            "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-        ).fetchall()
-        tables = {row[0] for row in table_rows}
+        views = set(list_views(conn, exclude_prefixes=("_",)))
+        tables = set(list_tables(conn, exclude_prefixes=("_",)))
         all_outputs = views | tables
 
         # --- Change report from _changes table ---
@@ -571,37 +577,26 @@ def _report_run_summary(output: Path, nodes: list[Node]) -> None:
             ).fetchall()
             has_changes = bool(change_rows)
         except duckdb.Error:
-            change_rows = []
-
-        transform_nodes = [n for n in nodes if not n.is_source()]
-
-        if has_changes:
-            # Changes are now reported real-time by the workspace
             pass
-        else:
+
+        if not has_changes:
             # Fallback: no _changes table, show basic view listing
             click.echo(
                 f"\nOutputs: {len(all_outputs)} ({len(tables)} materialized, {len(views)} views)"
             )
 
-            # Show source node row counts
             source_nodes = [n for n in nodes if n.is_source()]
             if source_nodes:
                 click.echo("\n  Sources:")
                 for node in source_nodes:
                     if node.name in tables:
-                        try:
-                            count = conn.execute(
-                                f'SELECT COUNT(*) FROM "{node.name}"'
-                            ).fetchone()
-                            count_s = str(count[0]) if count else "0"
-                            click.echo(f"    {node.name}: {count_s} rows")
-                        except duckdb.Error:
-                            click.echo(f"    {node.name}: error counting rows")
+                        click.echo(
+                            f"    {node.name}: {count_rows_display(conn, node.name)} rows"
+                        )
 
-            for node in transform_nodes:
-                # Discover node outputs: use output_columns keys if available,
-                # otherwise find materialized tables/views matching {name}_*
+            for node in nodes:
+                if node.is_source():
+                    continue
                 if node.output_columns:
                     node_output_names = list(node.output_columns.keys())
                 else:
@@ -609,26 +604,19 @@ def _report_run_summary(output: Path, nodes: list[Node]) -> None:
                     node_output_names = sorted(
                         n for n in all_outputs if n.startswith(prefix)
                     )
-
                 if not node_output_names:
                     continue
-
                 click.echo(f"\n  {node.name}:")
                 for output_name in node_output_names:
                     if output_name in all_outputs:
-                        try:
-                            count = conn.execute(
-                                f'SELECT COUNT(*) FROM "{output_name}"'
-                            ).fetchone()
-                            count_s = str(count[0]) if count else "0"
-                            click.echo(f"    {output_name}: {count_s} rows")
-                        except duckdb.Error:
-                            click.echo(f"    {output_name}: error counting rows")
+                        click.echo(
+                            f"    {output_name}: {count_rows_display(conn, output_name)} rows"
+                        )
                     else:
                         click.echo(f"    {output_name}: MISSING")
 
-        # --- Warnings and errors (always shown) ---
-        for node in transform_nodes:
+        # --- Warnings and errors (always shown, all node types) ---
+        for node in nodes:
             warn_count, warn_msgs = node.validation_warnings(
                 conn, limit=MAX_INLINE_MESSAGES
             )
@@ -749,9 +737,6 @@ def show(target: Path | None, spec: str | None):
     except Exception as e:
         raise click.ClickException(str(e))
 
-    source_nodes = [n for n in nodes if n.is_source()]
-    transform_nodes = [n for n in nodes if not n.is_source()]
-
     click.echo(f"Spec: {spec_module}\n")
 
     # --- Nodes by layer ---
@@ -765,43 +750,8 @@ def show(target: Path | None, spec: str | None):
     for layer_idx, layer in enumerate(layers):
         click.echo(f"  Layer {layer_idx}:")
         for n in layer:
-            ntype = n.node_type()
-            tag = f"[{ntype}]"
-
-            if ntype == "source":
-                # Describe the source
-                src = n.source
-                if callable(src) and not isinstance(src, FileInput):
-                    src_desc = "(callable)"
-                elif isinstance(src, FileInput):
-                    src_desc = f"({src.path})"
-                elif isinstance(src, str):
-                    src_desc = f"({src})"
-                elif isinstance(src, list):
-                    src_desc = f"({len(src)} rows)"
-                elif isinstance(src, dict):
-                    src_desc = "(dict)"
-                else:
-                    src_desc = ""
-
-                col_desc = ""
-                if n.columns:
-                    col_desc = f", columns: {', '.join(n.columns)}"
-                click.echo(f"    {tag:<10}{n.name:<20}{src_desc}{col_desc}")
-            else:
-                # sql or prompt node
-                dep_desc = ""
-                if n.depends_on:
-                    dep_desc = f"depends on: {', '.join(n.depends_on)}"
-
-                out_desc = ""
-                if n.output_columns:
-                    out_parts = []
-                    for o, cols in n.output_columns.items():
-                        out_parts.append(f"{o}({', '.join(cols)})" if cols else o)
-                    out_desc = " -> " + ", ".join(out_parts)
-
-                click.echo(f"    {tag:<10}{n.name:<20}{dep_desc}{out_desc}")
+            desc = _describe_node(n)
+            click.echo(f"    {n.name:<20}{desc}")
 
     # --- DAG (tree) ---
     click.echo(f"\nDAG (tree, {len(nodes)} nodes):")
@@ -810,23 +760,21 @@ def show(target: Path | None, spec: str | None):
     click.echo()
 
     # --- Validation summary ---
-    has_validation = False
     val_lines = []
     for n in nodes:
         parts = []
         if n.is_source() and n.columns:
             parts.append(f"{len(n.columns)} required columns")
         if n.output_columns:
-            n_schemas = len(n.output_columns)
-            parts.append(f"{n_schemas} output schema{'s' if n_schemas > 1 else ''}")
-        n_val = len(n.validation_view_names())
-        if n_val:
-            parts.append(f"{n_val} validation view{'s' if n_val > 1 else ''}")
+            ns = len(n.output_columns)
+            parts.append(f"{ns} output schema{'s' if ns > 1 else ''}")
+        if n.has_validation():
+            ns = len(n.validate_sql_statements())
+            parts.append(f"validate_sql: {ns} stmt{'s' if ns != 1 else ''}")
         if parts:
-            has_validation = True
             val_lines.append(f"  {n.name}: {', '.join(parts)}")
 
-    if has_validation:
+    if val_lines:
         click.echo("Validation:")
         for line in val_lines:
             click.echo(line)

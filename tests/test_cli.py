@@ -189,6 +189,18 @@ class TestLoadSpec:
         with pytest.raises(ValueError, match="missing required 'name'"):
             load_spec_from_module(module_path)
 
+    def test_node_name_double_underscore_rejected(self, tmp_path):
+        """Node names must not contain '__' (reserved for validation views)."""
+        from src.spec import load_spec_from_module
+
+        module_path = _write_spec_module(
+            tmp_path,
+            'NODES = [{"name": "bad__name", "source": []}]\n',
+        )
+
+        with pytest.raises(ValueError, match="must not contain '__'"):
+            load_spec_from_module(module_path)
+
     def test_missing_node_name_raises(self, tmp_path):
         """Node without name key raises ValueError."""
         from src.spec import load_spec_from_module

@@ -129,6 +129,16 @@ async def run_agent_loop(
     tool_calls_count = 0
     iteration = 0
 
+    def _result(success: bool, message: str) -> AgentResult:
+        return AgentResult(
+            success=success,
+            final_message=message,
+            iterations=iteration,
+            messages=messages,
+            usage=total_usage,
+            tool_calls_count=tool_calls_count,
+        )
+
     while max_iterations == 0 or iteration < max_iterations:
         iteration += 1
 
@@ -143,13 +153,8 @@ async def run_agent_loop(
             )
             if total_tokens > max_tokens:
                 log.warning("Token limit exceeded: %d / %d", total_tokens, max_tokens)
-                return AgentResult(
-                    success=False,
-                    final_message=f"Token limit exceeded ({total_tokens:,} / {max_tokens:,})",
-                    iterations=iteration,
-                    messages=messages,
-                    usage=total_usage,
-                    tool_calls_count=tool_calls_count,
+                return _result(
+                    False, f"Token limit exceeded ({total_tokens:,} / {max_tokens:,})"
                 )
 
         # Add assistant message to history
@@ -201,39 +206,16 @@ async def run_agent_loop(
             if validation_fn:
                 valid, error_msg = validation_fn()
                 if valid:
-                    return AgentResult(
-                        success=True,
-                        final_message=content,
-                        iterations=iteration,
-                        messages=messages,
-                        usage=total_usage,
-                        tool_calls_count=tool_calls_count,
-                    )
-                else:
-                    # Validation failed - feed error back and continue
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": f"VALIDATION FAILED:\n{error_msg}\n\nFix the issues and reply when done.",
-                        }
-                    )
-            else:
-                # No validation - just return
-                return AgentResult(
-                    success=True,
-                    final_message=content,
-                    iterations=iteration,
-                    messages=messages,
-                    usage=total_usage,
-                    tool_calls_count=tool_calls_count,
+                    return _result(True, content)
+                # Validation failed - feed error back and continue
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"VALIDATION FAILED:\n{error_msg}\n\nFix the issues and reply when done.",
+                    }
                 )
+            else:
+                return _result(True, content)
 
     # Max iterations reached
-    return AgentResult(
-        success=False,
-        final_message="Max iterations reached without valid output",
-        iterations=iteration,
-        messages=messages,
-        usage=total_usage,
-        tool_calls_count=tool_calls_count,
-    )
+    return _result(False, "Max iterations reached without valid output")

@@ -1,7 +1,7 @@
 import pytest
 
 from tests.conftest import _make_node, _write_spec_module
-from src.task import resolve_dag, validate_graph
+from src.task import discover_validation_objects, resolve_dag, validate_graph
 
 
 class TestValidateOutputs:
@@ -165,16 +165,24 @@ class TestValidateOutputs:
         assert len(errors) == 1
         assert "not created" in errors[0].lower()
 
-    def test_validation_view_names(self):
-        node = _make_node(
-            name="t",
-            validate_sql=(
-                "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message;"
-                "CREATE VIEW t__validation_extra AS SELECT 'pass' AS status, 'ok' AS message;"
-                "CREATE VIEW other_view AS SELECT 1 AS x"
-            ),
+    def test_discover_validation_objects(self, conn):
+        conn.execute(
+            "CREATE VIEW t__validation AS SELECT 'pass' AS status, 'ok' AS message"
         )
-        assert node.validation_view_names() == ["t__validation", "t__validation_extra"]
+        conn.execute(
+            "CREATE VIEW t__validation_extra AS SELECT 'pass' AS status, 'ok' AS message"
+        )
+        conn.execute("CREATE VIEW other_view AS SELECT 1 AS x")
+        assert discover_validation_objects(conn, "t") == [
+            "t__validation",
+            "t__validation_extra",
+        ]
+
+    def test_validate_graph_rejects_double_underscore_in_name(self):
+        node = _make_node(name="bad__name")
+        errors = validate_graph([node])
+        assert errors
+        assert any("bad__name" in e and "__" in e for e in errors)
 
     def test_node_type(self):
         prompt_node = _make_node(prompt="do the thing", sql="")

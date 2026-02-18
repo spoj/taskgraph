@@ -178,24 +178,27 @@ def _ensure_file_exists(path: Path) -> None:
         raise FileNotFoundError(f"File not found: {path}")
 
 
-def ingest_csv(conn: duckdb.DuckDBPyConnection, path: Path, table_name: str) -> None:
+def _ingest_single_file(
+    conn: duckdb.DuckDBPyConnection, path: Path, table_name: str, reader_fn: str
+) -> None:
+    """Ingest a single-file format (csv or parquet) using a DuckDB reader function."""
     _ensure_file_exists(path)
     query = (
         "SELECT CAST(row_number() OVER () AS INTEGER) AS _row_id, * "
-        "FROM read_csv_auto(?)"
+        f"FROM {reader_fn}(?)"
     )
     _write_table_from_query(conn, table_name, query, [str(path)])
+
+
+# Public aliases for direct use / tests
+def ingest_csv(conn: duckdb.DuckDBPyConnection, path: Path, table_name: str) -> None:
+    _ingest_single_file(conn, path, table_name, "read_csv_auto")
 
 
 def ingest_parquet(
     conn: duckdb.DuckDBPyConnection, path: Path, table_name: str
 ) -> None:
-    _ensure_file_exists(path)
-    query = (
-        "SELECT CAST(row_number() OVER () AS INTEGER) AS _row_id, * "
-        "FROM read_parquet(?)"
-    )
-    _write_table_from_query(conn, table_name, query, [str(path)])
+    _ingest_single_file(conn, path, table_name, "read_parquet")
 
 
 def ingest_excel(
@@ -312,16 +315,13 @@ async def ingest_file(
     table_name: str,
     client: Any | None = None,
 ) -> None:
-    if file_input.format == "csv":
-        ingest_csv(conn, file_input.path, table_name)
-        return
-    if file_input.format == "parquet":
-        ingest_parquet(conn, file_input.path, table_name)
-        return
-    if file_input.format == "excel":
+    fmt = file_input.format
+    if fmt in ("csv", "parquet"):
+        reader = "read_csv_auto" if fmt == "csv" else "read_parquet"
+        _ingest_single_file(conn, file_input.path, table_name, reader)
+    elif fmt == "excel":
         ingest_excel(conn, file_input.path, table_name, sheet=file_input.sheet)
-        return
-    if file_input.format == "pdf":
+    elif fmt == "pdf":
         await ingest_pdf(conn, file_input.path, table_name, client=client)
-        return
-    raise ValueError(f"Unsupported file format: {file_input.format}")
+    else:
+        raise ValueError(f"Unsupported file format: {fmt}")

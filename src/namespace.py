@@ -83,32 +83,21 @@ class Namespace:
         """
         base = f"{node.name}__validation"
         return cls(
-            allowed_names=frozenset(node.validation_view_names()) | frozenset({base}),
+            allowed_names=frozenset({base}),
             prefix=base,
         )
 
     @classmethod
     def for_source_validation(cls, input_name: str) -> Namespace:
-        """Namespace for source node validation SQL execution.
-
-        Allows ``{input_name}__validation`` and
-        ``{input_name}__validation_*`` prefixed names.
-        """
+        """Namespace for source node validation SQL execution."""
         base = f"{input_name}__validation"
-        return cls(
-            allowed_names=frozenset({base}),
-            prefix=base,
-        )
+        return cls(allowed_names=frozenset({base}), prefix=base)
 
     # --- Name checking ---
 
     def is_name_allowed(self, name: str) -> bool:
         """Return True if *name* is permitted by this namespace."""
-        if name in self.allowed_names:
-            return True
-        if name.startswith(f"{self.prefix}_"):
-            return True
-        return False
+        return name in self.allowed_names or name.startswith(f"{self.prefix}_")
 
     def check_name(
         self, name: str | None, kind_label: str, action: str

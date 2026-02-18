@@ -6,7 +6,6 @@ within its namespace prefix ({name}_*). SELECTs can read anything.
 
 import json
 import logging
-import re
 import duckdb
 import threading
 import time
@@ -16,12 +15,15 @@ import uuid
 from typing import Any, cast
 from .agent_loop import run_agent_loop, AgentResult, DEFAULT_MAX_ITERATIONS
 from .api import OpenRouterClient, create_model_callable, DEFAULT_MODEL
+from .catalog import list_tables
+from .infra import log_trace, persist_node_meta, ensure_trace as init_trace_table
 from .namespace import Namespace
 from .task import Node
 from .sql_utils import (
-    get_parser_conn,
     get_column_schema,
-    extract_create_name,
+    SqlParseError,
+    extract_ddl_target,
+    parse_one_statement,
 )
 
 log = logging.getLogger(__name__)
@@ -69,7 +71,7 @@ MACROS:
 
 CATALOG:
   SELECT view_name, sql FROM duckdb_views() WHERE internal = false
-  SELECT table_name FROM duckdb_tables()
+  SELECT table_name FROM duckdb_tables() WHERE internal = false
 
 DUCKDB DIALECT:
 - Identifiers: double-quote ("col"), not backticks. Quote reserved words. Always use AS for aliases.
@@ -125,34 +127,6 @@ def _create_sql_tool() -> dict[str, Any]:
 
 # --- SQL validation ---
 
-# Regex to extract the object name from CREATE/DROP statements.
-# Handles: CREATE [OR REPLACE] [TEMP] VIEW|MACRO "name" ...
-#          DROP VIEW|MACRO [IF EXISTS] "name" ...
-
-_DROP_NAME_RE = re.compile(
-    r"DROP\s+(?:MACRO\s+TABLE|VIEW|MACRO)\s+"
-    r"(?:IF\s+EXISTS\s+)?"
-    r'"?(\w+)"?',
-    re.IGNORECASE,
-)
-
-# Allowed sub-kinds within CREATE/DROP (matched against the SQL text)
-_CREATE_KIND_RE = re.compile(
-    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?"
-    r"(VIEW|MACRO)\b",
-    re.IGNORECASE,
-)
-_DROP_KIND_RE = re.compile(
-    r"DROP\s+(MACRO\s+TABLE|VIEW|MACRO)\b",
-    re.IGNORECASE,
-)
-
-
-def _extract_drop_name(query: str) -> str | None:
-    """Extract the object name from a DROP VIEW/MACRO statement."""
-    m = _DROP_NAME_RE.search(query)
-    return m.group(1) if m else None
-
 
 def is_sql_allowed(
     query: str,
@@ -171,176 +145,40 @@ def is_sql_allowed(
         ddl_only: If True, only allow CREATE/DROP VIEW|MACRO statements.
     """
     try:
-        statements = get_parser_conn().extract_statements(query)
-    except Exception as e:
-        return False, f"SQL parse error: {e}"
+        parsed = parse_one_statement(query)
+    except SqlParseError as e:
+        return False, str(e)
 
-    if not statements:
-        return False, "Empty query"
-
-    if len(statements) > 1:
-        return False, "Only one statement allowed at a time"
-
-    stmt = statements[0]
-    st = stmt.type
+    st = parsed.stmt_type
 
     # DuckDB's Python typing for StatementType is incomplete in some versions;
     # cast to Any so pyright can type-check the rest of this module.
     StatementType = cast(Any, duckdb.StatementType)
 
-    # SELECT — always allowed (covers UNION, INTERSECT, EXCEPT, SUMMARIZE, DESCRIBE)
-    if st == StatementType.SELECT:
+    # Read-only statements (SELECT, EXPLAIN, SUMMARIZE, DESCRIBE)
+    if st in (StatementType.SELECT, StatementType.EXPLAIN):
         if ddl_only:
             return False, "SQL-only nodes only allow CREATE/DROP VIEW|MACRO statements"
         return True, ""
 
-    # EXPLAIN — allowed (read-only introspection)
-    if st == StatementType.EXPLAIN:
-        if ddl_only:
-            return False, "SQL-only nodes only allow CREATE/DROP VIEW|MACRO statements"
+    # CREATE/DROP — only VIEW and MACRO, with namespace enforcement
+    if st in (StatementType.CREATE, StatementType.DROP):
+        sql = parsed.sql
+        ddl = extract_ddl_target(sql)
+        if ddl is None:
+            verb = "CREATE" if st == StatementType.CREATE else "DROP"
+            return False, f"Only {verb} VIEW and {verb} MACRO are permitted."
+        label = ddl.kind
+        action = ddl.action
+        name = ddl.name
+        if namespace is not None:
+            ok, err = namespace.check_name(name, label, action)
+            if not ok:
+                return False, err
         return True, ""
 
-    # CREATE — only VIEW and MACRO
-    if st == StatementType.CREATE:
-        sql = stmt.query
-        kind_match = _CREATE_KIND_RE.search(sql)
-        if kind_match:
-            kind = kind_match.group(1).upper()
-            label = "view" if kind == "VIEW" else "macro"
-            name = extract_create_name(sql)
-            if namespace is not None:
-                ok, err = namespace.check_name(name, label, "create")
-                if not ok:
-                    return False, err
-            return True, ""
-        return False, "Only CREATE VIEW and CREATE MACRO are permitted."
-
-    # DROP — only VIEW and MACRO
-    if st == StatementType.DROP:
-        sql = stmt.query
-        kind_match = _DROP_KIND_RE.search(sql)
-        if kind_match:
-            kind = kind_match.group(1).upper()
-            label = "view" if kind == "VIEW" else "macro"
-            name = _extract_drop_name(sql)
-            if namespace is not None:
-                ok, err = namespace.check_name(name, label, "drop")
-                if not ok:
-                    return False, err
-            return True, ""
-        return False, "Only DROP VIEW and DROP MACRO are permitted."
-
-    return False, f"{st.name} is not allowed."
-
-
-# --- Metadata persistence ---
-
-
-def persist_node_meta(
-    conn: duckdb.DuckDBPyConnection, node_name: str, meta: dict[str, Any]
-) -> None:
-    """Persist per-node run metadata in _node_meta.
-
-    _node_meta is a simple per-node JSON blob. It is overwritten per run.
-    """
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS _node_meta (
-            node VARCHAR PRIMARY KEY,
-            meta_json VARCHAR NOT NULL
-        )
-    """)
-
-    conn.execute("DELETE FROM _node_meta WHERE node = ?", [node_name])
-    conn.execute(
-        "INSERT INTO _node_meta (node, meta_json) VALUES (?, ?)",
-        [node_name, json.dumps(meta, sort_keys=True)],
-    )
-
-
-# --- Trace ---
-
-
-def init_trace_table(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create the _trace table and derived views.
-
-    Also creates ``_view_definitions`` as a view on ``_trace`` — it
-    extracts the last successful ``CREATE VIEW`` statement per view name,
-    giving the same ``(node, view_name, sql)`` interface that the old
-    ``_view_definitions`` table provided, but derived entirely from the
-    trace log.
-    """
-    conn.execute("CREATE SEQUENCE IF NOT EXISTS _trace_seq")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS _trace (
-            id INTEGER DEFAULT nextval('_trace_seq'),
-            timestamp TIMESTAMP DEFAULT current_timestamp,
-            node VARCHAR,
-            source VARCHAR,
-            query VARCHAR NOT NULL,
-            success BOOLEAN NOT NULL,
-            error VARCHAR,
-            row_count INTEGER,
-            elapsed_ms DOUBLE
-        )
-    """)
-    # Add source column to existing databases that lack it.
-    try:
-        conn.execute("ALTER TABLE _trace ADD COLUMN source VARCHAR")
-    except duckdb.Error:
-        pass  # column already exists
-    conn.execute(r"""
-        CREATE OR REPLACE VIEW _view_definitions AS
-        WITH actions AS (
-            SELECT id, node, query,
-                   regexp_extract(
-                       query,
-                       '(?i)VIEW\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?"?(\w+)"?',
-                       1
-                   ) AS view_name,
-                   CASE WHEN regexp_matches(query, '(?i)^\s*DROP\s')
-                        THEN 'drop' ELSE 'create' END AS action
-            FROM _trace
-            WHERE success = true
-              AND (regexp_matches(query, '(?i)^\s*CREATE\s+(OR\s+REPLACE\s+)?VIEW\s')
-                   OR regexp_matches(query, '(?i)^\s*DROP\s+VIEW\s'))
-        ),
-        latest AS (
-            SELECT *,
-                   row_number() OVER (
-                       PARTITION BY view_name ORDER BY id DESC
-                   ) AS rn
-            FROM actions
-            WHERE view_name IS NOT NULL
-        )
-        SELECT node, view_name, query AS sql
-        FROM latest
-        WHERE rn = 1 AND action = 'create'
-    """)
-
-
-def log_trace(
-    conn: duckdb.DuckDBPyConnection,
-    query: str,
-    success: bool,
-    error: str | None = None,
-    row_count: int | None = None,
-    elapsed_ms: float | None = None,
-    node_name: str | None = None,
-    source: str | None = None,
-) -> None:
-    """Log a SQL query execution to the _trace table.
-
-    Args:
-        source: Origin of the query — ``'agent'``, ``'sql_node'``,
-            ``'node_validation'``, or ``'input_validation'``.
-    """
-    conn.execute(
-        """
-        INSERT INTO _trace (node, source, query, success, error, row_count, elapsed_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        [node_name, source, query, success, error, row_count, elapsed_ms],
-    )
+    st_name = getattr(st, "name", str(st))
+    return False, f"{st_name} is not allowed."
 
 
 # --- SQL execution ---
@@ -429,13 +267,15 @@ def execute_sql(
             if max_result_chars > 0 and len(rows) > 0:
                 serialized = json.dumps(result, default=_json_default)
                 if len(serialized) > max_result_chars:
+                    success = False
+                    error_str = (
+                        f"Result too large ({len(rows)} rows, "
+                        f"{len(serialized):,} chars). "
+                        "Add LIMIT or narrow your query."
+                    )
                     result = {
                         "success": False,
-                        "error": (
-                            f"Result too large ({len(rows)} rows, "
-                            f"{len(serialized):,} chars). "
-                            "Add LIMIT or narrow your query."
-                        ),
+                        "error": error_str,
                     }
         else:
             success = True
@@ -471,10 +311,7 @@ def execute_sql(
 
 def _discover_available_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
     """Return all non-internal table names from the database."""
-    rows = conn.execute(
-        "SELECT table_name FROM duckdb_tables() WHERE internal = false ORDER BY table_name"
-    ).fetchall()
-    return [r[0] for r in rows]
+    return list_tables(conn, exclude_prefixes=("_",))
 
 
 def _format_table_schema_lines(
@@ -505,25 +342,16 @@ def build_transform_prompt(
     node: Node,
     input_lines: list[str] | None = None,
 ) -> str:
-    """Build a prompt for the LLM to produce node outputs.
-
-    Args:
-        node: Node specification.
-        input_lines: Pre-formatted table schema lines. If None, a
-            placeholder is shown (caller should pass discovered tables).
-    """
-    # Required outputs from output_columns keys
-    required_outputs: list[str] = []
+    """Build a prompt for the LLM to produce node outputs."""
     if node.output_columns:
-        for view_name, cols in node.output_columns.items():
-            if cols:
-                required_outputs.append(f"- {view_name}: {', '.join(cols)}")
-            else:
-                required_outputs.append(f"- {view_name}: (no required columns)")
+        required_outputs = [
+            f"- {vn}: {', '.join(cols)}" if cols else f"- {vn}: (no required columns)"
+            for vn, cols in node.output_columns.items()
+        ]
     else:
-        required_outputs.append(
+        required_outputs = [
             f"(none declared — create at least one view named {node.name}_*)"
-        )
+        ]
 
     parts = [
         f"NODE: {node.name}",
@@ -534,8 +362,7 @@ def build_transform_prompt(
         "AVAILABLE TABLES:",
         *(
             input_lines
-            if input_lines is not None
-            else [
+            or [
                 "(discover via: SELECT table_name FROM duckdb_tables() WHERE internal = false)"
             ]
         ),
@@ -645,30 +472,8 @@ async def run_node_agent(
         on_iteration=on_iteration,
     )
 
-    elapsed_s = time.time() - start_time
-
-    # Persist per-node metadata
-    persist_node_meta(
-        conn,
-        node.name,
-        {
-            "model": model,
-            "reasoning_effort": client.reasoning_effort,
-            "depends_on": node.depends_on,
-            "output_columns": {k: v for k, v in node.output_columns.items()},
-            "iterations": result.iterations,
-            "tool_calls": result.tool_calls_count,
-            "elapsed_s": round(elapsed_s, 1),
-            "validation": "PASSED" if result.success else "FAILED",
-            "prompt_tokens": result.usage["prompt_tokens"],
-            "completion_tokens": result.usage["completion_tokens"],
-            "cache_read_tokens": result.usage["cache_read_tokens"],
-            "reasoning_tokens": result.usage["reasoning_tokens"],
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        },
-    )
-
     status = "PASSED" if result.success else "FAILED"
+    elapsed_s = time.time() - start_time
     log.info("[%s] Validation: %s (%.1fs)", node.name, status, elapsed_s)
 
     return result
@@ -677,76 +482,43 @@ async def run_node_agent(
 # --- SQL-only node executor ---
 
 
+def _simple_result(success: bool, message: str) -> AgentResult:
+    """Create an AgentResult for non-agent nodes (source/sql)."""
+    return AgentResult(
+        success=success,
+        final_message=message,
+        iterations=0,
+        messages=[],
+        tool_calls_count=0,
+    )
+
+
 async def run_sql_node(
     conn: duckdb.DuckDBPyConnection,
     node: Node,
 ) -> AgentResult:
     """Execute a deterministic SQL-only node.
 
-    The node provides a list of SQL statements (node.sql).
-    Each statement is executed with the same namespace enforcement as agent nodes.
+    Executes all SQL statements with namespace enforcement. Does NOT
+    run validation — the caller (``run_one``) handles the unified
+    post-execution flow (validate + materialize) for all node types.
     """
-    start_time = time.time()
-
     statements = node.sql_statements()
     if not statements:
-        return AgentResult(
-            success=False,
-            final_message="SQL-only node has no SQL statements",
-            iterations=0,
-            messages=[],
-            tool_calls_count=0,
-        )
+        return _simple_result(False, "SQL-only node has no SQL statements")
 
     ns = Namespace.for_node(node)
-    execution_error: str | None = None
 
     for q in statements:
         result = execute_sql(
             conn, q, namespace=ns, node_name=node.name, ddl_only=True, source="sql_node"
         )
         if not result.get("success", False):
-            execution_error = str(result.get("error") or "SQL execution failed")
-            break
+            return _simple_result(
+                False, str(result.get("error") or "SQL execution failed")
+            )
 
-    validation_errors: list[str] = []
-    if execution_error is None:
-        validation_errors = validate_node_complete(conn, node)
-
-    elapsed_s = time.time() - start_time
-    validation_status = "FAILED" if execution_error or validation_errors else "PASSED"
-    meta: dict[str, Any] = {
-        "model": "sql",
-        "depends_on": node.depends_on,
-        "output_columns": {k: v for k, v in node.output_columns.items()},
-        "iterations": 0,
-        "tool_calls": 0,
-        "elapsed_s": round(elapsed_s, 1),
-        "validation": validation_status,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    }
-    if execution_error:
-        meta["error"] = execution_error
-
-    persist_node_meta(conn, node.name, meta)
-
-    if execution_error or validation_errors:
-        msg = execution_error or "\n".join(f"- {e}" for e in validation_errors)
-        return AgentResult(
-            success=False,
-            final_message=msg,
-            iterations=0,
-            messages=[],
-            tool_calls_count=0,
-        )
-
-    return AgentResult(
-        success=True,
-        final_message="OK",
-        iterations=0,
-        messages=[],
-        tool_calls_count=0,
-    )
+    return _simple_result(True, "OK")
 
 
 def run_validate_sql(
