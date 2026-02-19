@@ -168,15 +168,72 @@ JOIN unmatched_gl b
 MATCH_HARD_INTENT = """\
 Resolve remaining unmatched bank and GL items after exact matching.
 
-STRATEGIES:
-1. BATCH DEPOSITS: One bank deposit (description contains 'DEPOSIT') = sum of
-   multiple GL credits. Find subsets of unmatched positive GL entries that sum
-   exactly to the bank amount. Try 2-5 element combinations.
-2. AMOUNT TOLERANCE: Bank and GL differ by a small fee (< $100), e.g. wire fee
-   netted by accountant. Same sign, within 5-day window.
+There are two categories of remaining matches. You MUST attempt both:
 
-Bank descriptions are cryptic/truncated (e.g. 'AMZN MKTP US*RT4K29ZQ1').
-jaro_winkler scores between bank and GL are typically 0.3-0.6, not 0.8+.
+A) BATCH DEPOSITS — one bank deposit = sum of 2-5 GL credits deposited together.
+   A single customer payment (wire/ACH) covers multiple invoices.  The bank records
+   one credit line; the GL records one AR entry per invoice.  All GL entries in a
+   batch share the same customer/vendor.
+
+B) AMOUNT TOLERANCE — a bank item and GL item represent the same transaction but
+   differ by a small fee (< $100). Same sign, within a few days of each other.
+
+APPROACH:
+
+Step 1 — DATA EXPLORATION for batch deposits:
+  The key question is: what distinguishes GL entries that belong to the SAME batch
+  from GL entries that don't?  The answer is in the data itself — explore it.
+
+  Start by examining the text content of unmatched bank deposits and unmatched
+  positive GL entries:
+  a) Sample 10-15 unmatched bank deposits (positive amounts, descriptions like
+     "ACH CREDIT …").  What entity/vendor/customer names appear after the prefix?
+  b) Sample 20-30 unmatched positive GL entries.  What entity/vendor names appear
+     in GL descriptions?  Is there a common format (e.g. "Vendor Name - detail")?
+  c) Check: for each bank deposit, can you extract a name from the bank description
+     and find GL entries whose descriptions start with the SAME name?  If so, does
+     the sum of those GL entries' amounts equal the bank deposit amount?
+
+  Hypothesis to test: each batch deposit's bank description names a customer, and
+  the GL entries for that batch share that same customer name in their descriptions.
+  If grouping unmatched GL by the customer name extracted from the description and
+  summing their amounts matches a bank deposit amount, you have found the pattern.
+
+  CRITICAL — bank descriptions are often TRUNCATED (e.g. "ACH CREDIT STONEBRIDGE
+  CAPITA" for customer "Stonebridge Capital LLP").  Do NOT require exact match of
+  entity names.  Instead use PREFIX / starts-with matching:  the normalized bank
+  entity should be a prefix of (or equal to) the normalized GL entity.  Use
+  starts_with() or LIKE (bank_entity || '%') after normalizing both to uppercase
+  and stripping suffixes (Inc, LLC, Ltd, etc.).
+
+  IMPORTANT: GL entries within one batch can have DIFFERENT dates (spread across
+  several days). Do NOT partition or group by date when grouping candidates.
+  Use date only as a filter when joining groups against bank deposits (7-day window).
+
+Step 2 — BUILD BATCH MATCHES:
+  Once you've confirmed the pattern, create a view that:
+  - Extracts entity/vendor names from both bank and GL descriptions
+  - Groups unmatched positive GL entries by their vendor name
+  - Joins each group against unmatched bank deposits using PREFIX matching on the
+    normalized entity name AND amount match within $0.01
+  - Use a date window of up to 7 days (GL dates may precede bank deposit date)
+  Verify: each matched group's GL amounts should sum exactly to the bank amount.
+
+Step 3 — TOLERANCE MATCHES:
+  For remaining unmatched items (after excluding batch-matched items), find 1-to-1
+  pairs where bank amount and GL amount differ by less than $100, same sign, within
+  5 days. Use greedy best-match (smallest amount difference first), ensuring each
+  bank and GL item is used at most once.
+
+Step 4 — ASSEMBLE FINAL VIEW:
+  Combine confident matches + batch matches + tolerance matches.
+  Verify no GL id appears more than once. For batch rows, verify each bank_id's
+  GL components sum to bank_amount within $0.01.
+
+DuckDB NOTES:
+- Views are late-binding. Deeply nested view-of-view chains timeout on SELECT.
+  Keep chains shallow (max 2 levels). Use CTEs within views instead.
+- Materialize intermediate results as views early; don't build 5-level view stacks.
 
 OUTPUT: match_hard_all_matched view with columns:
   bank_id, gl_id, bank_amount, gl_amount, match_type, note
