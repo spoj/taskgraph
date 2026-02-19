@@ -47,7 +47,9 @@ def ensure_trace(conn: duckdb.DuckDBPyConnection) -> None:
             timestamp TIMESTAMP DEFAULT current_timestamp,
             node VARCHAR,
             source VARCHAR,
+            kind VARCHAR DEFAULT 'sql',
             query VARCHAR NOT NULL,
+            content VARCHAR,
             success BOOLEAN NOT NULL,
             error VARCHAR,
             row_count INTEGER,
@@ -72,6 +74,7 @@ def ensure_trace(conn: duckdb.DuckDBPyConnection) -> None:
                 END AS action
             FROM _trace
             WHERE success = true
+              AND kind = 'sql'
               AND (
                 regexp_matches(query, '{VIEW_TRACE_CREATE_RE}')
                 OR regexp_matches(query, '{VIEW_TRACE_DROP_RE}')
@@ -96,19 +99,31 @@ def log_trace(
     query: str,
     success: bool,
     *,
+    kind: str = "sql",
+    content: str | None = None,
     error: str | None = None,
     row_count: int | None = None,
     elapsed_ms: float | None = None,
     node_name: str | None = None,
     source: str | None = None,
 ) -> None:
-    """Log a SQL query execution to the _trace table."""
+    """Log an execution/event record to the _trace table."""
     conn.execute(
         """
-        INSERT INTO _trace (node, source, query, success, error, row_count, elapsed_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO _trace (node, source, kind, query, content, success, error, row_count, elapsed_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [node_name, source, query, success, error, row_count, elapsed_ms],
+        [
+            node_name,
+            source,
+            kind,
+            query,
+            content,
+            success,
+            error,
+            row_count,
+            elapsed_ms,
+        ],
     )
 
 

@@ -452,6 +452,26 @@ Export function exceptions are caught — they don't crash the run. Errors are s
 
 ---
 
+## Reporting
+
+Taskgraph can generate a single **agentic final report** (author = LLM, harness-controlled).
+
+- Generated at the end of a run when an LLM client is available (e.g. the spec has prompt nodes or PDF ingestion).
+- Implemented as an internal prompt node (name like `tg_report`) that can query the workspace DB (`_workspace_meta`, `_node_meta`, `_trace`, and domain tables).
+- Stored in `_workspace_meta` under key `final_report` (JSON with an `md` field).
+
+```sql
+SELECT value FROM _workspace_meta WHERE key = 'final_report';
+```
+
+Spec writer guidance (optional):
+- Create clear report-ready outputs (e.g. `report_summary`, `report_matched`, `report_unmatched_*`) so the reporter agent can find them quickly.
+- Use validation views with `status='warn'` to flag items that need human review; the final report agent can query these validation objects.
+
+Reporting keys do not affect pass/fail status; they are best-effort diagnostics.
+
+---
+
 ## DAG: Multi-Node Specs
 
 Nodes form a directed acyclic graph based on explicit `depends_on` edges. Nodes whose dependencies have all completed run concurrently (their LLM API calls overlap).

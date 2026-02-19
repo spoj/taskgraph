@@ -64,7 +64,12 @@ log = logging.getLogger(__name__)
 def _meta_json(meta: dict[str, str], key: str) -> dict[str, Any]:
     """Parse a JSON blob from workspace meta."""
     raw = meta.get(key)
-    return json.loads(raw) if raw else {}
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
 
 
 def _describe_node(n: Node, include_validation: bool = False) -> str:
@@ -550,6 +555,9 @@ def run(
     log.info("Saved to: %s", output)
     log.info("Node metadata: SELECT node, meta_json FROM _node_meta")
     log.info("SQL trace: SELECT * FROM _trace")
+    log.info(
+        "Final report: SELECT value FROM _workspace_meta WHERE key = 'final_report'"
+    )
 
     if not quiet:
         _report_run_summary(output, nodes)
@@ -673,6 +681,7 @@ def show(target: Path | None, spec: str | None):
         run = _meta_json(meta, "run")
         spec_m = _meta_json(meta, "spec")
         exports = _meta_json(meta, "exports")
+        final_report = _meta_json(meta, "final_report")
 
         click.echo(f"Workspace: {target}\n")
         click.echo(f"Created: {meta.get('created_at_utc', '(unknown)')}")
@@ -706,6 +715,16 @@ def show(target: Path | None, spec: str | None):
                     click.echo(f"  {name}: OK")
                 else:
                     click.echo(f"  {name}: FAILED ({err})")
+
+        if final_report:
+            status = final_report.get("status")
+            click.echo("\nFinal Report:")
+            click.echo(f"  status: {status}")
+            if final_report.get("error"):
+                click.echo(f"  error: {final_report.get('error')}")
+            md = final_report.get("md") or ""
+            if md.strip():
+                click.echo("\n" + md.rstrip())
         return
 
     if spec is None:

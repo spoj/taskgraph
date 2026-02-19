@@ -360,6 +360,9 @@ class Workspace:
             # Track row counts for source nodes (populated during execution)
             source_row_counts: dict[str, int] = {}
 
+            # Track per-node metadata dicts (also persisted to _node_meta)
+            node_meta_by_name: dict[str, dict[str, Any]] = {}
+
             async def run_one(node: Node) -> tuple[str, AgentResult]:
                 log.info(
                     "[%s] Starting (%s)",
@@ -439,8 +442,21 @@ class Workspace:
                     )
                 if ntype in ("prompt", "sql"):
                     node_meta["output_columns"] = dict(node.output_columns)
+                if ntype == "source":
+                    if node.name in source_row_counts:
+                        node_meta["row_count"] = source_row_counts[node.name]
+
+                # Persist validation warnings for structured reporting
+                warn_count, warn_msgs = node.validation_warnings(conn, limit=20)
+                if warn_count:
+                    node_meta["warnings"] = {
+                        "count": int(warn_count),
+                        "sample": list(warn_msgs),
+                    }
                 if not result.success:
                     node_meta["error"] = result.final_message
+
+                node_meta_by_name[node.name] = node_meta
                 persist_node_meta(conn, node.name, node_meta)
 
                 return node.name, result
@@ -480,6 +496,242 @@ class Workspace:
                     conn,
                     [("exports", json.dumps(exports_meta, sort_keys=True))],
                 )
+
+            # Reports (best-effort; should never fail the run)
+            try:
+                dag_order = [n for layer in dag_layer_names for n in layer]
+
+                # --- Final report (author = LLM; harness-controlled, agentic) ---
+                final_report: dict[str, Any] = {
+                    "schema_version": 1,
+                    "status": "skipped",
+                    "author": "llm",
+                    "model": None,
+                    "usage": None,
+                    "md": "",
+                    "error": None,
+                    "node": None,
+                    "output_relation": None,
+                }
+                if client is not None:
+                    # Pick a report node name unlikely to collide with spec nodes.
+                    existing = {n.name for n in self.nodes}
+                    base = "tg_report"
+                    report_node_name = base
+                    if report_node_name in existing:
+                        i = 2
+                        while f"{base}_{i}" in existing:
+                            i += 1
+                        report_node_name = f"{base}_{i}"
+
+                    output_view = f"{report_node_name}_md"
+
+                    node_by_name = {n.name: n for n in self.nodes}
+                    dag_lines: list[str] = ["DAG context (declared by spec):"]
+                    for node_name in dag_order:
+                        n = node_by_name.get(node_name)
+                        if n is None:
+                            continue
+                        deps = ", ".join(n.depends_on) if n.depends_on else "(none)"
+                        if n.is_source():
+                            outs = n.name
+                        elif n.output_columns:
+                            outs = ", ".join(sorted(n.output_columns.keys()))
+                        else:
+                            outs = f"{n.name}_*"
+                        validate_flag = (
+                            "validate=yes" if n.has_validation() else "validate=no"
+                        )
+                        dag_lines.append(
+                            f"- {n.name} [{n.node_type()}] deps=[{deps}] outputs=[{outs}] {validate_flag}"
+                        )
+                    dag_lines.append("")
+
+                    report_prompt = "\n".join(
+                        [
+                            "Write the FINAL REPORT for this Taskgraph run.",
+                            "",
+                            "You are a prompt node running inside the workspace DuckDB.",
+                            "You MUST read from the workspace to ground your report:",
+                            "- _workspace_meta (run metadata, spec module, exports, etc.)",
+                            "- _node_meta (per-node results: tokens/iters/errors)",
+                            "- _trace (FULL trace across all sources; include failures with ids)",
+                            "- _view_definitions (derived view SQL, if useful)",
+                            "- domain tables/views produced by the spec (discover via duckdb_tables/duckdb_views)",
+                            "",
+                            *dag_lines,
+                            "Validation warnings:",
+                            "- Query any <node>__validation_* objects and include warn rows in the report.",
+                            "",
+                            "Markdown newline requirement:",
+                            "- Your output must contain REAL newlines (ASCII LF).",
+                            "- In DuckDB, the literal string '\\n' is NOT a newline. Do not format markdown with '\\n' escapes inside normal string literals.",
+                            "- Use E'\\n' (escape string) when concatenating, e.g. '# Title' || E'\\n\\n' || '## Section'.",
+                            "- Or build a lines table and use string_agg(line, E'\\n').",
+                            "- Before finishing, sanity check there are no literal backslash-n sequences:",
+                            "  SELECT position('\\\\n' IN md) AS has_literal_backslash_n FROM <your_view> LIMIT 1;",
+                            "",
+                            "FINAL RESPONSE REQUIREMENT:",
+                            "- Your final assistant message MUST be the full markdown final report.",
+                            "- Do not respond with 'done' / 'created view' / brief status.",
+                            "- The harness stores your final assistant message into _trace (kind='assistant_final') and harvests it into _workspace_meta.final_report.",
+                            "",
+                            "OUTPUT REQUIREMENT:",
+                            f"- Create a view named {output_view} with a single column md (markdown).",
+                            "- Prefer a single row. If you output multiple rows, ensure each row is a markdown fragment.",
+                            "",
+                            "REPORT STRUCTURE (use these headings):",
+                            "# Final Report",
+                            "## Run Overview",
+                            "## Data Findings (Human Review Queue)",
+                            "## Node-by-Node Summary",
+                            "## Trace Narrative (What Happened + Why)",
+                            "## Validation Warnings",
+                            "## Next Steps",
+                            "",
+                            "GUIDELINES:",
+                            "- Ground every numeric claim in a SQL query result.",
+                            "- Use LIMIT and aggregates; avoid pulling whole tables.",
+                            "- Avoid exhaustive table/view dumps; highlight the key relations used for the findings.",
+                            "- When referencing trace entries, include _trace.id, node, source.",
+                            f"- Ignore _trace rows where node = '{report_node_name}' (those are your own reporting queries).",
+                            "",
+                            "Suggested starter queries:",
+                            "- SELECT key, length(value) AS len FROM _workspace_meta ORDER BY key;",
+                            "- SELECT node, meta_json FROM _node_meta ORDER BY node;",
+                            "- SELECT source, COUNT(*) AS n FROM _trace GROUP BY source ORDER BY n DESC;",
+                            "- SELECT id, node, source, error FROM _trace WHERE success = false ORDER BY id;",
+                            "- SELECT table_name FROM duckdb_tables() WHERE internal = false ORDER BY table_name;",
+                            "- SELECT view_name FROM duckdb_views() WHERE internal = false ORDER BY view_name;",
+                        ]
+                    )
+
+                    report_node = Node(
+                        name=report_node_name,
+                        prompt=report_prompt,
+                        output_columns={output_view: ["md"]},
+                        validate={
+                            "main": "\n".join(
+                                [
+                                    "WITH r AS (",
+                                    f"  SELECT COALESCE(md, '') AS md FROM {output_view} LIMIT 1",
+                                    ")",
+                                    "SELECT 'fail' AS status, 'Final report md is empty' AS message",
+                                    "WHERE (SELECT length(md) FROM r) < 200",
+                                    "UNION ALL",
+                                    "SELECT 'fail' AS status, 'Final report missing required headings' AS message",
+                                    "WHERE NOT EXISTS (",
+                                    "  SELECT 1 FROM r WHERE md ILIKE '%# Final Report%'",
+                                    ")",
+                                    "UNION ALL",
+                                    "SELECT 'pass' AS status, 'ok' AS message",
+                                    "WHERE (SELECT length(md) FROM r) >= 200",
+                                    "  AND EXISTS (SELECT 1 FROM r WHERE md ILIKE '%# Final Report%')",
+                                ]
+                            )
+                        },
+                    )
+
+                    report_start = time.time()
+                    report_result = await run_node_agent(
+                        conn,
+                        node=report_node,
+                        client=client,
+                        model=model,
+                        max_iterations=max(6, min(max_iterations, 30)),
+                    )
+                    report_elapsed = time.time() - report_start
+
+                    # Persist report node meta for audit.
+                    report_meta = {
+                        "node_type": "prompt",
+                        "depends_on": [],
+                        "iterations": report_result.iterations,
+                        "tool_calls": report_result.tool_calls_count,
+                        "elapsed_s": round(report_elapsed, 1),
+                        "validation": "PASSED" if report_result.success else "FAILED",
+                        "prompt_tokens": report_result.usage["prompt_tokens"],
+                        "completion_tokens": report_result.usage["completion_tokens"],
+                        "cache_read_tokens": report_result.usage["cache_read_tokens"],
+                        "reasoning_tokens": report_result.usage["reasoning_tokens"],
+                        "model": model,
+                        "report": True,
+                    }
+                    if not report_result.success:
+                        report_meta["error"] = report_result.final_message
+                    persist_node_meta(conn, report_node.name, report_meta)
+
+                    # Materialize report outputs for durability.
+                    materialize_node_outputs(conn, report_node)
+
+                    # Harvest markdown from the agent's final assistant message trace.
+                    # (The agent loop writes this as kind='assistant_final'.)
+                    md_text = ""
+                    trace_id: int | None = None
+                    try:
+                        row = conn.execute(
+                            """
+                            SELECT id, content
+                            FROM _trace
+                            WHERE node = ? AND kind = 'assistant_final'
+                            ORDER BY id DESC
+                            LIMIT 1
+                            """,
+                            [report_node.name],
+                        ).fetchone()
+                        if row:
+                            trace_id = int(row[0])
+                            md_text = str(row[1] or "")
+                    except Exception as e:
+                        final_report["error"] = str(e)
+
+                    # Fallback: read markdown from the report output relation.
+                    # (Kept for robustness if the trace row is missing.)
+                    if not md_text.strip():
+                        try:
+                            rows = conn.execute(
+                                f'SELECT CAST(md AS VARCHAR) AS md FROM "{output_view}" LIMIT 50'
+                            ).fetchall()
+                            md_parts = [
+                                str(r[0]) for r in rows if r and r[0] is not None
+                            ]
+                            md_text = "\n\n".join(p for p in md_parts if p.strip())
+                        except Exception as e:
+                            md_text = ""
+                            final_report["error"] = str(e)
+
+                    md_text = md_text.replace("\r\n", "\n").replace("\r", "\n")
+
+                    # Bound stored markdown (keep full text in DB relation).
+                    max_md = 1_000_000
+                    if len(md_text) > max_md:
+                        md_text = md_text[: max_md - 3] + "..."
+
+                    final_report.update(
+                        {
+                            "status": "ok" if report_result.success else "error",
+                            "model": model,
+                            "usage": dict(report_result.usage),
+                            "md": md_text,
+                            "error": final_report.get("error")
+                            or (
+                                None
+                                if report_result.success
+                                else report_result.final_message
+                            ),
+                            "node": report_node.name,
+                            "output_relation": output_view,
+                            "trace_id": trace_id,
+                        }
+                    )
+
+                upsert_workspace_meta(
+                    conn,
+                    [("final_report", json.dumps(final_report, sort_keys=True))],
+                )
+            except Exception as e:
+                log.warning("Failed to build reports: %s", e)
+                upsert_workspace_meta(conn, [("reporting_error", str(e))])
 
             elapsed_s = time.time() - start_time
 

@@ -247,6 +247,41 @@ class TestWorkspaceMeta:
         assert len(contexts["t"]) == 1000
 
 
+class TestReports:
+    def test_run_persists_final_report(self, tmp_path):
+        """Workspace.run persists a final report stub into _workspace_meta."""
+        nodes = [
+            _make_node(
+                name="data",
+                source=[{"x": 1}],
+                columns=["x"],
+                sql="",
+                prompt="",
+            ),
+            _make_node(
+                name="rpt",
+                depends_on=["data"],
+                sql="CREATE OR REPLACE VIEW rpt_report_md AS SELECT '# Hello' AS md",
+                prompt="",
+            ),
+        ]
+
+        out_db = tmp_path / "out.db"
+        ws = Workspace(db_path=out_db, nodes=nodes, exports={}, spec_module="tests")
+        result = asyncio.run(ws.run(model="m"))
+        assert result.success is True
+
+        conn = duckdb.connect(str(out_db), read_only=True)
+        try:
+            meta = read_workspace_meta(conn)
+            assert "final_report" in meta
+
+            final_report = json.loads(meta["final_report"])
+            assert final_report["status"] == "skipped"
+        finally:
+            conn.close()
+
+
 class TestMaterializeNodeOutputs:
     """Tests for materialize_node_outputs: view-to-table conversion."""
 

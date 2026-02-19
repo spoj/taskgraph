@@ -62,7 +62,9 @@ RULES:
 - Use CREATE OR REPLACE VIEW for outputs; namespace-prefix intermediates ({name}_*)
 - Do not create validation views ({name}__validation*); the system creates those separately
 - Batch independent run_sql calls in parallel to minimize rounds
-- When done, reply with a short message (no tool calls) to trigger validation
+- When done, reply with a completion note (no tool calls) to trigger validation.
+  Include: created/updated view names, key decisions, and any assumptions/warnings.
+  If the node prompt asks for a full report, comply.
 - If validation fails, you get feedback — fix and reply again
 
 MACROS:
@@ -475,6 +477,24 @@ async def run_node_agent(
     status = "PASSED" if result.success else "FAILED"
     elapsed_s = time.time() - start_time
     log.info("[%s] Validation: %s (%.1fs)", node.name, status, elapsed_s)
+
+    # Persist the agent's final assistant text as a trace event.
+    # This is valuable commentary for later inspection and is also used
+    # by the harness final report flow.
+    try:
+        log_trace(
+            conn,
+            "ASSISTANT_FINAL",
+            success=result.success,
+            kind="assistant_final",
+            content=result.final_message,
+            elapsed_ms=elapsed_s * 1000,
+            node_name=node.name,
+            source="assistant",
+        )
+    except Exception:
+        # Never fail a node due to reporting/trace persistence issues.
+        pass
 
     return result
 

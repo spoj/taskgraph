@@ -91,6 +91,28 @@ def accumulate_usage(total: dict[str, int], usage: dict[str, Any]) -> None:
     total["reasoning_tokens"] += completion_details.get("reasoning_tokens", 0)
 
 
+def _content_to_text(content: Any) -> str:
+    """Convert an assistant 'content' payload to plain text.
+
+    OpenRouter responses may return:
+    - a string
+    - a list of content blocks (e.g. [{type:'text', text:'...'}, ...])
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "".join(parts)
+    return str(content)
+
+
 async def run_agent_loop(
     call_model: ModelCallable,
     tool_executor: ToolExecutor,
@@ -201,6 +223,7 @@ async def run_agent_loop(
                 on_iteration(iteration, assistant_message, None)
 
             content = assistant_message.get("content", "")
+            content = _content_to_text(content)
 
             # Run validation if provided
             if validation_fn:
