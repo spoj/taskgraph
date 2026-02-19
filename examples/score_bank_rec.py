@@ -69,6 +69,7 @@ def read_solver_output(db_path: str) -> dict:
     solver_pairs: set[tuple[str, str]] = set()
     matched_view = None
     for candidate_view in [
+        "match_remaining_all_matched",
         "match_residual_all_matched",
         "match_hard_all_matched",
     ]:
@@ -83,7 +84,7 @@ def read_solver_output(db_path: str) -> dict:
             continue
     if matched_view is None:
         print(
-            "  WARNING: no matched-pairs view found (tried match_residual_all_matched, match_hard_all_matched)"
+            "  WARNING: no matched-pairs view found (tried match_remaining_all_matched, match_residual_all_matched, match_hard_all_matched)"
         )
     else:
         print(f"  Using matched-pairs view: {matched_view}")
