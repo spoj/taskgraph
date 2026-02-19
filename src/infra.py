@@ -178,6 +178,7 @@ def persist_workspace_meta(
     *,
     reasoning_effort: str | None = None,
     max_iterations: int | None = None,
+    max_concurrency: int | None = None,
     source_row_counts: dict[str, int] | None = None,
     spec_module: str | None = None,
 ) -> None:
@@ -211,6 +212,8 @@ def persist_workspace_meta(
         rows.append(("llm_reasoning_effort", reasoning_effort))
     if max_iterations is not None:
         rows.append(("llm_max_iterations", str(max_iterations)))
+    if max_concurrency is not None:
+        rows.append(("node_max_concurrency", str(max_concurrency)))
 
     if source_row_counts:
         source_schemas = {

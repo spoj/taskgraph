@@ -7,6 +7,7 @@ import pytest
 
 from tests.conftest import _make_node
 from src.agent import run_sql_node, log_trace, validate_node_complete
+from src.agent_loop import AgentResult
 from src.workspace import Workspace, persist_workspace_meta, read_workspace_meta
 from src.workspace import materialize_node_outputs
 
@@ -171,6 +172,33 @@ class TestWorkspaceValidateConfig:
         )
         with pytest.raises(ValueError, match="Graph validation failed"):
             ws._validate_config()
+
+
+class TestWorkspaceConcurrency:
+    def test_run_dag_respects_max_concurrency(self):
+        nodes = [_make_node(name=f"n{i}", sql="SELECT 1") for i in range(10)]
+
+        current = 0
+        max_seen = 0
+
+        async def run_one(node):
+            nonlocal current, max_seen
+            current += 1
+            max_seen = max(max_seen, current)
+            await asyncio.sleep(0.02)
+            current -= 1
+            return node.name, AgentResult(
+                success=True,
+                final_message="OK",
+                iterations=0,
+                messages=[],
+            )
+
+        results, ok = asyncio.run(Workspace._run_dag(nodes, run_one, max_concurrency=3))
+
+        assert ok is True
+        assert len(results) == 10
+        assert max_seen <= 3
 
 
 class TestWorkspaceMeta:

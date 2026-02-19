@@ -243,6 +243,8 @@ class Workspace:
     async def _run_dag(
         nodes: list[Node],
         run_one: Callable[[Node], Any],
+        *,
+        max_concurrency: int = 50,
     ) -> tuple[dict[str, AgentResult], bool]:
         """Schedule nodes as soon as their dependencies are met.
 
@@ -263,6 +265,16 @@ class Workspace:
         pending = set(node_by_name.keys())
         active: set[asyncio.Task] = set()
 
+        semaphore: asyncio.Semaphore | None = None
+        if max_concurrency is not None and max_concurrency > 0:
+            semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def _run_one_limited(node: Node) -> tuple[str, AgentResult]:
+            if semaphore is None:
+                return await run_one(node)
+            async with semaphore:
+                return await run_one(node)
+
         def launch_ready() -> None:
             newly_launched = []
             for name in list(pending):
@@ -272,7 +284,7 @@ class Workspace:
                     continue
                 if deps[name] <= done:
                     running.add(name)
-                    t = asyncio.create_task(run_one(node_by_name[name]))
+                    t = asyncio.create_task(_run_one_limited(node_by_name[name]))
                     active.add(t)
                     newly_launched.append(name)
             for name in newly_launched:
@@ -332,6 +344,7 @@ class Workspace:
         client: OpenRouterClient | None = None,
         model: str = DEFAULT_MODEL,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        max_concurrency: int = 50,
     ) -> WorkspaceResult:
         """Run the full workspace: resolve DAG, execute all nodes, export.
 
@@ -461,7 +474,11 @@ class Workspace:
 
                 return node.name, result
 
-            node_results, all_success = await self._run_dag(self.nodes, run_one)
+            node_results, all_success = await self._run_dag(
+                self.nodes,
+                run_one,
+                max_concurrency=max_concurrency,
+            )
 
             # Persist workspace metadata (after execution so we have row counts)
             persist_workspace_meta(
@@ -470,6 +487,7 @@ class Workspace:
                 nodes=self.nodes,
                 reasoning_effort=client.reasoning_effort if client else None,
                 max_iterations=max_iterations,
+                max_concurrency=max_concurrency,
                 source_row_counts=source_row_counts if source_row_counts else None,
                 spec_module=self.spec_module,
             )

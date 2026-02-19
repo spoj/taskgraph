@@ -434,6 +434,12 @@ def _format_node_tree(nodes: list[Node]) -> list[str]:
     type=int,
     help=f"Maximum agent iterations per node (default: {DEFAULT_MAX_ITERATIONS})",
 )
+@click.option(
+    "--max-concurrency",
+    default=50,
+    type=int,
+    help="Maximum concurrent running nodes (0 = unlimited)",
+)
 @click.option("--quiet", "-q", is_flag=True, help="Suppress verbose output")
 @click.option(
     "--force",
@@ -452,6 +458,7 @@ def run(
     output: Path | None,
     model: str,
     max_iterations: int,
+    max_concurrency: int,
     quiet: bool,
     force: bool,
     reasoning_effort: str | None,
@@ -512,6 +519,7 @@ def run(
     log.info("Spec: %s", spec)
     log.info("Output: %s", output)
     log.info("Model: %s", model)
+    log.info("Max concurrency: %s", max_concurrency)
     log.info(
         "Nodes: %d (%d sources, %d transforms)",
         len(nodes),
@@ -544,10 +552,12 @@ def run(
                     client=client,
                     model=model,
                     max_iterations=max_iterations,
+                    max_concurrency=max_concurrency,
                 )
         return await workspace.run(
             model=model,
             max_iterations=max_iterations,
+            max_concurrency=max_concurrency,
         )
 
     result = asyncio.run(_run())
