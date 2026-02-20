@@ -26,8 +26,8 @@ import time
 from dataclasses import dataclass, field
 from itertools import combinations
 
-from examples.bank_rec_generator import generate, verify
-from examples.score_bank_rec import flatten_truth, print_report, score
+from examples.bank_rec.generator import generate, verify
+from examples.bank_rec.score import flatten_truth, print_report, score
 
 
 # ---------------------------------------------------------------------------

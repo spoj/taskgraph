@@ -16,7 +16,7 @@ import sys
 
 import duckdb
 
-from examples.bank_rec_generator import generate, verify
+from examples.bank_rec.generator import generate, verify
 
 
 def flatten_truth(gt: dict) -> dict:

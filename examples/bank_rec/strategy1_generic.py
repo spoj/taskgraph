@@ -3,7 +3,7 @@ import argparse
 from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass
-from examples.score_bank_rec import score, print_report, flatten_truth
+from examples.bank_rec.score import score, print_report, flatten_truth
 
 @dataclass
 class Match:

@@ -1,6 +1,6 @@
 import json
 from datetime import datetime
-from examples.bank_rec_v4 import NODES as V4_NODES
+from examples.bank_rec.strategy3_hybrid_v4 import NODES as V4_NODES
 
 def load_bank():
     with open("dataset.json") as f:

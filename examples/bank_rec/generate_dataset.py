@@ -1,6 +1,6 @@
 import json
 import argparse
-from examples.bank_rec_generator import generate
+from examples.bank_rec.generator import generate
 
 def main():
     parser = argparse.ArgumentParser()

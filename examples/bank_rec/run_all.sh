@@ -26,7 +26,7 @@ rm -f hybrid.db
 uv run python ../../scripts/cli.py run --spec strategy3_hybrid.py -o hybrid.db
 # Evaluate using custom query script or the generic scorer
 # Wait, score_bank_rec.py expects the GT to be generated via arguments. We will just use the standard scorer but feed it the seed:
-uv run python ../score_bank_rec.py hybrid.db --n 1000 --seed 123 --difficulty hard
+uv run python score.py hybrid.db --n 1000 --seed 123 --difficulty hard
 
 echo ""
 echo "=========================================================="
@@ -37,13 +37,13 @@ echo "Strategy 4: V6 Hybrid TaskGraph (SQL Fuzzy + LLM)"
 echo "=========================================================="
 rm -f hybrid_v6.db
 uv run python ../../scripts/cli.py run --spec strategy6_hybrid_v6.py -o hybrid_v6.db
-uv run python ../score_bank_rec.py hybrid_v6.db --n 1000 --seed 123 --difficulty hard
+uv run python score.py hybrid_v6.db --n 1000 --seed 123 --difficulty hard
 
 echo "Strategy 5: Pure Prompt TaskGraph"
 echo "=========================================================="
 rm -f pure_prompt.db
 uv run python ../../scripts/cli.py run --spec strategy4_pure_prompt.py -o pure_prompt.db
-uv run python ../score_bank_rec.py pure_prompt.db --n 1000 --seed 123 --difficulty hard
+uv run python score.py pure_prompt.db --n 1000 --seed 123 --difficulty hard
 
 echo ""
 echo "=========================================================="

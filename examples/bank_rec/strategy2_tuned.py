@@ -3,8 +3,8 @@ import argparse
 from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass
-from examples.score_bank_rec import score, print_report, flatten_truth
-from examples.solve_bank_rec import solve, Match
+from examples.bank_rec.score import score, print_report, flatten_truth
+from examples.bank_rec.solve import solve, Match
 
 def main():
     parser = argparse.ArgumentParser()
