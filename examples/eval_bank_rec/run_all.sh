@@ -30,7 +30,16 @@ uv run python ../score_bank_rec.py hybrid.db --n 1000 --seed 123 --difficulty ha
 
 echo ""
 echo "=========================================================="
-echo "Strategy 4: Pure Prompt TaskGraph"
+
+echo ""
+echo "=========================================================="
+echo "Strategy 4: V6 Hybrid TaskGraph (SQL Fuzzy + LLM)"
+echo "=========================================================="
+rm -f hybrid_v6.db
+uv run python ../../scripts/cli.py run --spec strategy6_hybrid_v6.py -o hybrid_v6.db
+uv run python ../score_bank_rec.py hybrid_v6.db --n 1000 --seed 123 --difficulty hard
+
+echo "Strategy 5: Pure Prompt TaskGraph"
 echo "=========================================================="
 rm -f pure_prompt.db
 uv run python ../../scripts/cli.py run --spec strategy4_pure_prompt.py -o pure_prompt.db
@@ -38,7 +47,7 @@ uv run python ../score_bank_rec.py pure_prompt.db --n 1000 --seed 123 --difficul
 
 echo ""
 echo "=========================================================="
-echo "Strategy 5: Ablation (SQL Only, No LLM)"
+echo "Strategy 6: Ablation (SQL Only, No LLM)"
 echo "=========================================================="
 rm -f sql_only.db
 uv run python ../../scripts/cli.py run --spec strategy5_sql_only.py -o sql_only.db

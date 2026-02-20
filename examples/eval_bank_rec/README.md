@@ -2,7 +2,7 @@
 
 This directory contains a suite of experiments to evaluate different approaches to solving the Bank Reconciliation problem using `taskgraph`. 
 
-We evaluate 4 distinct strategies, ranging from rigid Python heuristics to pure LLM zero-shot prompts.
+We evaluate 6 distinct strategies, ranging from rigid Python heuristics to pure LLM zero-shot prompts.
 
 ## The Problem
 We use `generate_dataset.py` to generate a `dataset.json` of 1,000 transactions at `hard` difficulty.
@@ -18,7 +18,7 @@ This dataset includes:
 
 ## How to Run
 
-Execute the `run_all.sh` script to generate a fresh dataset and run all 5 experiments sequentially. Be warned that the TaskGraph strategies will use your default LLM and may take a few minutes each.
+Execute the `run_all.sh` script to generate a fresh dataset and run all 6 experiments sequentially. Be warned that the TaskGraph strategies will use your default LLM and may take a few minutes each.
 
 ```bash
 bash run_all.sh
@@ -38,7 +38,11 @@ bash run_all.sh
 - **Approach**: A TaskGraph pipeline (`bank_rec_v4.py`) that uses strict, highly accurate SQL nodes to solve the deterministic parts of the problem (exact matches, check numbers, batching). It then funnels the ambiguous leftovers (typos, mismatches, transpositions) into a single LLM prompt node to resolve using zero-shot fuzzy reasoning.
 - **Result**: F1 ~83%. The best balance of robustness and generalizability. It scored practically the same as the hand-tuned Python script but without requiring a massive catalogue of regexes for different vendor formats. The LLM was excellent at identifying 1:1 matches even when the descriptions were severely mangled.
 
-### 4. Strategy 4: Pure Prompt TaskGraph (`strategy4_pure_prompt.py`)
+### 4. Strategy 4: V6 Hybrid TaskGraph (`strategy6_hybrid_v6.py`)
+- **Approach**: An iteration on Strategy 3 designed specifically to handle extreme noise. Adds two new SQL heuristics to unburden the LLM: (1) Jaro-Winkler string similarity for 1:1 matches (recovers typos automatically), and (2) a secondary batching pass that purely sums pairs of close-proximity GL amounts regardless of vendor name (recovers typo'd batch entries).
+- **Result**: F1 ~93%. (Precision: 99.3%, Recall: 87.2%). By absorbing the simple typo correction into deterministic fuzzy-SQL, the LLM is left with a much smaller, denser set of true edge cases (fee mismatches and complex transposition errors). The LLM handles these flawlessly, boosting recall massively without tanking precision.
+
+### 5. Strategy 5: Pure Prompt TaskGraph (`strategy4_pure_prompt.py`)
 - **Approach**: An entirely LLM-driven approach. The LLM is provided the schemas and asked to write raw DuckDB SQL to perform the reconciliation autonomously, guided by high-level plain English rules.
 - **Result**: F1 ~79%. Surprisingly competent. The LLM successfully crafted SQL queries using `UPPER` and `LIKE` string matching that recovered the vast majority of 1:1 matches. However, it struggled with the combinatorial logic needed to discover multi-row batch deposits (recovering <10% of them). 
 
