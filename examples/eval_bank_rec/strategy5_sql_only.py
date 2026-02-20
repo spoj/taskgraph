@@ -1,0 +1,49 @@
+import json
+from datetime import datetime
+from examples.bank_rec_v4 import NODES as V4_NODES
+
+def load_bank():
+    with open("dataset.json") as f:
+        data = json.load(f)["bank_transactions"]
+        for row in data:
+            row["date"] = datetime.strptime(row["date"], "%Y-%m-%d").date()
+        return data
+
+def load_gl():
+    with open("dataset.json") as f:
+        data = json.load(f)["gl_entries"]
+        for row in data:
+            row["date"] = datetime.strptime(row["date"], "%Y-%m-%d").date()
+        return data
+
+REPORT_SQL = """
+CREATE VIEW report_matched AS
+SELECT * FROM match_certain_matched
+UNION ALL
+SELECT * FROM batch_match_matched;
+
+CREATE VIEW report_unmatched_bank AS
+SELECT * FROM batch_match_remaining_bank;
+
+CREATE VIEW report_unmatched_gl AS
+SELECT * FROM batch_match_remaining_gl;
+
+CREATE VIEW report_summary AS
+SELECT
+    (SELECT count(*) FROM match_certain_matched) AS certain_matches,
+    (SELECT count(*) FROM batch_match_matched) AS batch_matches,
+    (SELECT count(*) FROM report_unmatched_bank) AS unmatched_bank,
+    (SELECT count(*) FROM report_unmatched_gl) AS unmatched_gl;
+"""
+
+sql_nodes = [n for n in V4_NODES if n["name"] not in ("bank_txns", "gl_entries", "match_residual", "report")]
+sql_nodes.append({
+    "name": "report",
+    "sql": REPORT_SQL,
+    "depends_on": ["features", "batch_match", "offsetting"]
+})
+
+NODES = [
+    {"name": "bank_txns", "source": load_bank},
+    {"name": "gl_entries", "source": load_gl},
+] + sql_nodes

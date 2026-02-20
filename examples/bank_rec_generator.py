@@ -216,6 +216,8 @@ _CATEGORIES = {
     "credit_card": {"sign": -1, "lo": 3_000, "hi": 60_000},
     "customer_payment": {"sign": 1, "lo": 1_000, "hi": 300_000},
     "refund": {"sign": 1, "lo": 100, "hi": 10_000},
+    "marketing": {"sign": -1, "lo": 500, "hi": 50_000},
+    "legal": {"sign": -1, "lo": 1_000, "hi": 100_000},
 }
 
 _CATEGORY_WEIGHTS = {
@@ -232,18 +234,37 @@ _CATEGORY_WEIGHTS = {
     "credit_card": 3,
     "customer_payment": 30,
     "refund": 3,
+    "marketing": 8,
+    "legal": 5,
 }
 
 # Bank-side cryptic description templates (by category)
 _CRYPTIC_TEMPLATES = {
-    "supplies": ["AMZN MKTP US*{code} AMZN.CO", "AMZN MKTP US*{code}"],
+    "supplies": [
+        "AMZN MKTP US*{code} AMZN.CO",
+        "AMZN MKTP US*{code}",
+        "TST* AMAZON {code} AWS",
+        "SQ *{product} {code}",
+    ],
     "subscription": [
         "MSFT *{product} {ref}",
         "GOOG *{product} {ref}",
         "INTUIT *{product}",
     ],
-    "payroll": ["ADP TOFCPYRL {date_code} XXXXXX{last4}"],
-    "travel": ["DELTA AIR {ref}", "UNITED {ref}", "AA {ref}"],
+    "payroll": [
+        "ADP TOFCPYRL {date_code} XXXXXX{last4}",
+        "PAYCHEX E-PAY {ref}",
+        "GUSTO PAY {date_code}",
+    ],
+    "travel": [
+        "DELTA AIR {ref}",
+        "UNITED {ref}",
+        "AA {ref}",
+        "UBER   *TRIP {ref}",
+        "LYFT   *RIDE {ref}",
+    ],
+    "utilities": ["PG&E WEBPMT {ref}", "AT&T *PAYMENT {ref}", "COMCAST CABLE {ref}"],
+    "insurance": ["STATE FARM RO {ref}", "GEICO *PAYMENT {ref}"],
 }
 
 _DETAIL_PHRASES = {
@@ -279,6 +300,13 @@ _DETAIL_PHRASES = {
         "Service fee",
     ],
     "refund": ["Credit memo", "Returned goods", "Overpayment refund"],
+    "marketing": [
+        "Ad campaign",
+        "Social media marketing",
+        "SEO services",
+        "Billboard advertising",
+    ],
+    "legal": ["Litigation retainer", "Contract review", "Trademark registration"],
 }
 
 _UNMATCHED_BANK_TYPES = [
@@ -288,6 +316,8 @@ _UNMATCHED_BANK_TYPES = [
     ("MONTHLY MAINTENANCE FEE", -10, -50),
     ("ANALYSIS CHARGE", -20, -100),
     ("FOREIGN TXN FEE", -5, -25),
+    ("RETURNED ITEM FEE", -15, -35),
+    ("OVERDRAFT FEE", -35, -35),
 ]
 
 
@@ -325,6 +355,7 @@ class DifficultyProfile:
     date_shift_frac: float = 0.30  # fraction where bank date != GL date
     cryptic_desc_frac: float = 0.15  # fraction with cryptic bank desc
     truncated_desc_frac: float = 0.20  # fraction with truncated bank desc
+    typo_frac: float = 0.0  # fraction of GL descriptions with typos
 
     # --- Batch deposit sizing (capped at 5: solver uses brute-force
     #     k-way joins so k>5 is combinatorially infeasible) ---
@@ -353,9 +384,30 @@ EASY = DifficultyProfile(
     truncated_desc_frac=0.10,
     batch_size_min=2,
     batch_size_max=2,
+    typo_frac=0.0,
 )
 
-MEDIUM = DifficultyProfile()  # defaults: batch_size_max=3
+MEDIUM = DifficultyProfile(
+    simple=0.65,
+    batch_deposit=0.03,
+    void_reissue=0.02,
+    self_correcting=0.02,
+    nsf_return=0.02,
+    amount_mismatch=0.02,
+    dup_vendor_pmt=0.02,
+    unmatched_bank=0.02,
+    unmatched_gl=0.02,
+    offsetting_gl=0.02,
+    dup_amount_frac=0.15,
+    same_amt_date_frac=0.04,
+    prior_period_frac=0.03,
+    date_shift_frac=0.25,
+    cryptic_desc_frac=0.15,
+    truncated_desc_frac=0.20,
+    typo_frac=0.05,
+    batch_size_min=2,
+    batch_size_max=3,
+)
 
 HARD = DifficultyProfile(
     simple=0.42,
@@ -376,6 +428,7 @@ HARD = DifficultyProfile(
     truncated_desc_frac=0.30,
     batch_size_min=2,
     batch_size_max=5,
+    typo_frac=0.15,
 )
 
 
@@ -510,17 +563,29 @@ class _Generator:
             log_hi = math.log(max(hi, 2))
             raw = math.exp(self.rng.uniform(log_lo, log_hi))
             # Round to realistic precision
-            if raw >= 10_000:
-                val = round(raw / 100) * 100.0
-            elif raw >= 1_000:
-                val = round(raw / 10) * 10.0
-            elif raw >= 100:
-                val = round(raw, 0)
+            r = self.rng.random()
+            if r < 0.2:
+                # Flat hundred/thousand
+                if raw >= 1000:
+                    val = round(raw / 100) * 100.0
+                else:
+                    val = round(raw / 10) * 10.0
+            elif r < 0.4:
+                # Ending in .99 or .50
+                val = (
+                    round(raw) - 0.01 if self.rng.random() < 0.5 else round(raw) + 0.50
+                )
             else:
+                # Random cents
                 val = round(raw, 2)
             if not unique or val not in self._used_amounts:
                 self._used_amounts.add(val)
                 return val * sign
+        # fallback with cents
+        val = round(self.rng.uniform(lo, hi), 2)
+        self._used_amounts.add(val)
+        return val * sign
+
         # fallback with cents
         val = round(self.rng.uniform(lo, hi), 2)
         self._used_amounts.add(val)
@@ -536,8 +601,15 @@ class _Generator:
         days = self._month_days if (m == self.month and y == self.year) else 28
         return date(y, m, self.rng.randint(1, days))
 
-    def _shift(self, d: date, lo: int = 1, hi: int = 5) -> date:
-        return d + timedelta(days=self.rng.randint(lo, hi))
+    def _shift_weekdays(self, d: date, lo: int, hi: int) -> date:
+        shift = self.rng.randint(lo, hi)
+        target = d + timedelta(days=shift)
+        # push forward if it lands on weekend
+        if target.weekday() == 5:  # Saturday
+            target += timedelta(days=2)
+        elif target.weekday() == 6:  # Sunday
+            target += timedelta(days=1)
+        return target
 
     def _clamp_to_month(self, d: date) -> date:
         """Clamp a date to the target month."""
@@ -574,10 +646,17 @@ class _Generator:
                 return c
             style = "standard"
 
-        prefix = "ACH CREDIT" if is_credit else "ACH DEBIT"
+        prefix = (
+            "ACH CREDIT"
+            if is_credit
+            else self.rng.choice(["ACH DEBIT", "POS DEBIT", "E-PAYMENT", "AUTO-PAY"])
+        )
         if style == "truncated":
             trunc_len = self.rng.randint(12, 20)
-            return f"{prefix} {short[:trunc_len].rstrip()}"
+            base = short[:trunc_len].rstrip()
+            if self.rng.random() < 0.3:
+                base = base.replace(" ", "")
+            return f"{prefix} {base}"
         return f"{prefix} {short}"
 
     def _cryptic(self, category: str) -> str | None:
@@ -607,7 +686,21 @@ class _Generator:
         detail = self.rng.choice(_DETAIL_PHRASES.get(category, ["Payment"]))
         inv = self._ref("INV")
         mo = date(self.year, self.month, 1).strftime("%B %Y")
-        return f"{full} - {detail}, {inv}, {mo}"
+        desc = f"{full} - {detail}, {inv}, {mo}"
+        if (
+            getattr(self.p, "typo_frac", 0.0) > 0
+            and self.rng.random() < self.p.typo_frac
+        ):
+            if len(desc) > 10:
+                chars = list(desc)
+                idx = self.rng.randint(0, len(full) - 1)
+                if self.rng.random() < 0.5:
+                    chars.pop(idx)
+                else:
+                    if idx < len(chars) - 1:
+                        chars[idx], chars[idx + 1] = chars[idx + 1], chars[idx]
+                desc = "".join(chars)
+        return desc
 
     def _gl_ref(self, category: str, is_credit: bool = False) -> str:
         if is_credit or category in ("customer_payment", "refund"):
@@ -656,12 +749,18 @@ class _Generator:
         if gl_date is None:
             gl_date = self._date()
         if bank_date is None:
+            is_check = not is_credit and self.rng.random() < 0.3
             if self.rng.random() < self.p.date_shift_frac:
-                bank_date = self._clamp_to_month(self._shift(gl_date, 1, 5))
+                if is_check:
+                    bank_date = self._clamp_to_month(
+                        self._shift_weekdays(gl_date, 3, 14)
+                    )
+                else:
+                    bank_date = self._clamp_to_month(
+                        self._shift_weekdays(gl_date, 1, 4)
+                    )
             else:
-                bank_date = self._clamp_to_month(
-                    gl_date + timedelta(days=self.rng.randint(0, 1))
-                )
+                bank_date = self._clamp_to_month(self._shift_weekdays(gl_date, 0, 1))
 
         bdesc = self._bank_desc(short, cat, is_credit)
         gdesc = self._gl_desc(full, cat)
@@ -678,41 +777,40 @@ class _Generator:
         return b, g
 
     def _gen_batch_deposit(self):
-        """1 bank deposit = sum of K GL entries from the SAME customer.
+        """1 bank record = sum of K GL entries from the SAME vendor/customer.
 
-        Models the common B2B scenario where one customer sends a single
-        payment (wire / ACH) covering multiple invoices.  The bank records
-        one credit with the customer name; the GL records one AR entry per
-        invoice, all for the same vendor.
+        Models the common B2B scenario where a single payment covers
+        multiple invoices. Can be a batch deposit (AR) or batch payment (AP).
         """
         k = self.rng.randint(self.p.batch_size_min, self.p.batch_size_max)
-        # Pick a base date, then cluster GL entries within a few days before it.
-        # Bank deposit date = base + 0-2 days (the clearing lag).
         base = self._date()
 
-        # One vendor for the whole batch — customer paying multiple invoices
-        v = self._vendor("customer_payment")
+        is_deposit = self.rng.random() < 0.5
+        cat = "customer_payment" if is_deposit else "professional_svc"
+        v = self._vendor(cat)
         full, short, cat = v
 
         gl_recs = []
         total = 0.0
         for _ in range(k):
-            amt = abs(self._amount("customer_payment"))
+            amt = abs(self._amount(cat))
+            if not is_deposit:
+                amt = -amt
             total += amt
             # GL dates cluster within 0-5 days *before* the base date
-            gd = self._clamp_to_month(base - timedelta(days=self.rng.randint(0, 5)))
+            gd = self._clamp_to_month(self._shift_weekdays(base, -5, 0))
             g = self._grec(
                 gd,
-                self._gl_desc(full, "customer_payment"),
+                self._gl_desc(full, cat),
                 amt,
-                self._gl_ref("customer_payment", True),
+                self._gl_ref(cat, is_credit=is_deposit),
             )
             gl_recs.append(g)
             self._gl.append(g)
 
         total = round(total, 2)
-        bd = self._clamp_to_month(base + timedelta(days=self.rng.randint(0, 2)))
-        bdesc = self._bank_desc(short, cat, is_credit=True)
+        bd = self._clamp_to_month(self._shift_weekdays(base, 0, 2))
+        bdesc = self._bank_desc(short, cat, is_credit=is_deposit)
         b = self._brec(bd, bdesc, total)
         self._bank.append(b)
         self._mm.append(
@@ -721,7 +819,7 @@ class _Generator:
                 "gl_ids": [g["id"] for g in gl_recs],
                 "bank_amount": total,
                 "gl_amounts": {g["id"]: g["amount"] for g in gl_recs},
-                "note": f"Batch deposit: {k} payments totalling ${total:,.2f}",
+                "note": f"Batch {'deposit' if is_deposit else 'payment'}: {k} items totalling ${abs(total):,.2f}",
             }
         )
 
@@ -885,19 +983,48 @@ class _Generator:
         )
 
     def _gen_amount_mismatch(self):
-        """Wire with small fee netted on GL side."""
+        """Wire with small fee netted on GL side, OR a transposition error."""
         v = self._vendor("customer_payment")
-        full, short, _ = v
-        bank_amt = abs(self._amount("customer_payment"))
-        fee = round(self.rng.uniform(10, 50), 2)
-        gl_amt = round(bank_amt - fee, 2)
-        gd = self._date()
-        bd = self._clamp_to_month(gd + timedelta(days=self.rng.randint(0, 2)))
+        full, short, cat = v
 
+        if self.rng.random() < 0.5:
+            # Fee mismatch
+            bank_amt = abs(self._amount(cat))
+            fee = round(self.rng.uniform(10, 50), 2)
+            gl_amt = round(bank_amt - fee, 2)
+            diff = fee
+            note_str = f"Wire from {full}: bank ${bank_amt:,.2f} vs GL ${gl_amt:,.2f} (${fee:.2f} fee)"
+        else:
+            # Transposition error mismatch
+            gl_amt = self._amount(cat)
+
+            # Generate transposed bank_amt
+            s = f"{abs(gl_amt):.2f}"
+            chars = list(s)
+            valid_indices = [
+                i
+                for i in range(len(chars) - 1)
+                if chars[i] != "." and chars[i + 1] != "." and chars[i] != chars[i + 1]
+            ]
+            if valid_indices:
+                idx = self.rng.choice(valid_indices)
+                chars[idx], chars[idx + 1] = chars[idx + 1], chars[idx]
+            new_amt = float("".join(chars))
+            bank_amt = new_amt if gl_amt >= 0 else -new_amt
+
+            diff = round(bank_amt - gl_amt, 2)
+            note_str = (
+                f"Transposition from {full}: bank ${bank_amt:,.2f} vs GL ${gl_amt:,.2f}"
+            )
+
+        gd = self._date()
+        bd = self._clamp_to_month(self._shift_weekdays(gd, 0, 3))
+
+        is_credit = bank_amt > 0
         wref = self.rng.randint(1_000_000, 9_999_999)
         g = self._grec(
             gd,
-            f"{full} - Customer payment (net of ${fee:.2f} wire fee)",
+            f"{full} - Customer payment, {self._ref('AR')}",
             gl_amt,
             self._ref("AR"),
         )
@@ -910,8 +1037,8 @@ class _Generator:
                 "gl_id": g["id"],
                 "bank_amount": bank_amt,
                 "gl_amount": gl_amt,
-                "difference": fee,
-                "note": f"Wire from {full}: bank ${bank_amt:,.2f} vs GL ${gl_amt:,.2f} (${fee:.2f} fee)",
+                "difference": diff,
+                "note": note_str,
             }
         )
 
