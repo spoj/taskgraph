@@ -20,35 +20,32 @@ uv run python strategy2_tuned.py --dataset dataset.json
 
 echo ""
 echo "=========================================================="
-echo "Strategy 3: Hybrid TaskGraph (SQL + LLM)"
+echo "Strategy 3: Hybrid TaskGraph v4 (Older baseline)"
 echo "=========================================================="
-rm -f hybrid.db
-uv run python ../../scripts/cli.py run --spec strategy3_hybrid.py -o hybrid.db
-# Evaluate using custom query script or the generic scorer
-# Wait, score_bank_rec.py expects the GT to be generated via arguments. We will just use the standard scorer but feed it the seed:
-uv run python score.py hybrid.db --n 1000 --seed 123 --difficulty hard
+rm -f runs/hybrid_v4.db
+uv run python ../../scripts/cli.py run --spec run_hybrid_v4.py -o runs/hybrid_v4.db
+uv run python score.py runs/hybrid_v4.db --n 1000 --seed 123 --difficulty hard
 
 echo ""
 echo "=========================================================="
+echo "Strategy 4: Hybrid TaskGraph (Current SOTA)"
+echo "=========================================================="
+rm -f runs/hybrid.db
+uv run python ../../scripts/cli.py run --spec run_hybrid.py -o runs/hybrid.db
+uv run python score.py runs/hybrid.db --n 1000 --seed 123 --difficulty hard
 
 echo ""
 echo "=========================================================="
-echo "Strategy 4: V6 Hybrid TaskGraph (SQL Fuzzy + LLM)"
-echo "=========================================================="
-rm -f hybrid_v6.db
-uv run python ../../scripts/cli.py run --spec strategy6_hybrid_v6.py -o hybrid_v6.db
-uv run python score.py hybrid_v6.db --n 1000 --seed 123 --difficulty hard
-
 echo "Strategy 5: Pure Prompt TaskGraph"
 echo "=========================================================="
-rm -f pure_prompt.db
-uv run python ../../scripts/cli.py run --spec strategy4_pure_prompt.py -o pure_prompt.db
-uv run python score.py pure_prompt.db --n 1000 --seed 123 --difficulty hard
+rm -f runs/pure_prompt.db
+uv run python ../../scripts/cli.py run --spec strategy5_pure_prompt.py -o runs/pure_prompt.db
+uv run python score.py runs/pure_prompt.db --n 1000 --seed 123 --difficulty hard
 
 echo ""
 echo "=========================================================="
 echo "Strategy 6: Ablation (SQL Only, No LLM)"
 echo "=========================================================="
-rm -f sql_only.db
-uv run python ../../scripts/cli.py run --spec strategy5_sql_only.py -o sql_only.db
-uv run python score_sql_only.py
+rm -f runs/sql_only.db
+uv run python ../../scripts/cli.py run --spec strategy6_sql_only.py -o runs/sql_only.db
+uv run python score_sql_only.py runs/sql_only.db

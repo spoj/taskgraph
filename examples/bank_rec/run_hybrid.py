@@ -1,6 +1,6 @@
 import json
 from datetime import datetime
-from examples.bank_rec.strategy6_hybrid_v6 import NODES as V6_NODES
+from examples.bank_rec.strategy4_hybrid import NODES as HYBRID_NODES
 
 def load_bank():
     with open("dataset.json") as f:
@@ -19,4 +19,4 @@ def load_gl():
 NODES = [
     {"name": "bank_txns", "source": load_bank},
     {"name": "gl_entries", "source": load_gl},
-] + [n for n in V6_NODES if n["name"] not in ("bank_txns", "gl_entries")]
+] + [n for n in HYBRID_NODES if n["name"] not in ("bank_txns", "gl_entries")]

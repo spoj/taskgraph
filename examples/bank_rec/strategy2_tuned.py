@@ -4,7 +4,7 @@ from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass
 from examples.bank_rec.score import score, print_report, flatten_truth
-from examples.bank_rec.solve import solve, Match
+from examples.bank_rec.strategy2a_tuned_detailed import solve, Match
 
 def main():
     parser = argparse.ArgumentParser()

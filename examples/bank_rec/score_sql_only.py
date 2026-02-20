@@ -6,7 +6,7 @@ def main():
     with open("dataset.json") as f:
         gt = json.load(f)["ground_truth"]
 
-    conn = duckdb.connect("sql_only.db", read_only=True)
+    import sys; db_path = sys.argv[1] if len(sys.argv) > 1 else "runs/sql_only.db"; conn = duckdb.connect(db_path, read_only=True)
     rows = conn.execute("SELECT bank_id, gl_id FROM report_matched").fetchall()
     solver_pairs = {(r[0], r[1]) for r in rows}
 
