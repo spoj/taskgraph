@@ -649,12 +649,14 @@ MATCHING STRATEGIES (apply in order of confidence):
    the SQL batch node matched the full group but there may be remaining entities
    with GL entries that don't sum to any single bank deposit. Try finding subsets
    of GL entries from the same entity that sum to a bank deposit amount.
-   Use starts_with(gl_entity, bank_entity) for prefix matching.
+   Use `starts_with(gl_entity, bank_entity) OR jaro_winkler_similarity(gl_entity, bank_entity) > 0.85`
+   to account for typos in vendor names.
 
 2) TOLERANCE: Wire transfers commonly incur fees ($10-$75 typical), causing the
-   bank amount to slightly exceed the GL amount. Match by entity-prefix where
+   bank amount to slightly exceed the GL amount. Match by fuzzy-entity where
    amounts differ by up to $100. Use abs(bank_amount - gl_amount) <= 100 as
    the threshold — do NOT use a smaller cutoff like $25 or $50.
+   Also use `jaro_winkler_similarity > 0.85` here to catch typos.
    For non-entity matches, use a very small tolerance (< $5) only.
 
 3) EXTREME OBFUSCATION (MANUAL MAPPING): When the candidate pool is very small
