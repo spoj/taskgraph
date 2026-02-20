@@ -37,3 +37,4 @@ report.csv
 # OS
 .DS_Store
 Thumbs.db
+examples/bank_rec/dataset.json
