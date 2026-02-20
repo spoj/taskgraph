@@ -341,6 +341,50 @@ def solve(bank_raw: list[dict], gl_raw: list[dict]) -> dict:
         elif bank_cand_count.get(bid, 0) == 1 or gl_cand_count.get(gid, 0) == 1:
             _add_match(bid, gid, "exact_1to1")
 
+
+
+
+
+
+    # -----------------------------------------------------------------------
+    # Pass 2b: Chronological Series (Weekly Recurring)
+    # -----------------------------------------------------------------------
+    
+    import difflib
+    def _sim(s1, s2):
+        return difflib.SequenceMatcher(None, s1, s2).ratio()
+
+    from collections import defaultdict
+    series_candidates = defaultdict(lambda: ([], []))
+    
+    for b in bank:
+        if b.id in matched_bank: continue
+        if len(b.entity_norm) < 4: continue
+        for g in gl:
+            if g.id in matched_gl: continue
+            if len(g.entity_norm) < 4: continue
+            if b.amount == g.amount:
+                date_gap = _date_diff(b.date, g.date)
+                if date_gap <= 15:
+                    if _starts_with(g.entity_norm, b.entity_norm) or _sim(b.entity_norm, g.entity_norm) > 0.80:
+                        b_pfx = b.entity_norm[:6]
+                        g_pfx = g.entity_norm[:6]
+                        if b_pfx == g_pfx:
+                            key = (b.amount, b_pfx)
+                            if b not in series_candidates[key][0]: series_candidates[key][0].append(b)
+                            if g not in series_candidates[key][1]: series_candidates[key][1].append(g)
+
+    for (amt, pfx), (b_list, g_list) in series_candidates.items():
+        if len(b_list) > 1 and len(b_list) == len(g_list):
+            b_list.sort(key=lambda x: (x.date, x.id))
+            g_list.sort(key=lambda x: (x.date, x.id))
+            
+            for i in range(len(b_list)):
+                bid = b_list[i].id
+                gid = g_list[i].id
+                if bid not in matched_bank and gid not in matched_gl:
+                    _add_match(bid, gid, "series_chronological", f"Chronological rank {i+1}")
+
     # -----------------------------------------------------------------------
     # Pass 3: Generic DEPOSIT / NSF pairing
     # -----------------------------------------------------------------------
@@ -776,6 +820,39 @@ def solve(bank_raw: list[dict], gl_raw: list[dict]) -> dict:
             )
             tol_bank_used.add(bid)
             tol_gl_used.add(gid)
+
+
+
+    # -----------------------------------------------------------------------
+    # Pass 8: Exact Amount + Closest Date (Fallback)
+    # -----------------------------------------------------------------------
+    
+    remaining_bank8 = [b for b in bank if b.id not in matched_bank]
+    remaining_gl8 = [g for g in gl if g.id not in matched_gl and g.id not in offset_gl]
+
+    exact_candidates = []
+    for b in remaining_bank8:
+        for g in remaining_gl8:
+            if b.amount == g.amount:
+                date_gap = _date_diff(b.date, g.date)
+                if date_gap <= 15:
+                    exact_candidates.append((b.id, g.id, date_gap))
+                    
+    exact_candidates.sort(key=lambda x: (x[2], x[0], x[1]))
+    
+    b_used = set()
+    g_used = set()
+    
+    # Simple greedy assignment
+    for bid, gid, date_gap in exact_candidates:
+        if bid in b_used or gid in g_used: continue
+        if bid in matched_bank or gid in matched_gl: continue
+        
+        # Ensure unambiguous (only one best candidate for this amount and date gap)
+        # We can just be greedy because they are sorted by date gap
+        _add_match(bid, gid, "exact_amount_closest_date", f"Exact amount + closest date gap {date_gap}d")
+        b_used.add(bid)
+        g_used.add(gid)
 
     # -----------------------------------------------------------------------
     # Build results
