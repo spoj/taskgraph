@@ -136,8 +136,8 @@ gl_counts AS (
 ),
 ranked AS (
     SELECT c.*,
-        ROW_NUMBER() OVER (PARTITION BY c.bank_id ORDER BY c.date_gap, c.bank_ent_len DESC) AS b_rank,
-        ROW_NUMBER() OVER (PARTITION BY c.gl_id   ORDER BY c.date_gap, c.bank_ent_len DESC) AS g_rank,
+        ROW_NUMBER() OVER (PARTITION BY c.bank_id ORDER BY c.date_gap, c.bank_ent_len DESC, c.gl_id) AS b_rank,
+        ROW_NUMBER() OVER (PARTITION BY c.gl_id   ORDER BY c.date_gap, c.bank_ent_len DESC, c.bank_id) AS g_rank,
         bc.n_candidates AS bank_n,
         gc.n_candidates AS gl_n
     FROM candidates c
@@ -191,8 +191,8 @@ gl_counts AS (
 ),
 ranked AS (
     SELECT c.*,
-        ROW_NUMBER() OVER (PARTITION BY c.bank_id ORDER BY c.date_gap, c.sim DESC) AS b_rank,
-        ROW_NUMBER() OVER (PARTITION BY c.gl_id   ORDER BY c.date_gap, c.sim DESC) AS g_rank,
+        ROW_NUMBER() OVER (PARTITION BY c.bank_id ORDER BY c.date_gap, c.sim DESC, c.gl_id) AS b_rank,
+        ROW_NUMBER() OVER (PARTITION BY c.gl_id   ORDER BY c.date_gap, c.sim DESC, c.bank_id) AS g_rank,
         bc.n_candidates AS bank_n,
         gc.n_candidates AS gl_n
     FROM candidates c
@@ -208,12 +208,92 @@ WHERE b_rank = 1 AND g_rank = 1
   AND bank_n = 1 AND gl_n = 1;
 
 -- Combined certain matches
+CREATE VIEW match_certain_r4 AS
+WITH remaining_bank AS (
+    SELECT b.* FROM features_bank b
+    LEFT JOIN match_certain_r1 m1 ON b.id = m1.bank_id
+    LEFT JOIN match_certain_r2 m2 ON b.id = m2.bank_id
+    LEFT JOIN match_certain_r3 m3 ON b.id = m3.bank_id
+    WHERE m1.bank_id IS NULL AND m2.bank_id IS NULL AND m3.bank_id IS NULL
+),
+remaining_gl AS (
+    SELECT g.* FROM features_gl g
+    LEFT JOIN match_certain_r1 m1 ON g.id = m1.gl_id
+    LEFT JOIN match_certain_r2 m2 ON g.id = m2.gl_id
+    LEFT JOIN match_certain_r3 m3 ON g.id = m3.gl_id
+    WHERE m1.gl_id IS NULL AND m2.gl_id IS NULL AND m3.gl_id IS NULL
+),
+candidates AS (
+    SELECT
+        b.id AS bank_id, g.id AS gl_id,
+        b.amount AS amount,
+        b.date AS bank_date, g.date AS gl_date,
+        b.entity_norm AS bank_ent, g.entity_norm AS gl_ent
+    FROM remaining_bank b
+    JOIN remaining_gl g
+      ON b.amount = g.amount
+     AND ABS(date_diff('day', b.date, g.date)) <= 15
+     AND (
+         starts_with(g.entity_norm, b.entity_norm) OR 
+         jaro_winkler_similarity(b.entity_norm, g.entity_norm) > 0.85
+     )
+     AND length(b.entity_norm) >= 4
+     AND length(g.entity_norm) >= 4
+),
+bank_counts AS (
+    SELECT bank_id, COUNT(*) AS n_candidates FROM candidates GROUP BY bank_id
+),
+gl_counts AS (
+    SELECT gl_id, COUNT(*) AS n_candidates FROM candidates GROUP BY gl_id
+),
+entangled AS (
+    SELECT c.* 
+    FROM candidates c
+    JOIN bank_counts bc ON c.bank_id = bc.bank_id
+    JOIN gl_counts gc ON c.gl_id = gc.gl_id
+    WHERE bc.n_candidates > 1 AND gc.n_candidates > 1
+),
+bank_entangled AS (
+    SELECT bank_id, MIN(amount) as amount, MIN(bank_ent) as bank_ent, MIN(bank_date) as bank_date
+    FROM entangled GROUP BY bank_id
+),
+gl_entangled AS (
+    SELECT gl_id, MIN(amount) as amount, MIN(gl_ent) as gl_ent, MIN(gl_date) as gl_date
+    FROM entangled GROUP BY gl_id
+),
+bank_ranked AS (
+    SELECT bank_id, amount, bank_ent, bank_date,
+           ROW_NUMBER() OVER (PARTITION BY amount, SUBSTRING(bank_ent, 1, 6) ORDER BY bank_date, bank_id) as rnk,
+           COUNT(*) OVER (PARTITION BY amount, SUBSTRING(bank_ent, 1, 6)) as total_bank
+    FROM bank_entangled
+),
+gl_ranked AS (
+    SELECT gl_id, amount, gl_ent, gl_date,
+           ROW_NUMBER() OVER (PARTITION BY amount, SUBSTRING(gl_ent, 1, 6) ORDER BY gl_date, gl_id) as rnk,
+           COUNT(*) OVER (PARTITION BY amount, SUBSTRING(gl_ent, 1, 6)) as total_gl
+    FROM gl_entangled
+)
+SELECT 
+    br.bank_id, gr.gl_id, br.amount AS bank_amount, gr.amount AS gl_amount,
+    'series_chronological' AS match_type,
+    'Matched chronological series rank ' || br.rnk AS note
+FROM bank_ranked br
+JOIN gl_ranked gr 
+  ON br.amount = gr.amount 
+ AND SUBSTRING(br.bank_ent, 1, 6) = SUBSTRING(gr.gl_ent, 1, 6)
+ AND br.rnk = gr.rnk
+ AND br.total_bank = gr.total_gl
+ AND br.total_bank > 1;
+
+-- All matched
 CREATE VIEW match_certain_matched AS
 SELECT bank_id, gl_id, bank_amount, gl_amount, match_type, note FROM match_certain_r1
 UNION ALL
 SELECT bank_id, gl_id, bank_amount, gl_amount, match_type, note FROM match_certain_r2
 UNION ALL
-SELECT bank_id, gl_id, bank_amount, gl_amount, match_type, note FROM match_certain_r3;
+SELECT bank_id, gl_id, bank_amount, gl_amount, match_type, note FROM match_certain_r3
+UNION ALL
+SELECT bank_id, gl_id, bank_amount, gl_amount, match_type, note FROM match_certain_r4;
 
 -- Remaining pools
 CREATE VIEW match_certain_unmatched_bank AS
@@ -360,7 +440,7 @@ matched_groups AS (
      AND b.date BETWEEN g.gl_min_date - INTERVAL 7 DAY
                      AND g.gl_max_date + INTERVAL 7 DAY
     -- Each bank item matches at most one group
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY b.id ORDER BY g.gl_cnt) = 1
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY b.id ORDER BY g.gl_cnt, g.entity_norm) = 1
 )
 -- Explode: one row per GL entry in matched groups
 SELECT
@@ -428,8 +508,8 @@ bank_counts AS (SELECT bank_id, COUNT(*) as c FROM candidate_batches GROUP BY ba
 SELECT c.bank_id, c.gl_id1, c.gl_id2, c.bank_amount, c.gl_amount
 FROM (
     SELECT c.*,
-           ROW_NUMBER() OVER(PARTITION BY c.gl_id1 ORDER BY c.date_gap) as g1_rank,
-           ROW_NUMBER() OVER(PARTITION BY c.gl_id2 ORDER BY c.date_gap) as g2_rank
+           ROW_NUMBER() OVER(PARTITION BY c.gl_id1 ORDER BY c.date_gap, c.bank_id, c.gl_id2) as g1_rank,
+           ROW_NUMBER() OVER(PARTITION BY c.gl_id2 ORDER BY c.date_gap, c.bank_id, c.gl_id1) as g2_rank
     FROM candidate_batches c
 ) c
 JOIN bank_counts bc ON c.bank_id = bc.bank_id
@@ -485,8 +565,65 @@ WHERE cnt > 1;
 
 
 # ---------------------------------------------------------------------------
-# Node 5 — Residual matching  (prompt)
+# Node 4.5 — Exact Amount Closest Date (sql)
 # ---------------------------------------------------------------------------
+
+MATCH_EXACT_CLOSEST_SQL = """\
+CREATE VIEW match_exact_closest_matched AS
+WITH remaining_bank AS (
+    SELECT b.* FROM batch_match_final_remaining_bank b_ids
+    JOIN features_bank b ON b_ids.id = b.id
+),
+remaining_gl AS (
+    SELECT g.* FROM batch_match_final_remaining_gl g_ids
+    JOIN features_gl g ON g_ids.id = g.id
+),
+candidates AS (
+    SELECT
+        b.id AS bank_id, g.id AS gl_id,
+        b.amount AS bank_amount, g.amount AS gl_amount,
+        b.date AS bank_date, g.date AS gl_date,
+        b.entity_norm AS bank_ent, g.entity_norm AS gl_ent,
+        ABS(date_diff('day', b.date, g.date)) AS date_gap
+    FROM remaining_bank b
+    JOIN remaining_gl g
+      ON b.amount = g.amount
+     AND ABS(date_diff('day', b.date, g.date)) <= 15
+),
+ranked AS (
+    SELECT c.*,
+           ROW_NUMBER() OVER (PARTITION BY bank_id ORDER BY date_gap ASC, gl_id) as b_rnk,
+           ROW_NUMBER() OVER (PARTITION BY gl_id ORDER BY date_gap ASC, bank_id) as g_rnk
+    FROM candidates c
+)
+SELECT bank_id, gl_id, bank_amount, gl_amount, 
+       'exact_amount_closest_date' AS match_type,
+       'Matched purely by exact amount + closest date gap: ' || date_gap || ' days' AS note
+FROM ranked
+WHERE b_rnk = 1 AND g_rnk = 1;
+
+CREATE VIEW match_exact_closest_final_remaining_bank AS
+SELECT b.id FROM batch_match_final_remaining_bank b
+LEFT JOIN match_exact_closest_matched m ON b.id = m.bank_id
+WHERE m.bank_id IS NULL;
+
+CREATE VIEW match_exact_closest_final_remaining_gl AS
+SELECT g.id FROM batch_match_final_remaining_gl g
+LEFT JOIN match_exact_closest_matched m ON g.id = m.gl_id
+WHERE m.gl_id IS NULL;
+"""
+
+MATCH_EXACT_CLOSEST_VALIDATE = """\
+SELECT 'fail' AS status,
+       'bank_id ' || bank_id || ' matched ' || cnt || 'x' AS message
+FROM (SELECT bank_id, COUNT(*) AS cnt FROM match_exact_closest_matched GROUP BY bank_id)
+WHERE cnt > 1
+UNION ALL
+SELECT 'fail' AS status,
+       'gl_id ' || gl_id || ' matched ' || cnt || 'x' AS message
+FROM (SELECT gl_id, COUNT(*) AS cnt FROM match_exact_closest_matched GROUP BY gl_id)
+WHERE cnt > 1;
+"""
 
 MATCH_RESIDUAL_INTENT = """\
 Resolve remaining unmatched bank and GL items. Prior SQL nodes have matched:
@@ -494,14 +631,16 @@ Resolve remaining unmatched bank and GL items. Prior SQL nodes have matched:
 2) Entity-based 1:1 matches (bank entity is prefix of GL entity + exact amount)
 3) Offsetting GL pairs (equal-and-opposite GL entries that cancel out)
 4) Batch deposits (GL entries grouped by entity that sum to a bank deposit)
+5) Exact amount closest date (any remaining exact amount match within 15 days)
 
 Everything else is up to you. Query the remaining pools and match what you can.
 
 AVAILABLE VIEWS:
-  batch_match_final_remaining_bank   — unmatched bank items (after all SQL matching)
-  batch_match_final_remaining_gl     — unmatched GL items (after all SQL matching)
+  match_exact_closest_final_remaining_bank   — unmatched bank items (after all SQL matching)
+  match_exact_closest_final_remaining_gl     — unmatched GL items (after all SQL matching)
   match_certain_matched        — already-matched (check# + entity 1:1)
   batch_match_all_batch_matched          — already-matched batch deposits
+  match_exact_closest_matched  — already-matched by exact amount closest date
   offsetting_pairs             — GL pairs that cancel out (already excluded)
 
 MATCHING STRATEGIES (apply in order of confidence):
@@ -512,13 +651,7 @@ MATCHING STRATEGIES (apply in order of confidence):
    of GL entries from the same entity that sum to a bank deposit amount.
    Use starts_with(gl_entity, bank_entity) for prefix matching.
 
-2) EXACT-AMOUNT 1:1: For bank items where entity matching failed (cryptic
-   descriptions like generic deposit labels, merchant codes, airline names),
-   match by exact amount + date proximity (within 10 days). Only match when
-   the amount is unique among unmatched candidates — if multiple GL items
-   share the same amount, be conservative.
-
-3) TOLERANCE: Wire transfers commonly incur fees ($10-$75 typical), causing the
+2) TOLERANCE: Wire transfers commonly incur fees ($10-$75 typical), causing the
    bank amount to slightly exceed the GL amount. Match by entity-prefix where
    amounts differ by up to $100. Use abs(bank_amount - gl_amount) <= 100 as
    the threshold — do NOT use a smaller cutoff like $25 or $50.
@@ -538,7 +671,7 @@ OUTPUT: Create a view called match_residual_all_matched with columns:
   bank_id, gl_id, bank_amount, gl_amount, match_type, note
 
 Must include ALL match_certain_matched rows, ALL batch_match_all_batch_matched rows,
-plus your new matches. Batch rows should have match_type='batch'.
+ALL match_exact_closest_matched rows, plus your new matches. Batch rows should have match_type='batch'.
 
 DuckDB NOTES:
 - Keep view chains shallow (max 2 levels deep). Use CTEs instead.
@@ -573,6 +706,12 @@ UNION ALL
 SELECT 'fail' AS status,
        'Batch match ' || c.bank_id || '->' || c.gl_id || ' missing' AS message
 FROM batch_match_all_batch_matched c
+LEFT JOIN match_residual_all_matched a ON c.bank_id = a.bank_id AND c.gl_id = a.gl_id
+WHERE a.bank_id IS NULL
+UNION ALL
+SELECT 'fail' AS status,
+       'Exact match ' || c.bank_id || '->' || c.gl_id || ' missing' AS message
+FROM match_exact_closest_matched c
 LEFT JOIN match_residual_all_matched a ON c.bank_id = a.bank_id AND c.gl_id = a.gl_id
 WHERE a.bank_id IS NULL;
 """
@@ -694,10 +833,34 @@ NODES = [
         },
     },
     {
+        "name": "match_exact_closest",
+        "sql": MATCH_EXACT_CLOSEST_SQL,
+        "validate": {"main": MATCH_EXACT_CLOSEST_VALIDATE},
+        "depends_on": ["features", "batch_match"],
+        "output_columns": {
+            "match_exact_closest_matched": [
+                "bank_id",
+                "gl_id",
+                "bank_amount",
+                "gl_amount",
+                "match_type",
+                "note",
+            ],
+            "match_exact_closest_final_remaining_bank": ["id"],
+            "match_exact_closest_final_remaining_gl": ["id"],
+        },
+    },
+    {
         "name": "match_residual",
         "prompt": MATCH_RESIDUAL_INTENT,
         "validate": {"main": MATCH_RESIDUAL_VALIDATE},
-        "depends_on": ["features", "match_certain", "offsetting", "batch_match"],
+        "depends_on": [
+            "features",
+            "match_certain",
+            "offsetting",
+            "batch_match",
+            "match_exact_closest",
+        ],
         "output_columns": {
             "match_residual_all_matched": [
                 "bank_id",
@@ -713,6 +876,6 @@ NODES = [
         "name": "report",
         "sql": REPORT_SQL,
         "validate": {"main": REPORT_VALIDATE},
-        "depends_on": ["features", "match_residual", "offsetting"],
+        "depends_on": ["features", "match_residual", "offsetting", "batch_match"],
     },
 ]
