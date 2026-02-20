@@ -25,7 +25,7 @@ Design principles:
   - Batch SQL is general-purpose: group GL by entity, match sum to bank deposit
 """
 
-from examples.bank_rec_problem import BANK_TRANSACTIONS, GL_ENTRIES
+
 
 # ---------------------------------------------------------------------------
 # Node 1 — Features  (sql)
@@ -508,12 +508,12 @@ FROM (
 NODES = [
     {
         "name": "bank_txns",
-        "source": BANK_TRANSACTIONS,
+        "source": None,
         "columns": ["id", "date", "description", "amount"],
     },
     {
         "name": "gl_entries",
-        "source": GL_ENTRIES,
+        "source": None,
         "columns": ["id", "date", "description", "amount", "ref", "entry_type"],
     },
     {
