@@ -1,5 +1,5 @@
 import duckdb
-from examples.score_bank_rec import score, flatten_truth, print_report
+from examples.bank_rec.score import score, flatten_truth, print_report
 import json
 
 def main():

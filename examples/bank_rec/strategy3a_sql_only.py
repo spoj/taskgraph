@@ -1,6 +1,6 @@
 import json
 from datetime import datetime
-from examples.bank_rec.strategy3_hybrid_v4 import NODES as V4_NODES
+from examples.bank_rec.strategy3_hybrid import NODES as HYBRID_NODES
 
 def load_bank():
     with open("dataset.json") as f:
@@ -20,27 +20,30 @@ REPORT_SQL = """
 CREATE VIEW report_matched AS
 SELECT * FROM match_certain_matched
 UNION ALL
-SELECT * FROM batch_match_matched;
+SELECT * FROM batch_match_all_batch_matched
+UNION ALL
+SELECT * FROM match_exact_closest_matched;
 
 CREATE VIEW report_unmatched_bank AS
-SELECT * FROM batch_match_remaining_bank;
+SELECT * FROM match_exact_closest_final_remaining_bank;
 
 CREATE VIEW report_unmatched_gl AS
-SELECT * FROM batch_match_remaining_gl;
+SELECT * FROM match_exact_closest_final_remaining_gl;
 
 CREATE VIEW report_summary AS
 SELECT
     (SELECT count(*) FROM match_certain_matched) AS certain_matches,
-    (SELECT count(*) FROM batch_match_matched) AS batch_matches,
+    (SELECT count(*) FROM batch_match_all_batch_matched) AS batch_matches,
+    (SELECT count(*) FROM match_exact_closest_matched) AS exact_closest_matches,
     (SELECT count(*) FROM report_unmatched_bank) AS unmatched_bank,
     (SELECT count(*) FROM report_unmatched_gl) AS unmatched_gl;
 """
 
-sql_nodes = [n for n in V4_NODES if n["name"] not in ("bank_txns", "gl_entries", "match_residual", "report")]
+sql_nodes = [n for n in HYBRID_NODES if n["name"] not in ("bank_txns", "gl_entries", "match_residual", "report")]
 sql_nodes.append({
     "name": "report",
     "sql": REPORT_SQL,
-    "depends_on": ["features", "batch_match", "offsetting"]
+    "depends_on": ["features", "match_exact_closest", "batch_match", "offsetting"]
 })
 
 NODES = [
