@@ -274,7 +274,7 @@ def execute_sql(
                     error_str = (
                         f"Result too large ({len(rows)} rows, "
                         f"{len(serialized):,} chars). "
-                        "Add LIMIT or narrow your query."
+                        "Add LIMIT or narrow your query. If you are doing manual data inspection, you MUST use LIMIT."
                     )
                     result = {
                         "success": False,
@@ -285,7 +285,7 @@ def execute_sql(
             row_count = 0
             result = {"success": True, "message": "OK"}
     except duckdb.InterruptException:
-        error_str = f"Query timed out after {query_timeout_s}s"
+        error_str = f"Query timed out after {query_timeout_s}s. You likely wrote a massive cross-join or N-way self-join. Do NOT try to brute-force subset sums or combinations with massive JOINs. Rethink your approach."
         log.warning("[%s] %s", node_name or "?", error_str)
         result = {"success": False, "error": error_str}
     except Exception as e:
