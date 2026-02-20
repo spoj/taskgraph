@@ -657,6 +657,12 @@ MATCHING STRATEGIES (apply in order of confidence):
    the threshold — do NOT use a smaller cutoff like $25 or $50.
    For non-entity matches, use a very small tolerance (< $5) only.
 
+3) EXTREME OBFUSCATION (MANUAL MAPPING): When the candidate pool is very small
+   and you see clear matches that SQL could never join (e.g., heavily truncated
+   vendor names or missing invoices), do NOT try to invent complex SQL join rules.
+   Simply read the rows yourself, pair them up manually, and output a literal
+   table using a `VALUES` clause (e.g. `SELECT * FROM (VALUES (...)) AS t(...)`).
+
 RULES:
 - Bank-generated fees/charges (service charges, maintenance fees, interest,
   foreign transaction fees, wire fees) typically have NO corresponding GL entry.

@@ -99,6 +99,7 @@ DUCKDB DIALECT:
   string_split(s, delim), string_agg(col, ', '), concat_ws('-', a, b, c)
 - JSON: col->>'key' (extract as text), col->'key' (extract as JSON),
   json_extract_string(col, '$.path'), json_group_array(col), json_group_object(k, v)
+- Literal tables: SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)
 - Views are late-binding (store SQL text, not data). CREATE OR REPLACE propagates instantly.
 """
 
