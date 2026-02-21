@@ -1,21 +1,21 @@
 """Score a bank reconciliation solver run against generated ground truth.
 
-Re-generates the same problem (same seed/n/difficulty) and compares the
-solver's output in the .db file against the known ground truth.
+Loads ground truth from a dataset.json file (preferred) or regenerates it
+from the generator (legacy, unreliable due to non-determinism).
 
 Usage:
-    uv run python examples/bank_rec/score.py output.db --n 1000
-    uv run python examples/bank_rec/score.py output.db --n 1000 --difficulty medium --seed 99
+    uv run python examples/bank_rec/score.py output.db --dataset examples/bank_rec/dataset.json
+    uv run python examples/bank_rec/score.py output.db --n 1000 --seed 123  # legacy, non-deterministic
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
 import duckdb
-
-from examples.bank_rec.generator import generate, verify
 
 
 def flatten_truth(gt: dict) -> dict:
@@ -314,27 +314,59 @@ def print_report(scores: dict, solver: dict):
     print("=" * 70)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Score bank rec solver output")
-    parser.add_argument("db_path", help="Path to solver output .db file")
-    parser.add_argument(
-        "--n", type=int, default=1000, help="n_bank used for generation"
-    )
-    parser.add_argument("--difficulty", default="hard", help="Difficulty preset")
-    parser.add_argument("--seed", type=int, default=123, help="Random seed")
-    args = parser.parse_args()
+def load_ground_truth_from_dataset(dataset_path: str) -> dict:
+    """Load ground truth from a dataset.json file."""
+    path = Path(dataset_path)
+    if not path.exists():
+        print(f"ERROR: Dataset file not found: {dataset_path}")
+        sys.exit(1)
+    data = json.loads(path.read_text())
+    if "ground_truth" not in data:
+        print(f"ERROR: No 'ground_truth' key in {dataset_path}")
+        sys.exit(1)
+    return data["ground_truth"]
 
-    # Regenerate ground truth with same parameters
-    print(
-        f"Regenerating ground truth: n={args.n} difficulty={args.difficulty} seed={args.seed}"
-    )
-    result = generate(n_bank=args.n, seed=args.seed, difficulty=args.difficulty)
+
+def load_ground_truth_from_generator(n: int, seed: int, difficulty: str) -> dict:
+    """Legacy: regenerate ground truth from generator (non-deterministic)."""
+    from examples.bank_rec.generator import generate, verify
+
+    result = generate(n_bank=n, seed=seed, difficulty=difficulty)
     errors = verify(result)
     if errors:
         print(f"ERROR: Generator verification failed: {errors[:5]}")
         sys.exit(1)
+    return result["ground_truth"]
 
-    gt = result["ground_truth"]
+
+def main():
+    parser = argparse.ArgumentParser(description="Score bank rec solver output")
+    parser.add_argument("db_path", help="Path to solver output .db file")
+    parser.add_argument(
+        "--dataset",
+        help="Path to dataset.json file containing ground truth (preferred)",
+    )
+    parser.add_argument(
+        "--n", type=int, default=1000, help="n_bank used for generation (legacy)"
+    )
+    parser.add_argument(
+        "--difficulty", default="hard", help="Difficulty preset (legacy)"
+    )
+    parser.add_argument("--seed", type=int, default=123, help="Random seed (legacy)")
+    args = parser.parse_args()
+
+    # Load ground truth
+    if args.dataset:
+        print(f"Loading ground truth from: {args.dataset}")
+        gt = load_ground_truth_from_dataset(args.dataset)
+    else:
+        print(
+            "WARNING: No --dataset provided. Regenerating ground truth from generator.\n"
+            "  The generator is NOT deterministic — scores may be incorrect.\n"
+            "  Prefer: --dataset examples/bank_rec/dataset.json"
+        )
+        gt = load_ground_truth_from_generator(args.n, args.seed, args.difficulty)
+
     s = gt["summary"]
     print(
         f"  bank={s['bank_transactions']}  gl={s['gl_entries']}  "

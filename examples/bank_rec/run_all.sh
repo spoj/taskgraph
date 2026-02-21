@@ -24,7 +24,7 @@ echo "Strategy 3: Hybrid TaskGraph (SQL Fuzzy + LLM)"
 echo "=========================================================="
 rm -f runs/strategy3_hybrid.db
 uv run python ../../scripts/cli.py run --spec run_strategy3_hybrid.py -o runs/strategy3_hybrid.db
-uv run python score.py runs/strategy3_hybrid.db --n 1000 --seed 123 --difficulty hard
+uv run python score.py runs/strategy3_hybrid.db --dataset dataset.json
 
 echo ""
 echo "=========================================================="
@@ -40,4 +40,4 @@ echo "Strategy 4: Pure Prompt TaskGraph"
 echo "=========================================================="
 rm -f runs/strategy4_pure_prompt.db
 uv run python ../../scripts/cli.py run --spec strategy4_pure_prompt.py -o runs/strategy4_pure_prompt.db
-uv run python score.py runs/strategy4_pure_prompt.db --n 1000 --seed 123 --difficulty hard
+uv run python score.py runs/strategy4_pure_prompt.db --dataset dataset.json
