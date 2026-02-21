@@ -35,12 +35,14 @@ bash run_all.sh
 - **Result**: F1 ~84%. Extremely fast (milliseconds). It perfectly handles the offsetting pairs and standard batching. However, it is fundamentally brittle. When faced with the severe truncation and typo modifications introduced in the `hard` dataset, the entity normalization heuristics break down, causing it to miss over a hundred valid pairs.
 
 ### 3. Strategy 3: Hybrid TaskGraph (`strategy3_hybrid.py`)
-- **Approach**: A TaskGraph pipeline (`bank_rec_v4.py`) that uses strict, highly accurate SQL nodes to solve the deterministic parts of the problem (exact matches, check numbers, batching). It then funnels the ambiguous leftovers (typos, mismatches, transpositions) into a single LLM prompt node to resolve using zero-shot fuzzy reasoning.
-- **Result**: F1 ~83%. The best balance of robustness and generalizability. It scored practically the same as the hand-tuned Python script but without requiring a massive catalogue of regexes for different vendor formats. The LLM was excellent at identifying 1:1 matches even when the descriptions were severely mangled.
+- **Approach**: A TaskGraph pipeline that uses strict, highly accurate SQL nodes to solve the deterministic parts of the problem (exact matches, check numbers, batching). It then funnels the ambiguous leftovers (typos, mismatches, transpositions) into a single LLM prompt node to resolve using zero-shot fuzzy reasoning.
+- **Result (GPT-5.2)**: F1 **94.7%** (Precision 99.8%, Recall 90.2%). 100s, ~$0.25. The LLM handles 1:1 fuzzy matches well but misses ~40% of batch deposits.
+- **Result (Claude Opus 4.6)**: F1 **99.7%** (Precision 99.8%, Recall 99.6%). 1440s, ~$25. Opus systematically explores cross-entity batch matches, achieving 100% batch recall and 95.7% mismatch recall.
+- **Result (Gemini Flash)**: F1 **91.2%** (Precision 99.7%, Recall 84.0%). 114s, ~$0.15. Cheapest and fastest but misses ~68% of batch deposits.
 
-### 4. Strategy 4: Hybrid TaskGraph v4b (`strategy3_hybrid.py`)
+### 4. Strategy 3a: Hybrid TaskGraph v4b (`strategy3_hybrid.py`)
 - **Approach**: An iteration on Strategy 3 designed specifically to handle extreme noise. Adds two new SQL heuristics to unburden the LLM: (1) Jaro-Winkler string similarity for 1:1 matches (recovers typos automatically), and (2) a secondary batching pass that purely sums pairs of close-proximity GL amounts regardless of vendor name (recovers typo'd batch entries).
-- **Result**: F1 ~93%. (Precision: 99.3%, Recall: 87.2%). By absorbing the simple typo correction into deterministic fuzzy-SQL, the LLM is left with a much smaller, denser set of true edge cases (fee mismatches and complex transposition errors). The LLM handles these flawlessly, boosting recall massively without tanking precision.
+- **Result**: This is the current v4b spec. See multi-model results above.
 
 ### 5. Strategy 5: Pure Prompt TaskGraph (`strategy4_pure_prompt.py`)
 - **Approach**: An entirely LLM-driven approach. The LLM is provided the schemas and asked to write raw DuckDB SQL to perform the reconciliation autonomously, guided by high-level plain English rules.

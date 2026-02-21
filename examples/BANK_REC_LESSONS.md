@@ -144,17 +144,41 @@ eliminated all 5 false positive offsetting pairs.
 - `starts_with()` for prefix matching, `jaro_winkler_similarity()` for fuzzy
   matching, `QUALIFY` for window function filtering.
 
-## Benchmark results (all n=1000, model=gpt-5.2)
+## Benchmark results
 
-| Version | Difficulty | Seed | F1 | Precision | Recall | Batch | Mismatch | FP | FN | Time | Cost |
-|---------|-----------|------|-----|-----------|--------|-------|----------|----|----|------|------|
-| v4b | easy | 42 | 100% | 100% | 100% | 100% | 100% | 0 | 0 | 255s | $0.39 |
-| v4b | medium | 42 | 100% | 100% | 100% | 100% | 100% | 0 | 0 | 351s | $0.61 |
-| v4b | hard | 42 | 99.8% | 100% | 99.6% | 100% | 100% | 0 | 4 | 334s | $0.36 |
-| v4b | hard | 99 | 99.7% | 100% | 99.5% | 98.4% | 100% | 0 | 6 | 222s | $0.33 |
-| v4b | hard | 123 | 99.2% | 100% | 98.5% | 92.9% | 100% | 0 | 17 | 231s | $0.32 |
+### Multi-model comparison (v4b, n=1000, hard, seed=123)
 
-Earlier versions for comparison:
+All runs use the same strategy3_hybrid spec and dataset. The only variable is
+the model driving the `match_residual` prompt node.
+
+| Model | F1 | Precision | Recall | 1:1 | Batch | Mismatch | FP | FN | Iters | Time | Tokens | Est. Cost |
+|-------|-----|-----------|--------|-----|-------|----------|----|----|-------|------|--------|-----------|
+| claude-opus-4.6 | **99.7%** | 99.8% | 99.6% | 99.6% | **100%** | **95.7%** | 2 | 5 | 14 | 1440s | 1.32M | ~$25 |
+| gpt-5.2 | 94.7% | 99.8% | 90.2% | 99.6% | 61.3% | 70.2% | 2 | 111 | 8 | 100s | 74K | ~$0.25 |
+| gemini-3-flash | 91.2% | 99.7% | 84.0% | 99.8% | 32.1% | 70.2% | 3 | 181 | 18 | 114s | 231K | ~$0.15 |
+
+All models achieve ~100% precision and identical results on 1:1 matches,
+offsetting pairs, and unmatched identification — these are handled by
+deterministic SQL nodes. The entire F1 gap is in the LLM-dependent categories:
+batch deposits and amount mismatches.
+
+### GPT-5.2 across seeds and difficulties
+
+| Difficulty | Seed | F1 | Precision | Recall | Batch | Mismatch | FP | FN | Time | Cost |
+|-----------|------|-----|-----------|--------|-------|----------|----|----|------|------|
+| easy | 42 | 100% | 100% | 100% | 100% | 100% | 0 | 0 | 255s | $0.39 |
+| medium | 42 | 100% | 100% | 100% | 100% | 100% | 0 | 0 | 351s | $0.61 |
+| hard | 42 | 99.8% | 100% | 99.6% | 100% | 100% | 0 | 4 | 334s | $0.36 |
+| hard | 99 | 99.7% | 100% | 99.5% | 98.4% | 100% | 0 | 6 | 222s | $0.33 |
+| hard | 123 | 94.7% | 99.8% | 90.2% | 61.3% | 70.2% | 2 | 111 | 100s | $0.25 |
+
+Note: seeds 42 and 99 were benchmarked before a code change to `_bank_desc()`
+in commit `89b6d1a` that shifted the generator's RNG stream. Those results may
+not be directly comparable to seed=123 results. The generator is deterministic
+within a fixed code version but not across code changes — see "Scoring
+infrastructure" below.
+
+### Earlier versions for comparison
 
 | Version | Difficulty | Seed | F1 | Precision | Recall | Notes |
 |---------|-----------|------|-----|-----------|--------|-------|
@@ -162,18 +186,74 @@ Earlier versions for comparison:
 | v4 | hard | 42 | 97.0% | 100% | 94.2% | No batch SQL |
 | v4 | hard | 99 | 89.3% | 100% | 80.7% | Batch recall collapsed to 17.5% |
 
+## How Opus achieved 99.7%
+
+The `match_residual` node is a prompt node — the LLM agent writes SQL queries
+against the remaining unmatched transactions. Examining the Opus run's SQL trace
+reveals a three-phase approach:
+
+**Phase 1: General SQL discovery.** Opus wrote fuzzy-matching queries using
+`jaro_winkler_similarity`, `starts_with` prefix matching, and amount tolerance
+joins to find 1:1 candidates. It also wrote a batch-matching query that groups
+GL entries by entity and checks if sums match bank amounts. These are the same
+general techniques GPT-5.2 uses.
+
+**Phase 2: Manual verification.** For the batch candidates surfaced by general
+queries, Opus wrote verification queries with specific IDs to confirm the sums:
+`SELECT SUM(amount) FROM gl_entries WHERE id IN ('G0043','G0044',...)`. It did
+this systematically for all ~25 candidate batch groups across two queries.
+
+**Phase 3: Hardcoded VALUES.** The final `match_residual_all_matched` view
+contains a `manual_pairs` CTE with ~90 hardcoded `(bank_id, gl_id, match_type)`
+tuples in a VALUES clause, UNIONed with the prior deterministic matches.
+
+GPT-5.2 uses the same general approach but with fewer iterations (8 vs 14) and
+far fewer tokens (74K vs 1.32M). The difference is thoroughness — Opus
+systematically verified and included cross-entity batch matches (where the bank
+entity and GL entity differ due to typos/truncation), while GPT-5.2 missed 94
+of 243 batch GL entries.
+
+The key insight: **batch deposit matching is where model quality matters most**.
+All models handle 1:1 matches equally well via SQL. Batch matching requires the
+LLM to identify that 3-5 GL entries with slightly different entity names sum to
+a single bank deposit — a task that rewards systematic exploration over speed.
+
 ## Cost breakdown
 
-At OpenRouter gpt-5.2 pricing ($1.75/M input, $0.175/M cached, $14/M output):
-- Average cost per 1000-transaction run: **$0.40**
-- ~80% of tokens are cached (system prompt reuse across iterations)
-- The prompt node (match_residual) uses 5–15 LLM iterations
-- Total wall-clock time: 3.5–6 minutes
+At OpenRouter pricing:
+
+| Model | Input $/M | Output $/M | Cache discount | Typical run cost |
+|-------|-----------|------------|----------------|-----------------|
+| gpt-5.2 | $1.75 | $14.00 | 10x | **$0.25–0.60** |
+| gemini-3-flash | $0.50 | $3.00 | — | **$0.10–0.20** |
+| claude-opus-4.6 | $15.00 | $75.00 | 10x | **$5–25** |
+
+Opus cost is 50–100x GPT-5.2 for a 5% F1 improvement. Whether that tradeoff
+is worth it depends on the use case — for a reconciliation where each false
+negative requires manual review of a $100K+ transaction, $25 is trivial. For
+routine processing, GPT-5.2 at $0.25 is the clear choice.
+
+## Scoring infrastructure
+
+`score.py` accepts a `--dataset` flag pointing to `dataset.json`, which contains
+both the input data and the ground truth. This is the correct way to score:
+
+```bash
+uv run python score.py output.db --dataset dataset.json
+```
+
+The legacy path (no `--dataset` flag) regenerates ground truth by calling
+`generate()` with the same seed. This is **unreliable** because the generator
+is not deterministic across code changes — any modification that alters the
+number of RNG draws (even in an unrelated code path) shifts the entire random
+stream, producing different data for the same seed. The `--dataset` flag
+bypasses this entirely by loading the frozen ground truth.
 
 ## Remaining FN analysis (HARD difficulty)
 
 | Category | Count per run | Solvable? |
 |----------|--------------|-----------|
-| Batch subset-sum | 4–15 | Possibly with combinatorial SQL or better LLM prompting |
+| Batch subset-sum | 4–15 (GPT-5.2), 0 (Opus) | Yes — more LLM iterations or a stronger model resolves most |
 | Ambiguous dup-amount pairs | 2–4 | No — no textual signal exists |
+| Amount mismatch (fee/rounding) | 0–14 | Model-dependent; Opus gets 95.7%, GPT-5.2 gets 70.2% |
 | Isolated 1:1 misses | 0–2 | LLM non-determinism; varies by run |

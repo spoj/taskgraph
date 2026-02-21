@@ -26,7 +26,7 @@ A complex, heuristic-heavy matching problem traditionally solved by fine-tuned P
 - `run_all.sh` — Generates dataset and runs all strategies sequentially.
 - `LEARNING_LOG.md` — Iterative discoveries and prompt engineering lessons.
 
-See `bank_rec/README.md` for detailed strategy comparison and results.
+See `bank_rec/README.md` for strategy descriptions and `BANK_REC_LESSONS.md` for detailed multi-model benchmark results, architectural evolution, and cost analysis.
 
 ## Lessons Learned (`BANK_REC_LESSONS.md`)
 
