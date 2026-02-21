@@ -25,6 +25,30 @@ Design principles:
   - Batch SQL is general-purpose: group GL by entity, match sum to bank deposit
 """
 
+import json
+from datetime import datetime
+from pathlib import Path
+
+_DATA_PATH = Path(__file__).parent / "dataset.json"
+
+
+def _load_data():
+    return json.loads(_DATA_PATH.read_text())
+
+
+def load_bank():
+    data = _load_data()["bank_transactions"]
+    for row in data:
+        row["date"] = datetime.strptime(row["date"], "%Y-%m-%d").date()
+    return data
+
+
+def load_gl():
+    data = _load_data()["gl_entries"]
+    for row in data:
+        row["date"] = datetime.strptime(row["date"], "%Y-%m-%d").date()
+    return data
+
 
 # ---------------------------------------------------------------------------
 # Node 1 — Features  (sql)
@@ -786,12 +810,12 @@ FROM (
 NODES = [
     {
         "name": "bank_txns",
-        "source": None,
+        "source": load_bank,
         "columns": ["id", "date", "description", "amount"],
     },
     {
         "name": "gl_entries",
-        "source": None,
+        "source": load_gl,
         "columns": ["id", "date", "description", "amount", "ref", "entry_type"],
     },
     {
