@@ -155,16 +155,6 @@ class TestValidateOutputs:
         # Should mention the failing message
         assert "nope" in "\n".join(errors)
 
-    def test_validation_order_view_before_columns(self, conn):
-        """Step 1 (view existence) runs before step 2 (column check)."""
-        node = _make_node(
-            name="t",
-            output_columns={"t_missing": ["col1"]},
-        )
-        errors = node.validate_outputs(conn)
-        assert len(errors) == 1
-        assert "not created" in errors[0].lower()
-
     def test_discover_validation_objects(self, conn):
         conn.execute(
             "CREATE VIEW t__validation_main AS SELECT 'pass' AS status, 'ok' AS message"

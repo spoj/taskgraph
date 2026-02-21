@@ -5,7 +5,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from tests.conftest import _make_node
+from tests.conftest import _make_node, _views, _tables
 from src.agent import run_sql_node, log_trace, validate_node_complete
 from src.agent_loop import AgentResult
 from src.workspace import Workspace, persist_workspace_meta, read_workspace_meta
@@ -79,13 +79,7 @@ class TestTwoPhaseValidation:
         assert len(errors) > 0
         assert any("bad" in e for e in errors)
 
-        views = {
-            row[0]
-            for row in conn.execute(
-                "SELECT view_name FROM duckdb_views() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "t__validation_main" in views
+        assert "t__validation_main" in _views(conn)
 
 
 class TestWorkspaceExports:
@@ -321,22 +315,9 @@ class TestMaterializeNodeOutputs:
         n = materialize_node_outputs(conn, node)
 
         assert n == 1
-        # View should be gone
-        views = {
-            r[0]
-            for r in conn.execute(
-                "SELECT view_name FROM duckdb_views() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "t_out" not in views
+        assert "t_out" not in _views(conn)
         # Table should exist with same data
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "t_out" in tables
+        assert "t_out" in _tables(conn)
         row = conn.execute("SELECT x, y FROM t_out").fetchone()
         assert row == (1, "hello")
 
@@ -387,14 +368,7 @@ class TestMaterializeNodeOutputs:
 
         # Both views should be materialized
         assert n == 2
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "t_step1" in tables
-        assert "t_out" in tables
+        assert {"t_step1", "t_out"} <= _tables(conn)
 
     def test_materialized_data_matches_original(self, conn):
         """Multi-row view data is preserved exactly after materialization."""
@@ -470,22 +444,9 @@ class TestMaterializeNodeOutputs:
 
         assert n == 2  # output + validation view
         # Both should be tables now
-        views = {
-            r[0]
-            for r in conn.execute(
-                "SELECT view_name FROM duckdb_views() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "t_out" not in views
-        assert "t__validation_main" not in views
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "t_out" in tables
-        assert "t__validation_main" in tables
+        assert "t_out" not in _views(conn)
+        assert "t__validation_main" not in _views(conn)
+        assert {"t_out", "t__validation_main"} <= _tables(conn)
         # Data intact
         row = conn.execute("SELECT status, message FROM t__validation_main").fetchone()
         assert row == ("pass", "all good")
@@ -511,13 +472,7 @@ class TestMaterializeNodeOutputs:
         n = materialize_node_outputs(conn, node)
 
         assert n == 3  # t_out + t__validation + t__validation_extra
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-            ).fetchall()
-        }
-        assert {"t_out", "t__validation_main", "t__validation_extra"} <= tables
+        assert {"t_out", "t__validation_main", "t__validation_extra"} <= _tables(conn)
 
     def test_validation_warnings_works_after_materialization(self, conn):
         """validation_warnings() reads from materialized validation tables."""
@@ -590,10 +545,4 @@ class TestMaterializeNodeOutputs:
         # Stale tmp table replaced, final table has correct data
         assert conn.execute("SELECT x FROM t_out").fetchone() == (1,)
         # No leftover tmp table
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "_materialize_tmp_t_out" not in tables
+        assert "_materialize_tmp_t_out" not in _tables(conn)

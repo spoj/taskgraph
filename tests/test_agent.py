@@ -466,20 +466,18 @@ class TestAddCacheControl:
 class TestIsAnthropicModel:
     """Tests for _is_anthropic_model."""
 
-    def test_anthropic_model(self):
+    @pytest.mark.parametrize(
+        "model, expected",
+        [
+            ("anthropic/claude-opus-4.5", True),
+            ("openai/gpt-5.2", False),
+            ("Anthropic/Claude-Opus-4.5", True),  # case insensitive
+        ],
+    )
+    def test_detection(self, model, expected):
         from src.api import _is_anthropic_model
 
-        assert _is_anthropic_model("anthropic/claude-opus-4.5") is True
-
-    def test_non_anthropic_model(self):
-        from src.api import _is_anthropic_model
-
-        assert _is_anthropic_model("openai/gpt-5.2") is False
-
-    def test_case_insensitive(self):
-        from src.api import _is_anthropic_model
-
-        assert _is_anthropic_model("Anthropic/Claude-Opus-4.5") is True
+        assert _is_anthropic_model(model) is expected
 
 
 class TestPersistNodeMeta:

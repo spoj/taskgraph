@@ -5,7 +5,7 @@ import pytest
 import polars as pl
 from openpyxl import Workbook
 
-from tests.conftest import _make_node
+from tests.conftest import _make_node, _views, _tables
 from src.ingest import (
     coerce_to_dataframe,
     ingest_csv,
@@ -409,21 +409,9 @@ class TestSourceNodeValidation:
         assert not errors
         materialize_node_outputs(conn, node)
         # View should be gone (materialized into a table)
-        views = {
-            row[0]
-            for row in conn.execute(
-                "SELECT view_name FROM duckdb_views() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "t__validation_main" not in views
+        assert "t__validation_main" not in _views(conn)
         # Table should exist with same data
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "t__validation_main" in tables
+        assert "t__validation_main" in _tables(conn)
         row = conn.execute("SELECT status, message FROM t__validation_main").fetchone()
         assert row == ("pass", "ok")
 
@@ -460,14 +448,7 @@ class TestSourceNodeValidation:
         errors = validate_node_complete(conn, node)
         assert not errors
         materialize_node_outputs(conn, node)
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE internal = false"
-            ).fetchall()
-        }
-        assert "t__validation_main" in tables
-        assert "t__validation_extra" in tables
+        assert {"t__validation_main", "t__validation_extra"} <= _tables(conn)
 
     def test_no_validation_returns_empty(self, conn):
         """Source node with no columns or validate passes validation."""
