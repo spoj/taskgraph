@@ -66,6 +66,8 @@ RULES:
   Include: created/updated view names, key decisions, and any assumptions/warnings.
   If the node prompt asks for a full report, comply.
 - If validation fails, you get feedback — fix and reply again
+- After each CREATE VIEW, validation checks run automatically. Results appear in
+  "_validation" (e.g. ["main: 3 fail", "totals: ok"]). Fix failures early.
 
 MACROS:
 - CREATE MACRO name(args) AS expr — reusable scalar
@@ -316,6 +318,62 @@ def execute_sql(
     return result
 
 
+def _run_early_validation(
+    conn: duckdb.DuckDBPyConnection,
+    node: Node,
+) -> list[str]:
+    """Run node validation queries as SELECT and return per-check summaries.
+
+    Called after each successful CREATE VIEW to give the agent early feedback.
+    Runs each validation query as a bare SELECT (not defining views) and
+    returns a terse one-line summary per runnable check.
+
+    Checks whose queries error (e.g. referencing views not yet created) are
+    silently skipped — they'll appear once their dependencies exist.
+
+    Returns e.g.: ["main: 3 fail, 1 warn", "totals: ok"]
+    """
+    validate = node.validation_queries()
+    if not validate:
+        return []
+
+    summaries: list[str] = []
+    for check_name, query in sorted(validate.items()):
+        q = query.rstrip(";").strip()
+        try:
+            rows = conn.execute(q).fetchall()
+        except Exception:
+            # Expected: validation SQL may reference views not yet created
+            continue
+
+        # Check ran successfully — summarize results
+        if not rows:
+            summaries.append(f"{check_name}: ok")
+            continue
+
+        cols = [d[0].lower() for d in conn.description]
+        status_idx = cols.index("status") if "status" in cols else 0
+        n_fail = n_warn = 0
+        for row in rows:
+            status = str(row[status_idx]).lower()
+            if status == "fail":
+                n_fail += 1
+            elif status == "warn":
+                n_warn += 1
+
+        if n_fail == 0 and n_warn == 0:
+            summaries.append(f"{check_name}: ok ({len(rows)} rows, all pass)")
+        else:
+            parts = []
+            if n_fail:
+                parts.append(f"{n_fail} fail")
+            if n_warn:
+                parts.append(f"{n_warn} warn")
+            summaries.append(f"{check_name}: {', '.join(parts)}")
+
+    return summaries
+
+
 def _discover_available_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
     """Return all non-internal table names from the database."""
     return list_tables(conn, exclude_prefixes=("_",))
@@ -449,6 +507,17 @@ async def run_node_agent(
                 conn, query, namespace=ns, node_name=node.name, source="agent"
             )
             log.debug(".")
+
+            # Early validation: after a successful CREATE VIEW, run validation
+            # queries and report per-check summaries so the agent can
+            # course-correct before declaring completion.
+            if result.get("success") and node.has_validation():
+                ddl = extract_ddl_target(query)
+                if ddl and ddl.action == "create" and ddl.kind == "view":
+                    feedback = _run_early_validation(conn, node)
+                    if feedback:
+                        result["_validation"] = feedback
+
             return json.dumps(result, default=_json_default)
 
         return json.dumps({"success": False, "error": f"Unknown tool: {name}"})
