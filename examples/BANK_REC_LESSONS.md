@@ -151,11 +151,13 @@ eliminated all 5 false positive offsetting pairs.
 All runs use the same strategy3_hybrid spec and dataset. The only variable is
 the model driving the `match_residual` prompt node.
 
-| Model | F1 | Precision | Recall | 1:1 | Batch | Mismatch | FP | FN | Iters | Time | Tokens | Est. Cost |
-|-------|-----|-----------|--------|-----|-------|----------|----|----|-------|------|--------|-----------|
-| claude-opus-4.6 | **99.7%** | 99.8% | 99.6% | 99.6% | **100%** | **95.7%** | 2 | 5 | 14 | 1440s | 1.32M | ~$25 |
-| gpt-5.2 | 94.7% | 99.8% | 90.2% | 99.6% | 61.3% | 70.2% | 2 | 111 | 8 | 100s | 74K | ~$0.25 |
-| gemini-3-flash | 91.2% | 99.7% | 84.0% | 99.8% | 32.1% | 70.2% | 3 | 181 | 18 | 114s | 231K | ~$0.15 |
+| Model | F1 | Precision | Recall | 1:1 | Batch | Mismatch | FP | FN | Iters | Time | Tokens | Cost |
+|-------|-----|-----------|--------|-----|-------|----------|----|----|-------|------|--------|------|
+| claude-opus-4.6 | **99.7%** | 99.8% | 99.6% | 99.6% | **100%** | **95.7%** | 2 | 5 | 14 | 1440s | 1.32M | $3.66 |
+| gpt-5.2 (high) | **98.9%** | 99.8% | 98.1% | 99.6% | **97.9%** | 70.2% | 2 | 21 | 13 | 692s | 1.19M | $0.91 |
+| gpt-5.2 (low) | 97.0% | 99.8% | 94.3% | 99.6% | 80.7% | 70.2% | 2 | 65 | 10 | 193s | 160K | $0.26 |
+| gpt-5.2 (low, pre-early-val) | 94.7% | 99.8% | 90.2% | 99.6% | 61.3% | 70.2% | 2 | 111 | 8 | 100s | 74K | $0.25 |
+| gemini-3-flash | 91.2% | 99.7% | 84.0% | 99.8% | 32.1% | 70.2% | 3 | 181 | 18 | 114s | 231K | $0.15 |
 
 All models achieve ~100% precision and identical results on 1:1 matches,
 offsetting pairs, and unmatched identification — these are handled by
@@ -224,14 +226,16 @@ At OpenRouter pricing:
 
 | Model | Input $/M | Output $/M | Cache discount | Typical run cost |
 |-------|-----------|------------|----------------|-----------------|
-| gpt-5.2 | $1.75 | $14.00 | 10x | **$0.25–0.60** |
+| gpt-5.2 | $1.75 | $14.00 | 10x | **$0.25–0.91** |
 | gemini-3-flash | $0.50 | $3.00 | — | **$0.10–0.20** |
-| claude-opus-4.6 | $15.00 | $75.00 | 10x | **$5–25** |
+| claude-opus-4.6 | $5.00 | $25.00 | 10x | **$3–4** |
 
-Opus cost is 50–100x GPT-5.2 for a 5% F1 improvement. Whether that tradeoff
-is worth it depends on the use case — for a reconciliation where each false
-negative requires manual review of a $100K+ transaction, $25 is trivial. For
-routine processing, GPT-5.2 at $0.25 is the clear choice.
+Cost is dominated by output tokens and cache hit rate (75-94% cache reads
+across runs). Input cost is minor. Opus cost is 4-15x GPT-5.2 for a 1-3% F1
+improvement. Whether that tradeoff is worth it depends on the use case — for a
+reconciliation where each false negative requires manual review of a $100K+
+transaction, $4 is trivial. For routine processing, GPT-5.2 at $0.26 is the
+clear choice.
 
 ## Scoring infrastructure
 
@@ -253,7 +257,7 @@ bypasses this entirely by loading the frozen ground truth.
 
 | Category | Count per run | Solvable? |
 |----------|--------------|-----------|
-| Batch subset-sum | 4–15 (GPT-5.2), 0 (Opus) | Yes — more LLM iterations or a stronger model resolves most |
+| Batch subset-sum | 4–15 (GPT-5.2 low), 0–2 (GPT-5.2 high), 0 (Opus) | Yes — more LLM iterations or a stronger model resolves most |
 | Ambiguous dup-amount pairs | 2–4 | No — no textual signal exists |
 | Amount mismatch (fee/rounding) | 0–14 | Model-dependent; Opus gets 95.7%, GPT-5.2 gets 70.2% |
 | Isolated 1:1 misses | 0–2 | LLM non-determinism; varies by run |

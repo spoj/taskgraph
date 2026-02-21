@@ -3,7 +3,7 @@
 This guide targets people writing **workspace specs**: Python modules (usually shipped inside your own package) that call Taskgraph.
 
 A spec defines:
-- `NODES`: a list of nodes — each either an **input node** (has `source`) or a **task node** (has `sql` or `prompt`). Input nodes are ingested into DuckDB tables; task nodes form a DAG and produce SQL views.
+- `NODES`: a list of nodes — each either a **source node** (has `source`) or a **transform node** (has `sql` or `prompt`). Source nodes are ingested into DuckDB tables; transform nodes form a DAG and produce SQL views.
 - `EXPORTS` (optional): functions that export files from the final workspace
 
 Specs are imported as modules (e.g. `my_app.specs.main`). File paths are accepted by the CLI and auto-resolved to module paths.
@@ -12,7 +12,7 @@ Specs are imported as modules (e.g. `my_app.specs.main`). File paths are accepte
 
 For a new project, run `taskgraph init` to scaffold a `specs/` directory, `pyproject.toml`, and supporting files.
 
-Taskgraph uses OpenRouter for LLM calls; set `OPENROUTER_API_KEY` in your environment or `.env` file. If your spec only uses `sql` tasks, no API key is required.
+Taskgraph uses OpenRouter for LLM calls; set `OPENROUTER_API_KEY` in your environment or `.env` file. If your spec only uses `sql` nodes, no API key is required.
 
 Two common patterns:
 
@@ -104,20 +104,20 @@ uv run taskgraph run --spec my_app.specs.main
 
 ## NODES
 
-`NODES` is a list of node dicts. Each node has a `name` and is either an **input node** (has `source`) or a **task node** (has `sql` or `prompt`).
+`NODES` is a list of node dicts. Each node has a `name` and is either a **source node** (has `source`) or a **transform node** (has `sql` or `prompt`).
 
 Node discrimination:
-- Has `"source"` key → input node (ingested as a DuckDB table)
-- Has `"sql"` or `"prompt"` → task node (produces SQL views)
+- Has `"source"` key → source node (ingested as a DuckDB table)
+- Has `"sql"` or `"prompt"` → transform node (produces SQL views)
 - A node cannot have both `source` and `sql`/`prompt`.
 
 ---
 
-## Input Nodes
+## Source Nodes
 
-An input node has `name` and `source`. Each becomes a DuckDB table before any tasks run.
+A source node has `name` and `source`. Each becomes a DuckDB table before any transform nodes run.
 
-### Simple input nodes
+### Simple source nodes
 
 ```python
 NODES = [
@@ -133,9 +133,9 @@ Accepted return types from callables:
 - `list[dict]` — array of structs, each dict is a row
 - `dict[str, list]` — struct of arrays, each key is a column
 
-### Input nodes with validation
+### Source nodes with validation
 
-Input nodes can include optional `columns` and `validate` fields:
+Source nodes can include optional `columns` and `validate` fields:
 
 ```python
 NODES = [
@@ -161,8 +161,8 @@ NODES = [
 |-----|------|----------|-------------|
 | `name` | `str` | Yes | Table name in DuckDB |
 | `source` | callable, raw data, or file path | Yes | Data source |
-| `columns` | `list[str]` | No | Required columns. Checked after ingestion, before tasks. Missing columns abort the run. |
-| `validate` | `dict[str,str]` | No | Mapping of `check_name -> query`. Each query is wrapped into a view named `{input_name}__validation_{check_name}` and must return `status` and `message` columns. On success, validation views are materialized as tables; on failure, validation views remain as views for debugging. |
+| `columns` | `list[str]` | No | Required columns. Checked after ingestion, before transform nodes. Missing columns abort the run. |
+| `validate` | `dict[str,str]` | No | Mapping of `check_name -> query`. Each query is wrapped into a view named `{name}__validation_{check_name}` and must return `status` and `message` columns. On success, validation views are materialized as tables; on failure, validation views remain as views for debugging. |
 
 Node type is determined by the presence of `source` vs `sql`/`prompt` keys.
 
@@ -206,15 +206,15 @@ def load_data():
 
 ---
 
-## Task Nodes
+## Transform Nodes
 
-Task nodes are part of the same `NODES` list. Each task has exactly one transform mode:
+Transform nodes are part of the same `NODES` list. Each has exactly one mode:
 - `sql`: deterministic SQL statements executed directly (views/macros only).
 - `prompt`: LLM-driven transform. The agent writes SQL views/macros.
 
-All views created by a task must be namespaced as `{name}_*` (underscore required — bare `{name}` is NOT a valid view name).
+All views created by a transform node must be namespaced as `{name}_*` (underscore required — bare `{name}` is NOT a valid view name).
 
-Validation is optional and deterministic via `validate`, which runs after the transform to define one or more validation views named `{task_name}__validation_<check_name>`. Validation views are not listed in `output_columns`.
+Validation is optional and deterministic via `validate`, which runs after the transform to define one or more validation views named `{name}__validation_<check_name>`. Validation views are not listed in `output_columns`.
 
 Taskgraph treats validation as a definition step: it defines missing validation views, then re-evaluates those views on subsequent validation attempts.
 
@@ -241,7 +241,7 @@ NODES = [
 ]
 ```
 
-### Task node fields
+### Transform node fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -249,22 +249,22 @@ NODES = [
 | `sql` | `str` | Exactly one of `sql` or `prompt` | Deterministic statements executed directly (views/macros only). Multiple statements are allowed in one string and will be split by DuckDB's parser. |
 | `prompt` | `str` | Exactly one of `sql` or `prompt` | Objective text for LLM-driven transforms. |
 | `validate` | `dict[str,str]` | No | Mapping of `check_name -> query`. Each query is wrapped into a view named `{name}__validation_{check_name}` and must return `status` and `message` columns. |
-| `depends_on` | `list[str]` | No | Node names (input or task) that must complete before this task runs. Used for DAG scheduling. |
+| `depends_on` | `list[str]` | No | Node names (source or transform) that must complete before this node runs. Used for DAG scheduling. |
 | `output_columns` | `dict[str, list[str]]` | No | Required views and their columns. Keys must start with `{name}_`. Checks names only, not types. Extra columns are fine. |
 
 ### Dependencies
 
-- `depends_on` lists input node names and/or task node names.
-- If a dependency is an input node, the input is ingested before the task runs.
-- If a dependency is another task node, that task must complete first.
+- `depends_on` lists source node names and/or transform node names.
+- If a dependency is a source node, it is ingested before this node runs.
+- If a dependency is another transform node, that node must complete first.
 - Circular dependencies are detected and raise an error.
 
 ### Compensation over upstream rewrites
 
-If a task discovers an issue with upstream data, it should **compensate in its own outputs** rather than attempting to rewrite upstream logic. Tasks cannot override another task's outputs due to namespace enforcement and duplicate-output checks. The intended pattern is:
+If a node discovers an issue with upstream data, it should **compensate in its own outputs** rather than attempting to rewrite upstream logic. Nodes cannot override another node's outputs due to namespace enforcement and duplicate-output checks. The intended pattern is:
 
-- Add diagnostic or corrective intermediate views in the current task's namespace.
-- Update the task's own output views to apply the correction.
+- Add diagnostic or corrective intermediate views in the current node's namespace.
+- Update the node's own output views to apply the correction.
 
 This keeps provenance stable and avoids introducing extra variance across the DAG.
 
@@ -274,7 +274,7 @@ The agent receives:
 
 1. A system prompt describing DuckDB SQL syntax, constraints, and workflow guidance.
 2. A user message containing:
-    - The task name
+    - The node name
     - Your `prompt` text
     - Input tables with schemas (from `depends_on` references)
     - Required output views (with expected columns, if declared via `output_columns`)
@@ -298,8 +298,8 @@ The agent has a single tool: `run_sql`. It can execute:
 | `DROP MACRO` | Yes | Yes |
 | Everything else | **No** | — |
 
-Deterministic `sql` tasks are more restrictive: they may only execute `CREATE/DROP VIEW` and `CREATE/DROP MACRO` statements (no standalone `SELECT`).
-`prompt` tasks are the only ones that invoke the LLM.
+Deterministic `sql` nodes are more restrictive: they may only execute `CREATE/DROP VIEW` and `CREATE/DROP MACRO` statements (no standalone `SELECT`).
+`prompt` nodes are the only ones that invoke the LLM.
 
 The agent can call `run_sql` multiple times in parallel within a single turn.
 
@@ -322,7 +322,7 @@ The agent is told about these DuckDB features in its system prompt:
 
 ### Namespace and intermediate views
 
-All views created by a task must be namespaced as `{name}_*` (underscore required). A task named `"match"` can create:
+All views created by a node must be namespaced as `{name}_*` (underscore required). A node named `"match"` can create:
 - `match_results`, `match_scored`, `match_candidates`, etc. — any view prefixed with `match_`
 - `match_clean`, `match_normalize`, etc. — any macro prefixed with `match_`
 
@@ -354,7 +354,7 @@ View 'output' is missing required column(s): left_ids. Actual columns: category,
 
 ### 3. Validation
 
-Task validation is expressed by `validate`, which runs after the transform and defines one or more views named `{name}__validation_<check_name>`.
+Validation is expressed by `validate`, which runs after the transform and defines one or more views named `{name}__validation_<check_name>`.
 
 Contract:
 - The view must have columns `status` and `message`.
@@ -457,7 +457,7 @@ Export function exceptions are caught — they don't crash the run. Errors are s
 Taskgraph can generate a single **agentic final report** (author = LLM, harness-controlled).
 
 - Generated at the end of a run when an LLM client is available (e.g. the spec has prompt nodes or PDF ingestion).
-- Implemented as an internal prompt node (name like `tg_report`) that can query the workspace DB (`_workspace_meta`, `_node_meta`, `_trace`, and domain tables).
+- The reporter agent can query the workspace DB (`_workspace_meta`, `_node_meta`, `_trace`, and domain tables).
 - Stored in `_workspace_meta` under key `final_report` (JSON with an `md` field).
 
 ```sql
@@ -504,10 +504,10 @@ This produces two layers:
 
 ### Dependency rules
 
-- `depends_on` lists node names: input node names or task node names.
+- `depends_on` lists node names: source node names or transform node names.
 - Circular dependencies are detected and raise an error.
 
-### Layer failure
+### Failure isolation
 
 A failed node only blocks its direct downstream dependents — nodes that consume its outputs. Unrelated nodes in later layers continue to run. Nodes in the same layer are not affected (they run concurrently and may succeed).
 
@@ -519,7 +519,7 @@ The `.db` is a queryable audit trail. After a run, you can open it and trace how
 
 ### Inspect the database
 
-After a run, node outputs and validation views are **materialized as tables** (frozen). Intermediate `{name}_*` views stay as views for debuggability. Every SQL statement (including input validation) is logged in `_trace`. The `_view_definitions` view (derived from `_trace`) provides lineage — the original CREATE VIEW SQL for each materialized output.
+After a run, node outputs and validation views are **materialized as tables** (frozen). Intermediate `{name}_*` views stay as views for debuggability. Every SQL statement (including source validation) is logged in `_trace`. The `_view_definitions` view (derived from `_trace`) provides lineage — the original CREATE VIEW SQL for each materialized output.
 
 ```bash
 # Show all user-created tables (materialized outputs + inputs)
@@ -553,7 +553,7 @@ intermediate_view → materialized_table → ... → input_table
 
 ### SQL execution trace
 
-Every SQL query executed — by node agents, SQL-only nodes, node validation, and input validation — is logged in `_trace` with a `source` column indicating the origin (`agent`, `sql_node`, `node_validation`, `input_validation`):
+Every SQL query executed — by node agents, SQL-only nodes, node validation, and source validation — is logged in `_trace` with a `source` column indicating the origin (`agent`, `sql_node`, `node_validation`, `input_validation`):
 ```sql
 SELECT node, source, query, success, error, row_count, elapsed_ms
 FROM _trace
@@ -740,8 +740,8 @@ taskgraph show output.db
 taskgraph show
 ```
 
-When given a `.db` file, displays workspace metadata: creation time, model, inputs, tasks, and export results.
-Otherwise, displays spec structure: inputs, DAG layers, per-node details, validation summary, exports.
+When given a `.db` file, displays workspace metadata: creation time, model, sources, nodes, and export results.
+Otherwise, displays spec structure: sources, DAG layers, per-node details, validation summary, exports.
 
 ## Appendix: Debugging a Workspace
 

@@ -36,18 +36,15 @@ bash run_all.sh
 
 ### 3. Strategy 3: Hybrid TaskGraph (`strategy3_hybrid.py`)
 - **Approach**: A TaskGraph pipeline that uses strict, highly accurate SQL nodes to solve the deterministic parts of the problem (exact matches, check numbers, batching). It then funnels the ambiguous leftovers (typos, mismatches, transpositions) into a single LLM prompt node to resolve using zero-shot fuzzy reasoning.
-- **Result (GPT-5.2)**: F1 **94.7%** (Precision 99.8%, Recall 90.2%). 100s, ~$0.25. The LLM handles 1:1 fuzzy matches well but misses ~40% of batch deposits.
-- **Result (Claude Opus 4.6)**: F1 **99.7%** (Precision 99.8%, Recall 99.6%). 1440s, ~$25. Opus systematically explores cross-entity batch matches, achieving 100% batch recall and 95.7% mismatch recall.
-- **Result (Gemini Flash)**: F1 **91.2%** (Precision 99.7%, Recall 84.0%). 114s, ~$0.15. Cheapest and fastest but misses ~68% of batch deposits.
+- **Result (GPT-5.2 low)**: F1 **97.0%** (Precision 99.8%, Recall 94.3%). 193s, $0.26. With early validation feedback. Batch recall 80.7%.
+- **Result (GPT-5.2 high)**: F1 **98.9%** (Precision 99.8%, Recall 98.1%). 692s, $0.91. Batch recall 97.9%.
+- **Result (Claude Opus 4.6)**: F1 **99.7%** (Precision 99.8%, Recall 99.6%). 1440s, $3.66. Opus systematically explores cross-entity batch matches, achieving 100% batch recall and 95.7% mismatch recall.
+- **Result (Gemini Flash)**: F1 **91.2%** (Precision 99.7%, Recall 84.0%). 114s, $0.15. Cheapest and fastest but misses ~68% of batch deposits.
 
-### 4. Strategy 3a: Hybrid TaskGraph v4b (`strategy3_hybrid.py`)
-- **Approach**: An iteration on Strategy 3 designed specifically to handle extreme noise. Adds two new SQL heuristics to unburden the LLM: (1) Jaro-Winkler string similarity for 1:1 matches (recovers typos automatically), and (2) a secondary batching pass that purely sums pairs of close-proximity GL amounts regardless of vendor name (recovers typo'd batch entries).
-- **Result**: This is the current v4b spec. See multi-model results above.
-
-### 5. Strategy 5: Pure Prompt TaskGraph (`strategy4_pure_prompt.py`)
+### 4. Strategy 4: Pure Prompt TaskGraph (`strategy4_pure_prompt.py`)
 - **Approach**: An entirely LLM-driven approach. The LLM is provided the schemas and asked to write raw DuckDB SQL to perform the reconciliation autonomously, guided by high-level plain English rules.
 - **Result**: F1 ~79%. Surprisingly competent. The LLM successfully crafted SQL queries using `UPPER` and `LIKE` string matching that recovered the vast majority of 1:1 matches. However, it struggled with the combinatorial logic needed to discover multi-row batch deposits (recovering <10% of them). 
 
-### 6. Ablation Study: SQL Only (`strategy3a_sql_only.py`)
+### 5. Ablation Study: SQL Only (`strategy3a_sql_only.py`)
 - **Approach**: To measure exactly how much the LLM contributes to the Hybrid approach, this strategy runs the Hybrid TaskGraph but simply strips out the LLM node (`match_residual`).
 - **Result**: F1 ~60%. Without the LLM, the SQL nodes missed over 600 valid matches, entirely failing on fee mismatches, transpositions, and mangled vendor names. In the Hybrid pipeline, the LLM autonomously recovers ~300+ of these missed matches, demonstrating exactly why deterministic heuristics alone are insufficient for real-world reconciliation.

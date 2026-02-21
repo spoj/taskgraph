@@ -9,6 +9,27 @@ OpenRouter pricing (per million tokens):
 - Output: $14.00
 - Cache read: $0.175 (10x cheaper than input)
 
+## Typical Run Times and Costs
+
+Measured on bank reconciliation spec (9 nodes, 1000 records, hard difficulty).
+Only the `match_residual` prompt node uses the LLM; all other nodes are
+deterministic SQL or source ingestion.
+
+| Model | Reasoning | F1 | Wall time | Tokens | Cost |
+|-------|-----------|-----|-----------|--------|------|
+| gpt-5.2 | low | 97.0% | 3 min | 160k | $0.26 |
+| gpt-5.2 | high | 98.9% | 12 min | 1.19M | $0.91 |
+| claude-opus-4.6 | low | 99.7% | 24 min | 1.32M | $3.66 |
+
+Cost is dominated by output tokens and cache hit rate (75-94% cache reads
+across runs). Input cost is minor.
+
+**Timeout guidance:** Runs with `reasoning_effort=high` or large-context models
+(Opus) routinely take 10-25 minutes. A 10-minute timeout — which is a common
+default in many tools — will cut off a perfectly good run mid-execution. There
+is no resume capability, so a timeout wastes the entire run's time and cost.
+Use at least 30 minutes for any `tg run` invocation.
+
 ## Architecture
 
 Single DuckDB database as shared workspace. Nodes form a DAG, each runs as an

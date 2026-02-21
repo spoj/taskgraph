@@ -52,4 +52,5 @@ When `--spec` is not provided, Taskgraph looks for:
 
 ## Docs
 
-- `SPEC_GUIDE.md` (spec writers): how to build spec packages, write good tasks, validation, and exports
+- `SPEC_GUIDE.md` (spec writers): how to build spec packages, write good prompts, validation, and exports
+- `AGENTS.md` (contributors): architecture, DB schema, key functions, run times and costs

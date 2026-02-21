@@ -24,7 +24,6 @@ A complex, heuristic-heavy matching problem traditionally solved by fine-tuned P
 - `score.py` — Scoring library for evaluating solver output against ground truth.
 - `score_sql_only.py` — CLI tool for scoring a `.db` workspace file directly.
 - `run_all.sh` — Generates dataset and runs all strategies sequentially.
-- `LEARNING_LOG.md` — Iterative discoveries and prompt engineering lessons.
 
 See `bank_rec/README.md` for strategy descriptions and `BANK_REC_LESSONS.md` for detailed multi-model benchmark results, architectural evolution, and cost analysis.
 
