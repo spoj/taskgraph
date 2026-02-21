@@ -1,0 +1,269 @@
+{
+  "invoices": [
+    {
+      "invoice_id": "INV-00001",
+      "customer_id": "CUST-002",
+      "customer_name": "Sapphire Electronics Ltd",
+      "invoice_date": "2025-03-17",
+      "due_date": "2025-05-16",
+      "amount": 35200.0,
+      "description": "Temporary Staffing - January 2025"
+    },
+    {
+      "invoice_id": "INV-00002",
+      "customer_id": "CUST-004",
+      "customer_name": "Maple Leaf Consulting",
+      "invoice_date": "2025-03-18",
+      "due_date": "2025-04-17",
+      "amount": 6100.0,
+      "description": "Advertising Placement - May 2025"
+    },
+    {
+      "invoice_id": "INV-00003",
+      "customer_id": "CUST-005",
+      "customer_name": "Silverline Telecom Inc",
+      "invoice_date": "2025-03-21",
+      "due_date": "2025-05-20",
+      "amount": 4170.0,
+      "description": "Consulting Services - Project Epsilon"
+    },
+    {
+      "invoice_id": "INV-00004",
+      "customer_id": "CUST-002",
+      "customer_name": "Sapphire Electronics Ltd",
+      "invoice_date": "2025-03-26",
+      "due_date": "2025-05-25",
+      "amount": 4170.0,
+      "description": "Office Supplies - April 2025"
+    },
+    {
+      "invoice_id": "INV-00005",
+      "customer_id": "CUST-002",
+      "customer_name": "Sapphire Electronics Ltd",
+      "invoice_date": "2025-04-02",
+      "due_date": "2025-07-01",
+      "amount": 3280.0,
+      "description": "Legal Services - Matter #93886"
+    },
+    {
+      "invoice_id": "INV-00006",
+      "customer_id": "CUST-003",
+      "customer_name": "Sterling Automotive Parts",
+      "invoice_date": "2025-04-26",
+      "due_date": "2025-06-10",
+      "amount": 3280.0,
+      "description": "Temporary Staffing - July 2025"
+    },
+    {
+      "invoice_id": "INV-00007",
+      "customer_id": "CUST-001",
+      "customer_name": "Crestline Food Distributors",
+      "invoice_date": "2025-04-29",
+      "due_date": "2025-05-29",
+      "amount": 1760.0,
+      "description": "Consulting Services - Project Phoenix"
+    },
+    {
+      "invoice_id": "INV-00008",
+      "customer_id": "CUST-001",
+      "customer_name": "Crestline Food Distributors",
+      "invoice_date": "2025-05-10",
+      "due_date": "2025-08-08",
+      "amount": 9010.0,
+      "description": "Office Supplies - April 2025"
+    },
+    {
+      "invoice_id": "INV-00009",
+      "customer_id": "CUST-004",
+      "customer_name": "Maple Leaf Consulting",
+      "invoice_date": "2025-06-02",
+      "due_date": "2025-08-31",
+      "amount": 486.0,
+      "description": "Marketing Services - Campaign #36365"
+    }
+  ],
+  "payments": [
+    {
+      "payment_id": "PMT-00001",
+      "payment_date": "2025-04-01",
+      "payer_name": "Silverline Telecom Inc",
+      "amount": 4107.45,
+      "method": "CHECK",
+      "reference_info": "CK# 1005"
+    },
+    {
+      "payment_id": "PMT-00002",
+      "payment_date": "2025-04-08",
+      "payer_name": "Maple Leaf Consulting",
+      "amount": 6100.0,
+      "method": "WIRE",
+      "reference_info": "Wire Ref: Q85JSG65KX"
+    },
+    {
+      "payment_id": "PMT-00003",
+      "payment_date": "2025-05-15",
+      "payer_name": "Sapphire Electronics Ltd",
+      "amount": 35200.0,
+      "method": "EFT",
+      "reference_info": "EFT-82250789"
+    },
+    {
+      "payment_id": "PMT-00004",
+      "payment_date": "2025-05-16",
+      "payer_name": "Crestline Food Distributors",
+      "amount": 2703.0,
+      "method": "ACH",
+      "reference_info": "ACH CRESTLINE FOOD DIST"
+    },
+    {
+      "payment_id": "PMT-00005",
+      "payment_date": "2025-05-28",
+      "payer_name": "Sapphire Electronics Ltd",
+      "amount": 7450.0,
+      "method": "ACH",
+      "reference_info": "ACH Sapphire Electronics"
+    },
+    {
+      "payment_id": "PMT-00006",
+      "payment_date": "2025-06-17",
+      "payer_name": "Crestline Food Distributors",
+      "amount": 1579.69,
+      "method": "WIRE",
+      "reference_info": "Wire Ref: E7CKW5NGCX"
+    },
+    {
+      "payment_id": "PMT-00007",
+      "payment_date": "2025-06-30",
+      "payer_name": "Maple Leaf",
+      "amount": 486.0,
+      "method": "EFT",
+      "reference_info": "EFT-64512352"
+    }
+  ],
+  "remittance_lines": [
+    {
+      "remittance_id": "REM-00001",
+      "payment_id": "PMT-00006",
+      "invoice_ref": "INV-00007",
+      "amount": 1579.69,
+      "memo": "Deduction: Damaged goods (-$180.31)"
+    },
+    {
+      "remittance_id": "REM-00002",
+      "payment_id": "PMT-00005",
+      "invoice_ref": "INV-00004",
+      "amount": 4170.0,
+      "memo": ""
+    },
+    {
+      "remittance_id": "REM-00003",
+      "payment_id": "PMT-00005",
+      "invoice_ref": "INV-00050",
+      "amount": 3280.0,
+      "memo": ""
+    },
+    {
+      "remittance_id": "REM-00004",
+      "payment_id": "PMT-00004",
+      "invoice_ref": "INV-00008",
+      "amount": 2703.0,
+      "memo": "Progress payment #2"
+    },
+    {
+      "remittance_id": "REM-00005",
+      "payment_id": "PMT-00002",
+      "invoice_ref": "INV-00002",
+      "amount": 6100.0,
+      "memo": ""
+    },
+    {
+      "remittance_id": "REM-00006",
+      "payment_id": "PMT-00003",
+      "invoice_ref": "INV-00001",
+      "amount": 35200.0,
+      "memo": ""
+    },
+    {
+      "remittance_id": "REM-00007",
+      "payment_id": "PMT-00001",
+      "invoice_ref": "INV-00003",
+      "amount": 4107.45,
+      "memo": "Less 2% early pay discount"
+    }
+  ],
+  "ground_truth": {
+    "applications": [
+      {
+        "payment_id": "PMT-00006",
+        "invoice_id": "INV-00007",
+        "applied_amount": 1579.69,
+        "match_type": "short_pay_deduction"
+      },
+      {
+        "payment_id": "PMT-00005",
+        "invoice_id": "INV-00004",
+        "applied_amount": 4170.0,
+        "match_type": "multi_invoice"
+      },
+      {
+        "payment_id": "PMT-00005",
+        "invoice_id": "INV-00005",
+        "applied_amount": 3280.0,
+        "match_type": "multi_invoice"
+      },
+      {
+        "payment_id": "PMT-00004",
+        "invoice_id": "INV-00008",
+        "applied_amount": 2703.0,
+        "match_type": "partial_payment"
+      },
+      {
+        "payment_id": "PMT-00002",
+        "invoice_id": "INV-00002",
+        "applied_amount": 6100.0,
+        "match_type": "simple_1to1"
+      },
+      {
+        "payment_id": "PMT-00003",
+        "invoice_id": "INV-00001",
+        "applied_amount": 35200.0,
+        "match_type": "simple_1to1"
+      },
+      {
+        "payment_id": "PMT-00007",
+        "invoice_id": "INV-00009",
+        "applied_amount": 486.0,
+        "match_type": "no_remittance"
+      },
+      {
+        "payment_id": "PMT-00001",
+        "invoice_id": "INV-00003",
+        "applied_amount": 4107.45,
+        "match_type": "discount_taken"
+      }
+    ],
+    "unmatched_payments": [],
+    "unapplied_invoices": [
+      "INV-00006"
+    ]
+  },
+  "metadata": {
+    "n_invoices": 9,
+    "n_payments": 7,
+    "n_remittance_lines": 7,
+    "n_applications": 8,
+    "n_unmatched_payments": 0,
+    "n_unapplied_invoices": 1,
+    "seed": 42,
+    "difficulty": "hard",
+    "target_n": 10,
+    "match_type_counts": {
+      "short_pay_deduction": 1,
+      "multi_invoice": 2,
+      "partial_payment": 1,
+      "simple_1to1": 2,
+      "no_remittance": 1,
+      "discount_taken": 1
+    }
+  }
+}
