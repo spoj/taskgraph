@@ -20,7 +20,7 @@ Achieved 99.8% F1 on seed=42 but contained generator-specific fine-tuning:
 - Hardcoded fee list (SERVICE CHARGE, MAINTENANCE FEE, etc.)
 - Prompt mentioning generator patterns (AMZN MKTP, GOOG *, DEPOSIT)
 
-### v4: Simplified (7 nodes)
+### v4: Simplified (8 nodes)
 Dropped 3 SQL nodes (`batch_match`, `tolerance`, `amount_match`). Let the LLM
 handle all matching beyond check-number and entity+amount 1:1.
 
@@ -28,12 +28,14 @@ handle all matching beyond check-number and entity+amount 1:1.
 batch recall dropped to 17.5%. The LLM couldn't reliably handle batch matching
 at scale in a single prompt.
 
-### v4b: Balanced (8 nodes, current)
-Re-added a **general-purpose** batch SQL node and fixed two bugs. Three changes:
+### v4b: Balanced (9 nodes, current)
+Re-added a **general-purpose** batch SQL node, added an exact-amount-closest-date
+SQL node, and fixed two bugs. Key changes:
 
 1. Entity truncation fix (general-purpose)
 2. General-purpose batch SQL node (no generator-specific params)
-3. Offsetting entity confirmation (prevents false positive GL pairs)
+3. Exact-amount + closest-date SQL node (fallback for remaining exact matches)
+4. Offsetting entity confirmation (prevents false positive GL pairs)
 
 Results: 100% precision, 98.5–100% recall across 3 seeds and 3 difficulty levels.
 

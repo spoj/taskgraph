@@ -590,11 +590,6 @@ class _Generator:
         self._used_amounts.add(val)
         return val * sign
 
-        # fallback with cents
-        val = round(self.rng.uniform(lo, hi), 2)
-        self._used_amounts.add(val)
-        return val * sign
-
     # ------------------------------------------------------------------
     # Date generation
     # ------------------------------------------------------------------
@@ -639,7 +634,11 @@ class _Generator:
                 c = self._cryptic(category)
                 if c:
                     return c
-            if r < self.p.cryptic_desc_frac + self.p.truncated_desc_frac:
+                # Cryptic template unavailable for this category; re-roll
+                # against truncated vs standard using a fresh random draw
+                # to avoid biasing the truncated rate.
+                r = self.rng.random()
+            if r < self.p.truncated_desc_frac:
                 style = "truncated"
             else:
                 style = "standard"

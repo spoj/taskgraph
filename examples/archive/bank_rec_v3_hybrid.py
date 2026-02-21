@@ -1,3 +1,4 @@
+# ARCHIVE: Historical snapshot — imports reference old paths and will not run. See examples/bank_rec/ for current code.
 """Bank Reconciliation V3 — Redesigned: SQL-heavy pipeline with focused LLM
 
 Architecture: push as much as possible into deterministic SQL nodes.

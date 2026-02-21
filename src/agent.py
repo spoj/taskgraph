@@ -272,7 +272,8 @@ def execute_sql(
                 if len(serialized) > max_result_chars:
                     success = False
                     error_str = (
-                        f"The return set serialized to more than the length limit of {max_result_chars:,} chars. "
+                        f"Result too large ({len(rows)} rows, {len(serialized):,} chars; "
+                        f"limit is {max_result_chars:,} chars). "
                         "Try again with more targeted queries, e.g., using a LIMIT clause or requesting only specific columns."
                     )
                     result = {
@@ -291,7 +292,11 @@ def execute_sql(
         error_str = str(e)
         # If we timed out but got a different exception type, label it clearly
         if timed_out:
-            error_str = f"Query timed out after {query_timeout_s}s ({error_str})"
+            error_str = (
+                f"Query execution exceeded the {query_timeout_s} second timeout limit "
+                f"and was aborted ({error_str}). "
+                "Please reformulate your approach with faster, optimized queries."
+            )
         result = {"success": False, "error": error_str}
     finally:
         if timer is not None:

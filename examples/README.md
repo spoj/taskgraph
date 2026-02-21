@@ -1,22 +1,37 @@
-# Bank Reconciliation Examples
+# Examples
 
-This directory contains code and experiments exploring how to perform Bank Reconciliation using TaskGraph. Bank Rec is a complex, heuristic-heavy matching problem traditionally solved by fine-tuned Python scripts. We use it here to showcase how combining deterministic SQL nodes with non-deterministic LLM `prompt` nodes can achieve high accuracy while remaining highly generalized.
+This directory contains examples and experiments exploring how to use TaskGraph.
 
-## Core Files
+## Basic Examples (`basics/`)
 
-- `bank_rec_generator.py`: An extremely robust synthetic bank reconciliation problem generator. Generates datasets of arbitrary size with tunable difficulties (injecting typo noise, cryptic descriptions, offsetting entries, transpositions, and date clearing lags).
-- `bank_rec_v4.py`: The definitive "Hybrid" pipeline. It uses pure SQL to filter out all obvious deterministic matches, then delegates the remaining messy/ambiguous transactions to a `prompt` node for final fuzzy matching.
-- `solve_bank_rec.py`: A highly-tuned deterministic Python solver for comparison. Uses heavy regexes, subsets sums, and text normalization.
-- `score_bank_rec.py`: CLI tool for scoring the output of a solver/pipeline against the Ground Truth produced by the generator. 
-- `BANK_REC_LESSONS.md`: Contains a narrative log of our previous learnings trying to solve this task iteratively with TaskGraph (v2, v3, v4).
+Simple TaskGraph specs demonstrating core concepts:
+- `single_task/` — Minimal single-node spec.
+- `linear_chain/` — Linear chain of dependent nodes.
+- `diamond_dag/` — Diamond-shaped DAG with convergent dependencies.
+- `validation_demo/` — Validation views and output schema checks.
 
-## Evaluation Benchmark
+## Bank Reconciliation Benchmark (`bank_rec/`)
 
-Check out the `eval_bank_rec/` directory for a fully packaged, reproducible benchmark suite that compares 5 different reconciliation strategies (from generic python, to hand-tuned python, to LLM-SQL hybrid, to pure-prompt SQL). It includes `run_all.sh` to generate the testbed and execute all strategies automatically.
+A complex, heuristic-heavy matching problem traditionally solved by fine-tuned Python scripts. Showcases how combining deterministic SQL nodes with LLM prompt nodes can achieve high accuracy while remaining highly generalized.
 
-## Archive
+- `generator.py` — Synthetic bank reconciliation dataset generator with tunable difficulty (typos, cryptic descriptions, offsetting entries, transpositions, date lags).
+- `generate_dataset.py` — CLI wrapper that generates `dataset.json` for benchmarking.
+- `strategy3_hybrid.py` — The definitive hybrid pipeline: SQL handles deterministic matches (check numbers, entity+amount, batches, offsetting), LLM handles fuzzy residual.
+- `strategy1_generic.py` — Naive deterministic Python solver (amount+date only).
+- `strategy2_tuned.py` / `strategy2a_tuned_detailed.py` — Hand-tuned Python solvers with regexes, subset-sum, entity normalization.
+- `strategy3a_sql_only.py` — Ablation: hybrid pipeline with the LLM node stripped out (SQL-only).
+- `strategy4_pure_prompt.py` — Pure LLM approach: prompt node writes all matching SQL from scratch.
+- `score.py` — Scoring library for evaluating solver output against ground truth.
+- `score_sql_only.py` — CLI tool for scoring a `.db` workspace file directly.
+- `run_all.sh` — Generates dataset and runs all strategies sequentially.
+- `LEARNING_LOG.md` — Iterative discoveries and prompt engineering lessons.
 
-The `archive/` directory contains older iterations and experiments.
-- `bank_rec_problem.py`: The original, static ~100-record problem definition file.
-- `bank_rec_v2_*.py / bank_rec_v3_*.py`: Our early attempts at building the pipeline before we discovered the ideal Hybrid split in v4.
-- `bank_rec_v5.py`: An attempt to completely replace the LLM with 8 additional SQL nodes (which proved that SQL alone misses too many edge cases).
+See `bank_rec/README.md` for detailed strategy comparison and results.
+
+## Lessons Learned (`BANK_REC_LESSONS.md`)
+
+Narrative log of architectural evolution from v1 (monolithic LLM) through v4b (balanced hybrid), with benchmark results and key design decisions.
+
+## Archive (`archive/`)
+
+Historical iterations (v2, v3, v4, v5) preserved for reference. These files have stale import paths and are not runnable — they document the evolution of the approach.

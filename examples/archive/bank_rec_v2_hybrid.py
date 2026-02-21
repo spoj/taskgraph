@@ -1,3 +1,4 @@
+# ARCHIVE: Historical snapshot — imports reference old paths and will not run. See examples/bank_rec/ for current code.
 """Bank Reconciliation V2 — Hybrid: sql base + LLM for hard cases
 
 Deterministic SQL handles easy/medium matches (exact amount + date window +

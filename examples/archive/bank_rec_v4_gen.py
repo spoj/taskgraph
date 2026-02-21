@@ -1,3 +1,4 @@
+# ARCHIVE: Historical snapshot — imports reference old paths and will not run. See examples/bank_rec/ for current code.
 """Bank Reconciliation V4 — Generated Problems (simplified spec)
 
 Same generator, simplified solver spec with less fine-tuning.

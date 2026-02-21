@@ -1,3 +1,4 @@
+# ARCHIVE: Historical snapshot — imports reference old paths and will not run. See examples/bank_rec/ for current code.
 """Bank Reconciliation V3 — Generated Problems
 
 Same as bank_rec_v2_gen.py but uses the V3 redesigned spec.

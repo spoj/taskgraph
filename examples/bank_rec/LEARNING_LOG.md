@@ -12,7 +12,7 @@ The hybrid TaskGraph approach proved effective by interleaving the two:
 This architecture reduced token usage, mitigated context-window issues, and allowed the agent to focus on anomaly resolution.
 
 ## Learning 2: Immutability and Debuggability
-TaskGraph's design outputs materialized views to a local DuckDB `.db` file (`runs/strategy3_hybrid.db`). 
+TaskGraph's design outputs materialized views to a local DuckDB `.db` file (e.g. `strategy3_hybrid.db`). 
 When the LLM failed to match "Weekly Recurring" payments, we connected to the `.db` file and queried the `_trace` table to see the exact SQL the LLM generated and the specific data pool it was evaluating (`SELECT * FROM match_exact_closest_final_remaining_bank`). 
 
 Because the pipeline state is frozen at each node boundary, debugging agent behavior is a straightforward SQL querying exercise.

@@ -251,7 +251,7 @@ entangled AS (
     FROM candidates c
     JOIN bank_counts bc ON c.bank_id = bc.bank_id
     JOIN gl_counts gc ON c.gl_id = gc.gl_id
-    WHERE bc.n_candidates > 1 AND gc.n_candidates > 1
+    WHERE bc.n_candidates > 1 OR gc.n_candidates > 1
 ),
 bank_entangled AS (
     SELECT bank_id, MIN(amount) as amount, MIN(bank_ent) as bank_ent, MIN(bank_date) as bank_date
@@ -501,7 +501,7 @@ candidate_batches AS (
     FROM remaining_bank b
     JOIN gl_pairs p
       ON ABS(b.amount - p.sum_amount) < 0.01
-     AND b.date >= p.d1 AND b.date <= p.d1 + INTERVAL 14 DAY
+     AND b.date >= LEAST(p.d1, p.d2) - INTERVAL 3 DAY AND b.date <= GREATEST(p.d1, p.d2) + INTERVAL 14 DAY
      AND jaro_winkler_similarity(p.e1, p.e2) > 0.8
 ),
 bank_counts AS (SELECT bank_id, COUNT(*) as c FROM candidate_batches GROUP BY bank_id)
@@ -571,12 +571,10 @@ WHERE cnt > 1;
 MATCH_EXACT_CLOSEST_SQL = """\
 CREATE VIEW match_exact_closest_matched AS
 WITH remaining_bank AS (
-    SELECT b.* FROM batch_match_final_remaining_bank b_ids
-    JOIN features_bank b ON b_ids.id = b.id
+    SELECT * FROM batch_match_final_remaining_bank
 ),
 remaining_gl AS (
-    SELECT g.* FROM batch_match_final_remaining_gl g_ids
-    JOIN features_gl g ON g_ids.id = g.id
+    SELECT * FROM batch_match_final_remaining_gl
 ),
 candidates AS (
     SELECT
@@ -884,6 +882,6 @@ NODES = [
         "name": "report",
         "sql": REPORT_SQL,
         "validate": {"main": REPORT_VALIDATE},
-        "depends_on": ["features", "match_residual", "offsetting", "batch_match"],
+        "depends_on": ["features", "match_residual", "offsetting"],
     },
 ]

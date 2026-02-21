@@ -1,3 +1,4 @@
+# ARCHIVE: Historical snapshot — imports reference old paths and will not run. See examples/bank_rec/ for current code.
 """Bank Reconciliation Problem --- January 2025
 
 A mid-size company's monthly bank reconciliation for the operating account.

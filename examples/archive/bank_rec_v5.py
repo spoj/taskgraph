@@ -1,3 +1,4 @@
+# ARCHIVE: Historical snapshot — imports reference old paths and will not run. See examples/bank_rec/ for current code.
 """Bank Reconciliation V5 — All-SQL deterministic pipeline (no LLM)
 
 Replaces the LLM prompt node from v4 with additional SQL nodes.

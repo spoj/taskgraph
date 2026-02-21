@@ -4,9 +4,8 @@ Re-generates the same problem (same seed/n/difficulty) and compares the
 solver's output in the .db file against the known ground truth.
 
 Usage:
-    uv run python examples/score_bank_rec.py gen200.db  --n 200
-    uv run python examples/score_bank_rec.py gen1000.db --n 1000
-    uv run python examples/score_bank_rec.py gen1000.db --n 1000 --difficulty medium --seed 99
+    uv run python examples/bank_rec/score.py output.db --n 1000
+    uv run python examples/bank_rec/score.py output.db --n 1000 --difficulty medium --seed 99
 """
 
 from __future__ import annotations
@@ -230,7 +229,7 @@ def score(truth: dict, solver: dict) -> dict:
     }
 
 
-def print_report(scores: dict, solver: dict, summary: dict):
+def print_report(scores: dict, solver: dict):
     """Print a formatted scoring report."""
     pa = scores["pair_accuracy"]
     print()
@@ -299,12 +298,15 @@ def print_report(scores: dict, solver: dict, summary: dict):
         print("NODE METADATA")
         print("-" * 50)
         for node, m in sorted(meta.items()):
-            elapsed = m.get("elapsed_s", "?")
+            elapsed = m.get("elapsed_s")
+            elapsed_str = (
+                f"{elapsed:>6.1f}s" if isinstance(elapsed, (int, float)) else "     ?s"
+            )
             iters = m.get("iterations", "-")
             tokens = m.get("total_tokens", "-")
             status = m.get("validation_status", "?")
             print(
-                f"  {node:<20s}  {elapsed:>6.1f}s  iters={iters}  "
+                f"  {node:<20s}  {elapsed_str}  iters={iters}  "
                 f"tokens={tokens}  validation={status}"
             )
 
@@ -315,9 +317,11 @@ def print_report(scores: dict, solver: dict, summary: dict):
 def main():
     parser = argparse.ArgumentParser(description="Score bank rec solver output")
     parser.add_argument("db_path", help="Path to solver output .db file")
-    parser.add_argument("--n", type=int, default=200, help="n_bank used for generation")
+    parser.add_argument(
+        "--n", type=int, default=1000, help="n_bank used for generation"
+    )
     parser.add_argument("--difficulty", default="hard", help="Difficulty preset")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, default=123, help="Random seed")
     args = parser.parse_args()
 
     # Regenerate ground truth with same parameters
@@ -354,7 +358,7 @@ def main():
 
     # Score
     scores = score(truth, solver)
-    print_report(scores, solver, s)
+    print_report(scores, solver)
 
     # Exit code: 0 if F1 > 50%, 1 otherwise
     f1 = scores["pair_accuracy"]["f1_pct"]

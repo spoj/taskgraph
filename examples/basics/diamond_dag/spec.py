@@ -137,7 +137,7 @@ NODES = [
     },
     {
         "name": "sales",
-        "depends_on": ["prep", "products"],
+        "depends_on": ["prep"],
         "sql": """
             CREATE OR REPLACE VIEW sales_summary AS
             SELECT

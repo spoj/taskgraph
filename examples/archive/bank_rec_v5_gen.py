@@ -1,3 +1,4 @@
+# ARCHIVE: Historical snapshot — imports reference old paths and will not run. See examples/bank_rec/ for current code.
 """Bank Reconciliation V5 — Generated Problems (all-SQL, no LLM)
 
 All-SQL deterministic pipeline. No API key needed.

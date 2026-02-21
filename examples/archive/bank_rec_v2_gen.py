@@ -1,3 +1,4 @@
+# ARCHIVE: Historical snapshot — imports reference old paths and will not run. See examples/bank_rec/ for current code.
 """Bank Reconciliation V2 — Generated Problems
 
 Same solver pipeline as bank_rec_v2_hybrid.py but fed with synthetic data
