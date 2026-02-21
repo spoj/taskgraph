@@ -234,6 +234,61 @@ No per-type `_post_execute()` or `_materialize_node()` wrappers. The `run_sql_no
 - `Namespace.for_validation(node)` — `{name}__validation*` prefix
 - `Namespace.for_source_validation(source_name)` — `{input}__validation*` prefix (for source validation)
 
+## Example Layout Convention
+
+Each example in `examples/` follows a standard structure. No shared base
+classes — each example is self-contained.
+
+```
+examples/{use_case}/
+├── __init__.py
+├── generator.py              # Problem generator (deterministic, seeded)
+├── generate_*.py             # CLI script to produce problem sets
+├── score.py                  # Scoring framework (F1, precision, recall, per-type)
+├── strategy1_generic.py      # Deterministic naive/greedy baseline
+├── strategy2_tuned.py        # Deterministic fine-tuned multi-pass solver
+├── strategy3_hybrid.py       # Taskgraph spec: SQL preprocessing + LLM residual
+├── strategy4_prompt.py       # Taskgraph spec: pure LLM prompt
+├── problems/                 # Pre-generated problem sets (version-controlled)
+│   ├── n10_seed42.json
+│   ├── n30_seed42.json
+│   ├── n100_seed42.json      # Default benchmark size
+│   ├── n300_seed42.json
+│   └── n1000_seed42.json
+└── runs/                     # Run output artifacts (NOT version-controlled)
+    └── .gitignore            # Contains: *\n!.gitignore
+```
+
+Strategy numbering convention:
+- **S1**: deterministic naive/greedy (baseline, fast, zero cost)
+- **S2**: deterministic fine-tuned (best deterministic, zero cost)
+- **S3**: taskgraph hybrid SQL+LLM (SQL handles easy cases, LLM handles residual)
+- **S4**: taskgraph pure LLM (LLM does everything — measures raw LLM capability)
+
+Variants use letter suffixes: `strategy2a_tuned_detailed.py`,
+`strategy3a_sql_only.py`.
+
+## Run Artifacts
+
+All `.db` output files from `tg run` go in the example's `runs/` subdirectory.
+These are valuable for debugging and comparison but are NOT version-controlled.
+
+```bash
+# Run a strategy and save output to runs/
+uv run tg run --spec examples/bank_rec/strategy3_hybrid.py \
+  -o examples/bank_rec/runs/strategy3_hybrid.db
+
+# Score against ground truth
+uv run python -m examples.bank_rec.score \
+  examples/bank_rec/runs/strategy3_hybrid.db --dataset examples/bank_rec/problems/n1000_seed42.json
+```
+
+Each `runs/` directory has a `.gitignore` containing `*` / `!.gitignore` so
+files are excluded regardless of the root `.gitignore` rules.
+
+Do NOT place `.db` files at the repo root or in arbitrary locations. Always
+use the example's `runs/` subdirectory.
+
 ## CLI Commands
 
 ### `taskgraph init`
