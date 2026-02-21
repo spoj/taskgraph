@@ -9,6 +9,7 @@ from src.agent import (
     execute_sql,
     is_sql_allowed,
     _json_default,
+    _run_early_validation,
     DEFAULT_QUERY_TIMEOUT_S,
     MAX_RESULT_CHARS,
 )
@@ -326,7 +327,7 @@ class TestQueryTimeout:
             query_timeout_s=1,  # 1 second timeout
         )
         assert not result["success"]
-        assert "timed out" in result["error"].lower()
+        assert "timeout" in result["error"].lower()
 
     def test_timeout_zero_disables(self, conn: duckdb.DuckDBPyConnection):
         """query_timeout_s=0 disables the timeout."""
@@ -361,7 +362,7 @@ class TestQueryTimeout:
         ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] is False
-        assert "timed out" in rows[0][1].lower()
+        assert "timeout" in rows[0][1].lower()
 
 
 class TestAddCacheControl:
@@ -811,3 +812,111 @@ class TestNamespace:
         """Namespace compared to non-Namespace returns NotImplemented."""
         ns = Namespace(frozenset({"x"}), "p")
         assert ns != "not a namespace"
+
+
+class TestEarlyValidation:
+    """Tests for _run_early_validation() early feedback summaries."""
+
+    @pytest.fixture
+    def conn(self):
+        c = duckdb.connect(":memory:")
+        c.execute("CREATE TABLE items (id INT, amount DOUBLE)")
+        c.execute("INSERT INTO items VALUES (1, 10.0), (2, -5.0), (3, 0.0)")
+        yield c
+        c.close()
+
+    def test_no_validation_returns_empty(self, conn):
+        """Node without validate returns empty list."""
+        node = _make_node(name="t", prompt="do stuff")
+        result = _run_early_validation(conn, node)
+        assert result == []
+
+    def test_all_pass_returns_ok(self, conn):
+        """Validation query returning zero rows -> 'ok'."""
+        node = _make_node(
+            name="t",
+            prompt="do stuff",
+            validate={
+                "positive": "SELECT 'fail' AS status, 'bad' AS message WHERE 1=0"
+            },
+        )
+        result = _run_early_validation(conn, node)
+        assert result == ["positive: ok"]
+
+    def test_failures_counted(self, conn):
+        """Validation returning fail rows reports count."""
+        node = _make_node(
+            name="t",
+            prompt="do stuff",
+            validate={
+                "amounts": (
+                    "SELECT CASE WHEN amount <= 0 THEN 'fail' ELSE 'pass' END AS status, "
+                    "'bad amount' AS message FROM items WHERE amount <= 0"
+                ),
+            },
+        )
+        result = _run_early_validation(conn, node)
+        assert len(result) == 1
+        assert result[0] == "amounts: 2 fail"
+
+    def test_mixed_fail_warn(self, conn):
+        """Validation with both fail and warn rows."""
+        node = _make_node(
+            name="t",
+            prompt="do stuff",
+            validate={
+                "check": (
+                    "SELECT * FROM (VALUES "
+                    "('fail', 'msg1'), ('warn', 'msg2'), ('fail', 'msg3'), ('pass', 'msg4')"
+                    ") AS t(status, message)"
+                ),
+            },
+        )
+        result = _run_early_validation(conn, node)
+        assert result == ["check: 2 fail, 1 warn"]
+
+    def test_all_pass_rows(self, conn):
+        """Validation returning rows all with status='pass'."""
+        node = _make_node(
+            name="t",
+            prompt="do stuff",
+            validate={
+                "ok_check": "SELECT 'pass' AS status, 'fine' AS message FROM items",
+            },
+        )
+        result = _run_early_validation(conn, node)
+        assert len(result) == 1
+        assert "ok" in result[0]
+        assert "3 rows" in result[0]
+
+    def test_missing_view_skipped(self, conn):
+        """Validation referencing nonexistent view is silently skipped."""
+        node = _make_node(
+            name="t",
+            prompt="do stuff",
+            validate={
+                "needs_view": "SELECT 'fail' AS status, 'x' AS message FROM t_output",
+            },
+        )
+        result = _run_early_validation(conn, node)
+        # Should return empty — the check errored and was skipped
+        assert result == []
+
+    def test_multiple_checks_sorted(self, conn):
+        """Multiple checks return sorted summaries, skipping erroring ones."""
+        node = _make_node(
+            name="t",
+            prompt="do stuff",
+            validate={
+                "b_check": "SELECT 'fail' AS status, 'bad' AS message WHERE 1=0",
+                "a_check": (
+                    "SELECT 'fail' AS status, 'neg' AS message FROM items WHERE amount < 0"
+                ),
+                "c_missing": "SELECT * FROM nonexistent_view",
+            },
+        )
+        result = _run_early_validation(conn, node)
+        # a_check: 1 fail, b_check: ok, c_missing: skipped (error)
+        assert len(result) == 2
+        assert result[0] == "a_check: 1 fail"
+        assert result[1] == "b_check: ok"
