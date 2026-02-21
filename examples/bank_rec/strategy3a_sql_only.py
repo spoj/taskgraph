@@ -1,22 +1,28 @@
 import json
 from datetime import datetime
+from pathlib import Path
+
 from examples.bank_rec.strategy3_hybrid import NODES as HYBRID_NODES
+
+_DATA_PATH = Path(__file__).parent / "dataset.json"
+
+
+def _load_data():
+    return json.loads(_DATA_PATH.read_text())
 
 
 def load_bank():
-    with open("dataset.json") as f:
-        data = json.load(f)["bank_transactions"]
-        for row in data:
-            row["date"] = datetime.strptime(row["date"], "%Y-%m-%d").date()
-        return data
+    data = _load_data()["bank_transactions"]
+    for row in data:
+        row["date"] = datetime.strptime(row["date"], "%Y-%m-%d").date()
+    return data
 
 
 def load_gl():
-    with open("dataset.json") as f:
-        data = json.load(f)["gl_entries"]
-        for row in data:
-            row["date"] = datetime.strptime(row["date"], "%Y-%m-%d").date()
-        return data
+    data = _load_data()["gl_entries"]
+    for row in data:
+        row["date"] = datetime.strptime(row["date"], "%Y-%m-%d").date()
+    return data
 
 
 REPORT_SQL = """
