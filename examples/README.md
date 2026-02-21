@@ -22,8 +22,6 @@ A complex, heuristic-heavy matching problem traditionally solved by fine-tuned P
 - `strategy3a_sql_only.py` — Ablation: hybrid pipeline with the LLM node stripped out (SQL-only).
 - `strategy4_pure_prompt.py` — Pure LLM approach: prompt node writes all matching SQL from scratch.
 - `score.py` — Scoring library for evaluating solver output against ground truth.
-- `score_sql_only.py` — CLI tool for scoring a `.db` workspace file directly.
-- `run_all.sh` — Generates dataset and runs all strategies sequentially.
 
 See `bank_rec/README.md` for strategy descriptions and `BANK_REC_LESSONS.md` for detailed multi-model benchmark results, architectural evolution, and cost analysis.
 

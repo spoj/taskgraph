@@ -18,10 +18,17 @@ This dataset includes:
 
 ## How to Run
 
-Execute the `run_all.sh` script to generate a fresh dataset and run all strategies sequentially. Be warned that the TaskGraph strategies will use your default LLM and may take a few minutes each.
-
 ```bash
-bash run_all.sh
+# Generate dataset
+uv run python -m examples.bank_rec.generate_dataset --n 1000 --seed 42 --difficulty hard
+
+# Run a strategy
+uv run tg run --spec examples/bank_rec/strategy3_hybrid.py \
+  -o examples/bank_rec/runs/strategy3_hybrid.db
+
+# Score output
+uv run python -m examples.bank_rec.score \
+  examples/bank_rec/runs/strategy3_hybrid.db --dataset examples/bank_rec/dataset.json
 ```
 
 ## The Strategies
