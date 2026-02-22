@@ -79,10 +79,14 @@ def add_cache_control(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 }
             ]
         elif isinstance(content, list):
+            import copy
+
             # Add cache_control to last text block
-            for j in range(len(content) - 1, -1, -1):
-                if content[j].get("type") == "text":
-                    content[j]["cache_control"] = {"type": "ephemeral"}
+            new_content = copy.deepcopy(content)
+            for j in range(len(new_content) - 1, -1, -1):
+                if new_content[j].get("type") == "text":
+                    new_content[j]["cache_control"] = {"type": "ephemeral"}
+                    messages[i]["content"] = new_content
                     break
         break
 

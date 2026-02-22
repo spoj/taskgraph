@@ -112,10 +112,13 @@ def materialize_views(
         tmp_name = f"_materialize_tmp_{view_name}"
         conn.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
         conn.execute(f'CREATE TABLE "{tmp_name}" AS SELECT * FROM "{view_name}"')
+        conn.execute("BEGIN TRANSACTION")
         try:
             conn.execute(f'DROP VIEW "{view_name}"')
             conn.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{view_name}"')
+            conn.execute("COMMIT")
         except duckdb.Error:
+            conn.execute("ROLLBACK")
             # Swap failed — drop the tmp table so we don't leak it.
             # The original view may or may not still exist; either way
             # downstream can still query it by name.
