@@ -49,13 +49,15 @@ same greedy DAG executor as sql/prompt nodes.
 ### Source files
 
 - `src/task.py` — `Node` dataclass, `_NO_SOURCE` sentinel, DAG resolution (topo-sort via Kahn's algorithm), dependency graph (`resolve_deps`), graph validation (`validate_graph`), output validation, validation view enforcement
-- `src/agent.py` — node agent: prompt-based SQL transform, SQL execution with namespace enforcement, `persist_node_meta`, `run_node_agent`, `run_sql_node`, `run_validate_sql`, `validate_node_complete`
+- `src/agent.py` — node agent: prompt-based SQL transform, SQL execution with namespace enforcement, `run_node_agent`, `run_sql_node`, `run_validate_sql`, `validate_node_complete`
 - `src/agent_loop.py` — generic async agent loop with concurrent tool execution
 - `src/api.py` — OpenRouter client. Connection pooling, cache_control on last message (Anthropic only), reasoning_effort
 - `src/namespace.py` — `Namespace` class: DDL name enforcement for nodes and validation. Factory methods `for_node()`, `for_validation()`, `for_source_validation()` encode naming conventions. Single `check_name()` entry point used by `is_sql_allowed()`.
 - `src/sql_utils.py` — shared SQL utilities: parser connection, statement splitting, column schema queries, CREATE name extraction
 - `src/workspace.py` — Workspace orchestrator: resolve DAG, run nodes with greedy scheduling, view materialization, unified post-execution flow
 - `src/ingest.py` — Ingestion: DataFrame/list[dict]/dict[str,list] or file paths -> DuckDB with _row_id PK
+- `src/infra.py` — Workspace infrastructure tables: `_trace` (+ `_trace_seq`, `_view_definitions`), `_node_meta`, `_workspace_meta`. Includes `log_trace`, `persist_node_meta`, `persist_workspace_meta`
+- `src/catalog.py` — DuckDB catalog helpers: `list_views`, `list_tables`, `view_exists`, `count_rows`
 - `src/spec.py` — spec loader: parses `NODES` list from Python modules, validates fields, resolves file paths
 - `scripts/cli.py` — CLI entry point: `tg init`, `tg run`, `tg show`
 
@@ -140,7 +142,7 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 | Table | PK | Columns | Purpose |
 |-------|-----|---------|---------|
 | `_node_meta` | `node` | `node VARCHAR`, `meta_json VARCHAR` | Per-node run metadata (model, iterations, tokens, elapsed, validation status) |
-| `_trace` | `id` (sequence) | `id`, `timestamp`, `node VARCHAR`, `source VARCHAR`, `query`, `success`, `error`, `row_count`, `elapsed_ms` | SQL execution log |
+| `_trace` | `id` (sequence) | `id`, `timestamp`, `node VARCHAR`, `source VARCHAR`, `kind VARCHAR`, `query`, `content VARCHAR`, `success`, `error`, `row_count`, `elapsed_ms` | SQL execution log (`kind` defaults to `'sql'`; `content` stores non-SQL payloads like assistant final messages) |
 | `_workspace_meta` | `key` | `key VARCHAR`, `value VARCHAR` | Workspace-level metadata (model, prompts, timing, spec info) |
 
 ### Derived views
@@ -156,6 +158,7 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 | `agent` | LLM agent tool calls (prompt nodes) |
 | `sql_node` | Deterministic SQL node execution |
 | `node_validation` | Validation view definition |
+| `assistant` | Agent's final assistant message (kind=`assistant_final`) |
 | `input_validation` | (reserved — referenced in docstrings only) |
 
 ### Workspace metadata keys
@@ -171,6 +174,7 @@ No other third-party imports. Spec modules should be pure data + ingestion logic
 | `llm_model` | Model identifier |
 | `llm_reasoning_effort` | Reasoning effort level (optional) |
 | `llm_max_iterations` | Max iterations (optional) |
+| `node_max_concurrency` | Max concurrent running nodes (optional) |
 | `inputs_row_counts` | JSON: `{source_name: count}` |
 | `inputs_schema` | JSON: `{source_name: [{name, type}]}` |
 | `run` | JSON: `{"mode": "run"}` |
@@ -215,18 +219,32 @@ No per-type `_post_execute()` or `_materialize_node()` wrappers. The `run_sql_no
 - `run_sql_node(conn, node)` — execute deterministic SQL node
 - `run_validate_sql(conn, node)` — define validation views from `node.validate`
 - `validate_node_complete(conn, node)` — full validation (outputs + validate + validation views)
-- `persist_node_meta(conn, node_name, meta)` — write to `_node_meta` table
 - `execute_sql(conn, query, namespace, node_name, ...)` — SQL execution with namespace enforcement, timeout, size cap
 - `is_sql_allowed(query, namespace, ddl_only)` — statement type + name checking
+
+### `src/infra.py`
+
+- `init_infra(conn)` — ensure all workspace infra tables exist
+- `log_trace(conn, query, success, ...)` — log an execution/event record to `_trace`
+- `persist_node_meta(conn, node_name, meta)` — write to `_node_meta` table
+- `persist_workspace_meta(conn, model, nodes, ...)` — write `_workspace_meta` table
+- `read_workspace_meta(conn)` — read workspace metadata as dict
+- `upsert_workspace_meta(conn, rows)` — upsert additional workspace metadata rows
+
+### `src/catalog.py`
+
+- `list_views(conn, ...)` — return view names from the catalog
+- `list_tables(conn, ...)` — return table names from the catalog
+- `view_exists(conn, view_name)` — check if a view exists
+- `count_rows(conn, relation_name)` — return `COUNT(*)` for a table/view
 
 ### `src/workspace.py`
 
 - `Workspace` — dataclass: `db_path`, `nodes`, `exports`, `spec_module`
-- `Workspace.run(client, model, max_iterations)` — full workspace execution
+- `Workspace.run(client, model, max_iterations, max_concurrency)` — full workspace execution
 - `WorkspaceResult` — `success`, `node_results: dict[str, AgentResult]`, `elapsed_s`, `dag_layers`, `export_errors`
 - `materialize_node_outputs(conn, node)` — discover and materialize `{name}_*` views
 - `materialize_views(conn, view_names)` — core materialization (3-step swap)
-- `persist_workspace_meta(conn, model, nodes, ...)` — write `_workspace_meta` table
 
 ### `src/namespace.py`
 
