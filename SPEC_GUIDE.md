@@ -729,6 +729,7 @@ taskgraph run -o OUTPUT_DB [options]
 | `-m, --model MODEL` | LLM model (default: `openai/gpt-5.2`) |
 | `--reasoning-effort low\|medium\|high` | Reasoning effort level |
 | `--max-iterations N` | Max agent iterations per node (default: 200) |
+| `--max-concurrency N` | Maximum concurrent running nodes (default: 50, 0 = unlimited) |
 | `-q, --quiet` | Suppress verbose output |
 | `-f, --force` | Overwrite output file without prompting |
 
