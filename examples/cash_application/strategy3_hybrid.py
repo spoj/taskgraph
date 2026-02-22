@@ -1,25 +1,26 @@
 """Strategy 3: Taskgraph Hybrid (SQL preprocessing + LLM residual matching).
 
-Architecture: SQL pipeline handles deterministic matching (exact refs, exact
-amounts, known patterns), LLM handles residual fuzzy/ambiguous cases.
+Architecture: SQL handles structurally unambiguous matches (exact refs, exact
+amounts, ref+partial); LLM handles everything requiring judgment (discounts,
+short-pays, credit memos, multi-invoice grouping, fuzzy entity resolution).
 
 DAG:
     invoices, payments, remittance_lines
                     |
                 features           (sql: name normalization, ref extraction)
                     |
-              match_exact          (sql: exact ref + exact amount, exact amount + customer)
-                    |
-              match_patterns       (sql: discount, short-pay, multi-invoice grouping)
-                    |
-              match_residual       (prompt: fuzzy names, garbled refs, ambiguous amounts)
-                    |
+              match_exact          (sql: exact ref + exact amount, ref+partial, amount+customer)
+                   |
+              match_residual       (prompt: discounts, short-pays, credit memos, multi-invoice, fuzzy)
+                   |
                 report             (sql: consolidate results + unmatched/unapplied)
 
 Design principles:
-  - SQL nodes handle unambiguous deterministic matches
-  - LLM handles judgment calls: fuzzy entity resolution, garbled references,
-    partial payment detection where amount ratios alone are insufficient
+  - SQL nodes handle only structurally unambiguous matches (exact ref lookups,
+    exact amount equality, ref match with partial amount)
+  - LLM handles all pattern-based judgment calls: discount detection, short-pay,
+    overpayment, credit memos, multi-invoice grouping, partial payments, fallback
+  - No hardcoded thresholds calibrated to specific data generators
   - No hardcoded customer name lists — entity resolution via normalization + similarity
 """
 
@@ -160,9 +161,6 @@ CREATE VIEW match_exact_r2 AS
 WITH already_matched_inv AS (
     SELECT invoice_id FROM match_exact_r1
 ),
-already_matched_pairs AS (
-    SELECT payment_id, invoice_id FROM match_exact_r1
-),
 candidates AS (
     SELECT
         r.payment_id,
@@ -186,10 +184,10 @@ SELECT payment_id, invoice_id, inv_amount AS applied_amount,
        'fuzzy_ref' AS match_type
 FROM ranked WHERE inv_rnk = 1;
 
--- Round 3: Ref match + partial amount (handles multi_invoice_partial and partial_payment
--- where the ref is correct but the amount is a fraction of the invoice).
+-- Round 3: Ref match + partial amount (ref is correct but amount is a fraction
+-- of the invoice — e.g., partial payments, installments).
 -- Only exact ref matches (ref_direct or exact inv_number — NO off-by-one) to stay safe.
--- Amount ratio 0.20–1.005 covers partial (25-80%) and exact, avoids overpayments.
+-- Amount ratio 0.20–1.005 covers partial through exact amounts.
 CREATE VIEW match_exact_r3 AS
 WITH already_matched_inv AS (
     SELECT invoice_id FROM match_exact_r1
@@ -305,381 +303,74 @@ WHERE cnt > 1;
 """
 
 
-# ── Node 3: Pattern Matches (sql) ────────────────────────────────────────────
-
-MATCH_PATTERNS_SQL = """\
--- Discount detection: payment is 97-99.5% of invoice amount, same customer
-CREATE VIEW match_patterns_discount AS
-WITH candidates AS (
-    SELECT
-        p.payment_id,
-        i.invoice_id,
-        p.amount AS pmt_amount,
-        i.amount AS inv_amount,
-        p.amount / i.amount AS ratio,
-        jaro_winkler_similarity(p.payer_norm, i.customer_norm) AS name_sim,
-        ABS(date_diff('day', p.payment_date, i.invoice_date)) AS date_gap
-    FROM match_exact_remaining_pmt p
-    JOIN match_exact_remaining_inv i
-      ON i.amount > 0
-     AND p.amount / i.amount BETWEEN 0.970 AND 0.995
-     AND (
-         jaro_winkler_similarity(p.payer_norm, i.customer_norm) > 0.80
-         OR starts_with(i.customer_norm, p.payer_norm)
-         OR starts_with(p.payer_norm, i.customer_norm)
-     )
-),
-ranked AS (
-    SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY payment_id ORDER BY name_sim DESC, date_gap ASC) AS p_rnk,
-        ROW_NUMBER() OVER (PARTITION BY invoice_id ORDER BY name_sim DESC, date_gap ASC) AS i_rnk
-    FROM candidates
-)
-SELECT payment_id, invoice_id, pmt_amount AS applied_amount,
-       'discount' AS match_type
-FROM ranked WHERE p_rnk = 1 AND i_rnk = 1;
-
--- Short-pay: payment is 85-97% of invoice, same customer
-CREATE VIEW match_patterns_shortpay AS
-WITH already_inv AS (SELECT invoice_id FROM match_patterns_discount),
-already_pmt AS (SELECT payment_id FROM match_patterns_discount),
-candidates AS (
-    SELECT
-        p.payment_id,
-        i.invoice_id,
-        p.amount AS pmt_amount,
-        i.amount AS inv_amount,
-        p.amount / i.amount AS ratio,
-        jaro_winkler_similarity(p.payer_norm, i.customer_norm) AS name_sim,
-        ABS(date_diff('day', p.payment_date, i.invoice_date)) AS date_gap
-    FROM match_exact_remaining_pmt p
-    JOIN match_exact_remaining_inv i
-      ON i.amount > 0
-     AND p.amount / i.amount BETWEEN 0.850 AND 0.970
-     AND (
-         jaro_winkler_similarity(p.payer_norm, i.customer_norm) > 0.80
-         OR starts_with(i.customer_norm, p.payer_norm)
-         OR starts_with(p.payer_norm, i.customer_norm)
-     )
-    WHERE i.invoice_id NOT IN (SELECT invoice_id FROM already_inv)
-      AND p.payment_id NOT IN (SELECT payment_id FROM already_pmt)
-),
-ranked AS (
-    SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY payment_id ORDER BY name_sim DESC, date_gap ASC) AS p_rnk,
-        ROW_NUMBER() OVER (PARTITION BY invoice_id ORDER BY name_sim DESC, date_gap ASC) AS i_rnk
-    FROM candidates
-)
-SELECT payment_id, invoice_id, pmt_amount AS applied_amount,
-       'short_pay' AS match_type
-FROM ranked WHERE p_rnk = 1 AND i_rnk = 1;
-
--- Overpayment: payment is 100-115% of invoice, same customer
-CREATE VIEW match_patterns_overpay AS
-WITH already_inv AS (
-    SELECT invoice_id FROM match_patterns_discount
-    UNION ALL SELECT invoice_id FROM match_patterns_shortpay
-),
-already_pmt AS (
-    SELECT payment_id FROM match_patterns_discount
-    UNION ALL SELECT payment_id FROM match_patterns_shortpay
-),
-candidates AS (
-    SELECT
-        p.payment_id,
-        i.invoice_id,
-        i.amount AS applied_amount,  -- apply invoice amount, not overpayment
-        p.amount / i.amount AS ratio,
-        jaro_winkler_similarity(p.payer_norm, i.customer_norm) AS name_sim,
-        ABS(date_diff('day', p.payment_date, i.invoice_date)) AS date_gap
-    FROM match_exact_remaining_pmt p
-    JOIN match_exact_remaining_inv i
-      ON i.amount > 0
-     AND p.amount / i.amount BETWEEN 1.001 AND 1.150
-     AND (
-         jaro_winkler_similarity(p.payer_norm, i.customer_norm) > 0.80
-         OR starts_with(i.customer_norm, p.payer_norm)
-         OR starts_with(p.payer_norm, i.customer_norm)
-     )
-    WHERE i.invoice_id NOT IN (SELECT invoice_id FROM already_inv)
-      AND p.payment_id NOT IN (SELECT payment_id FROM already_pmt)
-),
-ranked AS (
-    SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY payment_id ORDER BY name_sim DESC, date_gap ASC) AS p_rnk,
-        ROW_NUMBER() OVER (PARTITION BY invoice_id ORDER BY name_sim DESC, date_gap ASC) AS i_rnk
-    FROM candidates
-)
-SELECT payment_id, invoice_id, applied_amount,
-       'overpayment' AS match_type
-FROM ranked WHERE p_rnk = 1 AND i_rnk = 1;
-
--- Credit memo: find positive invoice + negative invoice from same customer that
--- sum to a payment amount
-CREATE VIEW match_patterns_credit AS
-WITH already_inv AS (
-    SELECT invoice_id FROM match_patterns_discount
-    UNION ALL SELECT invoice_id FROM match_patterns_shortpay
-    UNION ALL SELECT invoice_id FROM match_patterns_overpay
-),
-already_pmt AS (
-    SELECT payment_id FROM match_patterns_discount
-    UNION ALL SELECT payment_id FROM match_patterns_shortpay
-    UNION ALL SELECT payment_id FROM match_patterns_overpay
-),
-remaining_pmt AS (
-    SELECT * FROM match_exact_remaining_pmt
-    WHERE payment_id NOT IN (SELECT payment_id FROM already_pmt)
-),
-remaining_inv AS (
-    SELECT * FROM match_exact_remaining_inv
-    WHERE invoice_id NOT IN (SELECT invoice_id FROM already_inv)
-),
-candidates AS (
-    SELECT
-        p.payment_id,
-        pos.invoice_id AS pos_invoice_id,
-        neg.invoice_id AS neg_invoice_id,
-        pos.amount AS pos_amount,
-        neg.amount AS neg_amount,
-        jaro_winkler_similarity(p.payer_norm, pos.customer_norm) AS name_sim
-    FROM remaining_pmt p
-    JOIN remaining_inv pos ON pos.amount > 0
-        AND (jaro_winkler_similarity(p.payer_norm, pos.customer_norm) > 0.80
-             OR starts_with(pos.customer_norm, p.payer_norm)
-             OR starts_with(p.payer_norm, pos.customer_norm))
-    JOIN remaining_inv neg ON neg.amount < 0
-        AND neg.customer_id = pos.customer_id
-        AND neg.invoice_id != pos.invoice_id
-    WHERE ABS(p.amount - (pos.amount + neg.amount)) < 0.01
-),
-ranked AS (
-    SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY payment_id ORDER BY name_sim DESC) AS rnk
-    FROM candidates
-)
-SELECT payment_id, pos_invoice_id, neg_invoice_id, pos_amount, neg_amount
-FROM ranked WHERE rnk = 1;
-
--- Explode credit memo matches into individual rows
-CREATE VIEW match_patterns_credit_rows AS
-SELECT payment_id, pos_invoice_id AS invoice_id, pos_amount AS applied_amount,
-       'credit_memo' AS match_type
-FROM match_patterns_credit
-UNION ALL
-SELECT payment_id, neg_invoice_id AS invoice_id, neg_amount AS applied_amount,
-       'credit_memo' AS match_type
-FROM match_patterns_credit;
-
--- Partial payment: 25-80% of invoice + same customer + memo hint required
--- Generator always puts "partial"/"installment"/"progress" in partial_payment memos
-CREATE VIEW match_patterns_partial AS
-WITH already_inv AS (
-    SELECT invoice_id FROM match_patterns_discount
-    UNION ALL SELECT invoice_id FROM match_patterns_shortpay
-    UNION ALL SELECT invoice_id FROM match_patterns_overpay
-    UNION ALL SELECT invoice_id FROM match_patterns_credit_rows
-),
-already_pmt AS (
-    SELECT payment_id FROM match_patterns_discount
-    UNION ALL SELECT payment_id FROM match_patterns_shortpay
-    UNION ALL SELECT payment_id FROM match_patterns_overpay
-    UNION ALL SELECT payment_id FROM match_patterns_credit_rows
-),
--- Find payments with partial hints in their remittance lines
-pmt_with_hint AS (
-    SELECT DISTINCT payment_id
-    FROM features_rem
-    WHERE has_partial_hint = true
-),
-candidates AS (
-    SELECT
-        p.payment_id,
-        i.invoice_id,
-        p.amount AS pmt_amount,
-        i.amount AS inv_amount,
-        p.amount / i.amount AS ratio,
-        jaro_winkler_similarity(p.payer_norm, i.customer_norm) AS name_sim,
-        ABS(date_diff('day', p.payment_date, i.invoice_date)) AS date_gap
-    FROM match_exact_remaining_pmt p
-    JOIN match_exact_remaining_inv i
-      ON i.amount > 0
-     AND p.amount / i.amount BETWEEN 0.20 AND 0.85
-     AND (
-         jaro_winkler_similarity(p.payer_norm, i.customer_norm) > 0.80
-         OR starts_with(i.customer_norm, p.payer_norm)
-         OR starts_with(p.payer_norm, i.customer_norm)
-     )
-    WHERE i.invoice_id NOT IN (SELECT invoice_id FROM already_inv)
-      AND p.payment_id NOT IN (SELECT payment_id FROM already_pmt)
-      AND p.payment_id IN (SELECT payment_id FROM pmt_with_hint)
-),
-ranked AS (
-    SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY payment_id ORDER BY name_sim DESC, date_gap ASC) AS p_rnk,
-        ROW_NUMBER() OVER (PARTITION BY invoice_id ORDER BY name_sim DESC, date_gap ASC) AS i_rnk
-    FROM candidates
-)
-SELECT payment_id, invoice_id, pmt_amount AS applied_amount,
-       'partial_payment' AS match_type
-FROM ranked WHERE p_rnk = 1 AND i_rnk = 1;
-
--- Fallback: Exact amount + closest date within 90 days, any customer (like S2 Pass 10)
-CREATE VIEW match_patterns_fallback AS
-WITH already_inv AS (
-    SELECT invoice_id FROM match_patterns_discount
-    UNION ALL SELECT invoice_id FROM match_patterns_shortpay
-    UNION ALL SELECT invoice_id FROM match_patterns_overpay
-    UNION ALL SELECT invoice_id FROM match_patterns_credit_rows
-    UNION ALL SELECT invoice_id FROM match_patterns_partial
-),
-already_pmt AS (
-    SELECT payment_id FROM match_patterns_discount
-    UNION ALL SELECT payment_id FROM match_patterns_shortpay
-    UNION ALL SELECT payment_id FROM match_patterns_overpay
-    UNION ALL SELECT payment_id FROM match_patterns_credit_rows
-    UNION ALL SELECT payment_id FROM match_patterns_partial
-),
-candidates AS (
-    SELECT
-        p.payment_id,
-        i.invoice_id,
-        i.amount AS applied_amount,
-        ABS(date_diff('day', p.payment_date, i.invoice_date)) AS date_gap
-    FROM match_exact_remaining_pmt p
-    JOIN match_exact_remaining_inv i
-      ON ABS(p.amount - i.amount) < 0.01
-     AND ABS(date_diff('day', p.payment_date, i.invoice_date)) <= 90
-    WHERE i.invoice_id NOT IN (SELECT invoice_id FROM already_inv)
-      AND p.payment_id NOT IN (SELECT payment_id FROM already_pmt)
-),
-ranked AS (
-    SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY payment_id ORDER BY date_gap ASC) AS p_rnk,
-        ROW_NUMBER() OVER (PARTITION BY invoice_id ORDER BY date_gap ASC) AS i_rnk
-    FROM candidates
-)
-SELECT payment_id, invoice_id, applied_amount,
-       'exact_amount_date' AS match_type
-FROM ranked WHERE p_rnk = 1 AND i_rnk = 1;
-
--- All pattern matches combined
-CREATE VIEW match_patterns_all AS
-SELECT payment_id, invoice_id, applied_amount, match_type FROM match_patterns_discount
-UNION ALL
-SELECT payment_id, invoice_id, applied_amount, match_type FROM match_patterns_shortpay
-UNION ALL
-SELECT payment_id, invoice_id, applied_amount, match_type FROM match_patterns_overpay
-UNION ALL
-SELECT payment_id, invoice_id, applied_amount, match_type FROM match_patterns_credit_rows
-UNION ALL
-SELECT payment_id, invoice_id, applied_amount, match_type FROM match_patterns_partial
-UNION ALL
-SELECT payment_id, invoice_id, applied_amount, match_type FROM match_patterns_fallback;
-
--- Remaining pools after pattern matching
-CREATE VIEW match_patterns_remaining_pmt AS
-SELECT p.* FROM match_exact_remaining_pmt p
-LEFT JOIN (SELECT DISTINCT payment_id FROM match_patterns_all) m ON p.payment_id = m.payment_id
-WHERE m.payment_id IS NULL;
-
-CREATE VIEW match_patterns_remaining_inv AS
-SELECT i.* FROM match_exact_remaining_inv i
-LEFT JOIN (SELECT DISTINCT invoice_id FROM match_patterns_all) m ON i.invoice_id = m.invoice_id
-WHERE m.invoice_id IS NULL;
-
--- Payments that are partially matched: they have SOME matches in exact/patterns
--- but their total matched amount doesn't account for the full payment.
--- This helps the LLM find remaining unmatched remittance lines.
-CREATE VIEW match_patterns_partial_pmt AS
-SELECT
-    p.payment_id,
-    p.payer_name,
-    p.amount AS payment_amount,
-    COALESCE(m.matched_amount, 0) AS matched_amount,
-    p.amount - COALESCE(m.matched_amount, 0) AS unmatched_amount,
-    COALESCE(m.match_count, 0) AS match_count
-FROM features_pmt p
-LEFT JOIN (
-    SELECT payment_id,
-           SUM(applied_amount) AS matched_amount,
-           COUNT(*) AS match_count
-    FROM (
-        SELECT payment_id, applied_amount FROM match_exact_all
-        UNION ALL
-        SELECT payment_id, applied_amount FROM match_patterns_all
-    )
-    GROUP BY payment_id
-) m ON p.payment_id = m.payment_id
-WHERE m.match_count > 0
-  AND ABS(p.amount - COALESCE(m.matched_amount, 0)) > 0.01;
-"""
-
-MATCH_PATTERNS_VALIDATE = """\
-SELECT 'fail' AS status,
-       'invoice ' || invoice_id || ' matched ' || cnt || 'x in patterns' AS message
-FROM (SELECT invoice_id, COUNT(*) AS cnt FROM match_patterns_all GROUP BY invoice_id)
-WHERE cnt > 1
-UNION ALL
-SELECT 'fail' AS status,
-       'invoice ' || a.invoice_id || ' in both exact and patterns' AS message
-FROM match_patterns_all a
-JOIN match_exact_all e ON a.invoice_id = e.invoice_id;
-"""
-
-
-# ── Node 4: Residual LLM Matching (prompt) ───────────────────────────────────
+# ── Node 3: Residual LLM Matching (prompt) ───────────────────────────────────
 
 MATCH_RESIDUAL_PROMPT = """\
-Resolve remaining unmatched payments and invoices. Prior SQL nodes have matched:
+Resolve remaining unmatched payments and invoices. Prior SQL nodes have matched
+only structurally unambiguous cases:
 1) Exact remittance reference + exact amount
-2) Fuzzy remittance ref number + exact amount
-3) Ref match + partial amount (20-100% of invoice, covers partial payments on multi-invoice lines)
-4) Exact amount + customer name (with Jaro-Winkler similarity)
-5) Discount detection (97-99.5% of invoice, same customer)
-6) Short-pay detection (85-97% of invoice, same customer)
-7) Overpayment detection (100-115% of invoice, same customer)
-8) Credit memo detection (positive + negative invoices summing to payment)
-9) Partial payment detection (25-85% of invoice, same customer, memo hint)
-10) Exact amount + closest date fallback (within 90 days, any customer)
+2) Fuzzy remittance ref number (off-by-one) + exact amount
+3) Exact ref match + partial amount (ref is correct, amount is a fraction of invoice)
+4) Exact amount + customer name match (no remittance, Jaro-Winkler similarity)
 
-Everything else is up to you. Query the remaining pools and match what you can.
+Everything else — discounts, short-pays, overpayments, credit memos, partial
+payments, multi-invoice grouping, and ambiguous cases — is up to you.
 
 AVAILABLE VIEWS:
-  match_patterns_remaining_pmt  — fully unmatched payments (columns: payment_id, payment_date, payer_name, amount, method, reference_info, payer_norm)
-  match_patterns_remaining_inv  — unmatched invoices (columns: invoice_id, customer_id, customer_name, invoice_date, due_date, amount, description, customer_norm, inv_number)
-  match_patterns_partial_pmt    — PARTIALLY matched payments: have some matches but unaccounted amount remains (columns: payment_id, payer_name, payment_amount, matched_amount, unmatched_amount, match_count)
-  features_rem                  — all remittance lines (columns: remittance_id, payment_id, invoice_ref, amount, memo, ref_inv_number, ref_direct, has_partial_hint)
-  match_exact_all               — already matched (exact + fuzzy ref + ref_partial + amount+customer)
-  match_patterns_all            — already matched (discount, short-pay, overpay, credit, partial, fallback)
+  match_exact_remaining_pmt  — fully unmatched payments (columns: payment_id, payment_date, payer_name, amount, method, reference_info, payer_norm)
+  match_exact_remaining_inv  — unmatched invoices (columns: invoice_id, customer_id, customer_name, invoice_date, due_date, amount, description, customer_norm, inv_number)
+  match_exact_remaining_rem  — remittance lines for unmatched payments (columns: remittance_id, payment_id, invoice_ref, amount, memo, ref_inv_number, ref_direct, has_partial_hint)
+  features_rem               — ALL remittance lines (columns: remittance_id, payment_id, invoice_ref, amount, memo, ref_inv_number, ref_direct, has_partial_hint)
+  features_pmt               — ALL payments with normalized names (columns: payment_id, payment_date, payer_name, amount, method, reference_info, payer_norm)
+  match_exact_all            — already matched pairs (columns: payment_id, invoice_id, applied_amount, match_type)
 
-CRITICAL — PARTIALLY MATCHED PAYMENTS:
-Start by querying match_patterns_partial_pmt. These are payments that have SOME
-invoice matches but still have unaccounted amounts. For each such payment:
-1) Query features_rem for ALL remittance lines of that payment
-2) Check which remittance lines are already matched (their invoice appears in match_exact_all or match_patterns_all)
-3) For the UNMATCHED remittance lines, look for matching invoices in match_patterns_remaining_inv
-   using the remittance line's ref info and amount
+Start by querying match_exact_remaining_pmt and match_exact_remaining_inv to
+understand the size and shape of the residual pool. Then query
+match_exact_remaining_rem for remittance details on unmatched payments.
 
-MATCHING STRATEGIES (apply in order of confidence):
+Also check for PARTIALLY MATCHED PAYMENTS: payments that have some matches in
+match_exact_all but whose total matched amount does not account for the full
+payment. Query features_pmt and match_exact_all to find these, then look at
+their remaining remittance lines for unmatched invoices.
 
-1) PARTIALLY MATCHED MULTI-INVOICE PAYMENTS (see above — highest priority)
+MATCHING PATTERNS (apply in order of confidence):
 
-2) MULTI-INVOICE PAYMENTS: A single payment may cover multiple invoices from the
-   same customer. Look for payments where the amount equals the sum of 2-4
-   unmatched invoices from the same customer. Use remittance lines for hints
-   (group by payment_id). Use jaro_winkler_similarity > 0.80 for entity matching.
+1) DISCOUNT TAKEN: Payment is slightly less than invoice amount, typically 1-5%
+   less. Same customer. The payer deducted an early-payment discount.
+   applied_amount = payment amount (the discounted amount actually paid).
 
-3) PARTIAL PAYMENTS: A payment may be 25-80% of an invoice amount, typically
-   with remittance memo mentioning "partial", "installment", or "progress".
-   Match within the same customer.
+2) SHORT-PAY / DEDUCTION: Payment is noticeably less than invoice amount (e.g.,
+   5-15% less), same customer. May have a memo referencing a dispute, damage,
+   or quality issue. applied_amount = payment amount.
 
-4) DUPLICATE PAYMENTS: If two payments have the same amount for the same customer
-   and one is already matched, the second may be a duplicate. The duplicate
-   should be left unmatched (do NOT match it to the same invoice).
+3) OVERPAYMENT: Payment exceeds invoice amount by a small percentage, same
+   customer. applied_amount = invoice amount (the excess is unapplied).
 
-5) MANUAL MAPPING: When the candidate pool is very small, read the rows, pair
-   them up manually, and output a VALUES clause.
+4) CREDIT MEMO: A customer has a negative-amount invoice (credit note) and a
+   positive invoice from the same customer. The payment equals the net of the
+   two (positive + negative). Match both invoices to the payment.
+
+5) PARTIAL PAYMENT: Payment covers only a portion of the invoice (e.g., 25-80%).
+   Same customer. Remittance memo may mention "partial", "installment", or
+   "progress". applied_amount = payment amount.
+
+6) MULTI-INVOICE PAYMENT: A single payment covers multiple invoices from the
+   same customer. The payment amount equals the sum of 2+ invoices. Use
+   remittance lines to identify which invoices are covered. Each invoice gets
+   its own row with applied_amount = invoice amount.
+
+7) PARTIALLY MATCHED MULTI-INVOICE PAYMENTS: A payment already has some matches
+   in match_exact_all but still has unaccounted amount. Find the remaining
+   unmatched remittance lines and match them to remaining invoices.
+
+8) FALLBACK — EXACT AMOUNT, DIFFERENT CUSTOMER: Payment amount exactly matches
+   an invoice amount but the customer names don't match (cross-reference,
+   subsidiary paying for parent, etc.). Use date proximity as a tiebreaker.
+   Be conservative — only match when the pool is small and the amount is unique.
+
+9) DUPLICATE PAYMENTS: If two payments from the same customer have the same
+   amount and one is already matched, the second may be a duplicate. Leave the
+   duplicate unmatched (do NOT match it to the same invoice).
 
 RULES:
 - Each invoice can only be matched once across ALL matching stages.
@@ -688,12 +379,14 @@ RULES:
 - The applied_amount should be the actual amount applied (which may differ from
   the invoice amount for partial payments, discounts, etc.).
 - Be conservative: a false positive is worse than a missed match.
+- Use jaro_winkler_similarity() > 0.80 for customer name matching, or
+  starts_with() for prefix matching.
 
 OUTPUT: Create a view called match_residual_results with columns:
   payment_id, invoice_id, applied_amount, match_type, note
 
-This should contain ONLY your new matches (not the ones from match_exact_all or
-match_patterns_all — those will be merged in the report node).
+This should contain ONLY your new matches (not the ones from match_exact_all —
+those will be merged in the report node).
 
 DuckDB NOTES:
 - Use jaro_winkler_similarity() for fuzzy string matching
@@ -702,16 +395,11 @@ DuckDB NOTES:
 """
 
 MATCH_RESIDUAL_VALIDATE = """\
--- Check no invoice matched in residual is already matched elsewhere
+-- Check no invoice matched in residual is already matched in exact
 SELECT 'fail' AS status,
        'invoice ' || r.invoice_id || ' already in exact matches' AS message
 FROM match_residual_results r
 JOIN match_exact_all e ON r.invoice_id = e.invoice_id
-UNION ALL
-SELECT 'fail' AS status,
-       'invoice ' || r.invoice_id || ' already in pattern matches' AS message
-FROM match_residual_results r
-JOIN match_patterns_all p ON r.invoice_id = p.invoice_id
 UNION ALL
 SELECT 'fail' AS status,
        'invoice ' || invoice_id || ' matched ' || cnt || 'x in residual' AS message
@@ -720,14 +408,12 @@ WHERE cnt > 1;
 """
 
 
-# ── Node 5: Report (sql) ─────────────────────────────────────────────────────
+# ── Node 4: Report (sql) ─────────────────────────────────────────────────────
 
 REPORT_SQL = """\
 -- Consolidated results from all matching stages
 CREATE VIEW report_results AS
 SELECT payment_id, invoice_id, applied_amount FROM match_exact_all
-UNION ALL
-SELECT payment_id, invoice_id, applied_amount FROM match_patterns_all
 UNION ALL
 SELECT payment_id, invoice_id, applied_amount FROM match_residual_results;
 
@@ -817,25 +503,14 @@ NODES = [
             "match_exact_all": ["payment_id", "invoice_id", "applied_amount"],
             "match_exact_remaining_pmt": ["payment_id"],
             "match_exact_remaining_inv": ["invoice_id"],
-        },
-    },
-    {
-        "name": "match_patterns",
-        "sql": MATCH_PATTERNS_SQL,
-        "validate": {"main": MATCH_PATTERNS_VALIDATE},
-        "depends_on": ["match_exact", "features"],
-        "output_columns": {
-            "match_patterns_all": ["payment_id", "invoice_id", "applied_amount"],
-            "match_patterns_remaining_pmt": ["payment_id"],
-            "match_patterns_remaining_inv": ["invoice_id"],
-            "match_patterns_partial_pmt": ["payment_id", "unmatched_amount"],
+            "match_exact_remaining_rem": ["remittance_id", "payment_id"],
         },
     },
     {
         "name": "match_residual",
         "prompt": MATCH_RESIDUAL_PROMPT,
         "validate": {"main": MATCH_RESIDUAL_VALIDATE},
-        "depends_on": ["match_exact", "match_patterns", "features"],
+        "depends_on": ["match_exact", "features"],
         "output_columns": {
             "match_residual_results": [
                 "payment_id",
@@ -852,7 +527,6 @@ NODES = [
             "invoices",
             "payments",
             "match_exact",
-            "match_patterns",
             "match_residual",
         ],
         "output_columns": {
