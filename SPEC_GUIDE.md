@@ -12,7 +12,7 @@ Specs are imported as modules (e.g. `my_app.specs.main`). File paths are accepte
 
 For a new project, run `taskgraph init` to scaffold a `specs/` directory, `pyproject.toml`, and supporting files.
 
-Taskgraph uses OpenRouter for LLM calls; set `OPENROUTER_API_KEY` in your environment or `.env` file. If your spec only uses `sql` nodes, no API key is required.
+Taskgraph uses OpenRouter for LLM calls; set `OPENROUTER_API_KEY` in your environment or `.env` file. If your spec only uses `sql` nodes and non-PDF source nodes, no API key is required.
 
 Two common patterns:
 
@@ -175,7 +175,7 @@ Strings ending in one of the supported extensions are treated as file inputs:
 | `.csv` | DuckDB `read_csv_auto` | Auto-detect schema |
 | `.parquet` | DuckDB `read_parquet` | Native parquet reader |
 | `.xlsx` / `.xls` | DuckDB `read_xlsx` | `header = false`; columns named `A1`, `B1`, etc. Use `#SheetName` to pick a sheet |
-| `.pdf` | Gemini 3 Flash (OpenRouter) | Extracts tabular data into JSON (requires OPENROUTER_API_KEY) |
+| `.pdf` | Gemini 3 Flash (OpenRouter) | Single-file extraction (requires OPENROUTER_API_KEY). For multi-file or per-page extraction, use `llm()` or `llm_pages()` instead. |
 
 Excel sheet selection uses a fragment:
 
@@ -185,13 +185,84 @@ Excel sheet selection uses a fragment:
 
 Relative file paths resolve from the spec file's directory.
 
+### LLM-based PDF extraction
+
+For PDFs that need LLM-powered extraction, two factory functions are available — imported from `taskgraph`:
+
+```python
+from taskgraph import llm, llm_pages
+```
+
+Both require `OPENROUTER_API_KEY` (extraction uses Gemini 3 Flash via OpenRouter).
+
+#### `llm()` — whole-file extraction
+
+Sends each PDF file in its entirety to the LLM for tabular extraction, then concatenates results from all files into one table.
+
+```python
+from taskgraph import llm
+
+NODES = [
+    {"name": "invoices", "source": llm("data/jan.pdf", "data/feb.pdf")},
+    {"name": "report", "source": llm("data/report.pdf", prompt="Extract line items with date, description, and amount")},
+]
+```
+
+All positional arguments are file paths (strings). `prompt` is keyword-only with a default that requests JSON tabular extraction. Relative paths resolve from the spec file's directory.
+
+Use `llm()` when:
+- The PDF is short (1-5 pages) and the LLM can process it in one pass.
+- You want simple multi-file concatenation without per-page verification.
+
+#### `llm_pages()` — per-page extraction with majority vote
+
+Splits each PDF into individual pages (via `pypdf`), sends each page to the LLM independently, and uses a 2/3 majority vote to verify extraction accuracy. Results from all pages across all files are concatenated into one table.
+
+```python
+from taskgraph import llm_pages
+
+NODES = [
+    {"name": "transactions", "source": llm_pages("data/jan_stmt.pdf", "data/feb_stmt.pdf")},
+    {
+        "name": "ledger",
+        "source": llm_pages(
+            "data/q1.pdf",
+            prompt="Extract all transactions with columns: date, description, debit, credit, balance",
+        ),
+    },
+]
+```
+
+Majority vote logic per page:
+1. Run 2 extraction passes. Compare results after normalizing whitespace (strip all string columns, then Polars DataFrame `.equals()`).
+2. If the two passes match → accept.
+3. If they differ → run a 3rd pass. If pass 3 matches either pass 1 or 2 → use the majority result.
+4. If all 3 differ → the page errors.
+
+Each page is sent to the LLM with a header line: `=== page N of TOTAL from file filename.pdf ===`, followed by the prompt.
+
+Use `llm_pages()` when:
+- The PDF is long (many pages) and table-heavy (e.g., bank statements, transaction logs).
+- You want per-page verification to catch extraction errors.
+- Pages are independent (each page's table rows stand alone).
+
+#### Differences between `llm()` and `llm_pages()`
+
+| | `llm()` | `llm_pages()` |
+|---|---------|---------------|
+| Granularity | Whole file per LLM call | One page per LLM call |
+| Verification | None (single pass) | 2/3 majority vote per page |
+| LLM calls per file | 1 | 2-3 per page |
+| Best for | Short PDFs, simple layouts | Long PDFs, table-heavy documents |
+| Dependency | None | `pypdf` (auto-installed) |
+
 ### The `_row_id` column
 
 Every ingested table gets a `_row_id INTEGER` column: a 1-based sequential row number. It serves as the primary key for row-level references in validation SQL and output views. The agent can query it but it is not shown in the schema display.
 
 ### Data loading guidelines
 
-- **Allowed imports in spec modules**: `polars`, `openpyxl`, and Python stdlib (`pathlib`, `csv`, `json`, etc.). No other third-party libraries.
+- **Allowed imports in spec modules**: `taskgraph` (for `llm`, `llm_pages`), `polars`, `openpyxl`, and Python stdlib (`pathlib`, `csv`, `json`, etc.). No other third-party libraries.
 - Callables are invoked at ingest time, not import time. Exceptions are caught and reported with context.
 - Empty tables (0 rows) produce a warning but do not abort the run.
 - Polars handles type inference. If you need specific types, cast explicitly:
@@ -456,7 +527,7 @@ Export function exceptions are caught — they don't crash the run. Errors are s
 
 Taskgraph can generate a single **agentic final report** (author = LLM, harness-controlled).
 
-- Generated at the end of a run when an LLM client is available (e.g. the spec has prompt nodes or PDF ingestion).
+- Generated at the end of a run when an LLM client is available (e.g. the spec has prompt nodes, PDF ingestion, or `llm()`/`llm_pages()` sources).
 - The reporter agent can query the workspace DB (`_workspace_meta`, `_node_meta`, `_trace`, and domain tables).
 - Stored in `_workspace_meta` under key `final_report` (JSON with an `md` field).
 

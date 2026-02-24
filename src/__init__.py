@@ -5,7 +5,14 @@ from .api import OpenRouterClient, create_model_callable
 from .agent import run_node_agent
 from .task import Node, resolve_dag, resolve_deps, validate_graph
 from .workspace import Workspace, WorkspaceResult
-from .ingest import ingest_table, coerce_to_dataframe
+from .ingest import (
+    ingest_table,
+    coerce_to_dataframe,
+    llm,
+    LLMSource,
+    llm_pages,
+    LLMPagesSource,
+)
 
 __all__ = [
     # Agent loop
@@ -27,4 +34,8 @@ __all__ = [
     # Ingestion
     "ingest_table",
     "coerce_to_dataframe",
+    "llm",
+    "LLMSource",
+    "llm_pages",
+    "LLMPagesSource",
 ]

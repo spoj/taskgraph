@@ -51,7 +51,15 @@ from .infra import (
     read_workspace_meta,
     upsert_workspace_meta,
 )
-from .ingest import FileInput, ingest_file, ingest_table
+from .ingest import (
+    FileInput,
+    LLMSource,
+    LLMPagesSource,
+    ingest_file,
+    ingest_llm_source,
+    ingest_llm_pages,
+    ingest_table,
+)
 from .agent import (
     _simple_result,
     run_node_agent,
@@ -202,7 +210,11 @@ class Workspace:
         Returns row count. Raises on failure.
         """
         value = node.source
-        if isinstance(value, FileInput):
+        if isinstance(value, LLMPagesSource):
+            await ingest_llm_pages(conn, value, node.name, client=client)
+        elif isinstance(value, LLMSource):
+            await ingest_llm_source(conn, value, node.name, client=client)
+        elif isinstance(value, FileInput):
             await ingest_file(conn, value, node.name, client=client)
         elif callable(value):
             try:
