@@ -29,8 +29,6 @@ from typing import Any
 
 from .ingest import (
     FileInput,
-    LLMSource,
-    LLMPagesSource,
     is_supported_file_string,
     parse_file_path,
     parse_file_string,
@@ -63,18 +61,7 @@ def resolve_module_path(module_path: str) -> Path:
 def _resolve_source_path(source: Any, spec_dir: Path) -> Any:
     """Resolve a source value, turning file paths/strings into FileInput.
 
-    Also resolves LLMSource file paths.
     """
-    if isinstance(source, (LLMSource, LLMPagesSource)):
-        resolved = tuple(
-            parse_file_string(f, base_dir=spec_dir)
-            if isinstance(f, str)
-            else parse_file_path(f, base_dir=spec_dir)
-            if isinstance(f, Path)
-            else f  # already FileInput
-            for f in source.files
-        )
-        return type(source)(files=resolved, prompt=source.prompt)
     if isinstance(source, FileInput):
         return source
     if isinstance(source, Path):

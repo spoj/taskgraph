@@ -45,7 +45,7 @@ from src.api import (
     has_openrouter_api_key,
 )
 from src.catalog import count_rows_display, list_tables, list_views
-from src.ingest import FileInput, LLMSource, LLMPagesSource
+from src.ingest import FileInput
 from src.agent_loop import DEFAULT_MAX_ITERATIONS
 from src.infra import read_workspace_meta
 from src.spec import load_spec_from_module, resolve_module_path
@@ -536,13 +536,7 @@ def run(
         log.info("")
 
     needs_llm = any(n.node_type() == "prompt" for n in nodes)
-    needs_pdf = any(
-        (isinstance(n.source, FileInput) and n.source.format == "pdf")
-        or isinstance(n.source, (LLMSource, LLMPagesSource))
-        for n in nodes
-        if n.is_source()
-    )
-    needs_client = needs_llm or needs_pdf
+    needs_client = needs_llm
     if needs_client:
         _require_openrouter_api_key()
 

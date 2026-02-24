@@ -10,7 +10,6 @@ dependencies = [
     "httpx>=0.28.0",
     "openpyxl>=3.1.0",
     "polars[pyarrow]>=1.0.0",
-    "pypdf>=5.0.0",
     "python-dotenv>=1.2.1",
 ]
 

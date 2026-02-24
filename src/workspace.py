@@ -53,11 +53,7 @@ from .infra import (
 )
 from .ingest import (
     FileInput,
-    LLMSource,
-    LLMPagesSource,
     ingest_file,
-    ingest_llm_source,
-    ingest_llm_pages,
     ingest_table,
 )
 from .agent import (
@@ -202,20 +198,16 @@ class Workspace:
     # Source node ingestion
     # ------------------------------------------------------------------
 
-    async def _ingest_node(
-        self, conn: duckdb.DuckDBPyConnection, node: Node, client: Any | None
+    def _ingest_node(
+        self, conn: duckdb.DuckDBPyConnection, node: Node
     ) -> int:
         """Ingest a single source node into the database.
 
         Returns row count. Raises on failure.
         """
         value = node.source
-        if isinstance(value, LLMPagesSource):
-            await ingest_llm_pages(conn, value, node.name, client=client)
-        elif isinstance(value, LLMSource):
-            await ingest_llm_source(conn, value, node.name, client=client)
-        elif isinstance(value, FileInput):
-            await ingest_file(conn, value, node.name, client=client)
+        if isinstance(value, FileInput):
+            ingest_file(conn, value, node.name)
         elif callable(value):
             try:
                 data = value()
@@ -233,11 +225,10 @@ class Workspace:
             log.info("  %s: %d rows", node.name, count)
         return count
 
-    async def _execute_source_node(
+    def _execute_source_node(
         self,
         conn: duckdb.DuckDBPyConnection,
         node: Node,
-        client: Any | None,
     ) -> tuple[AgentResult, int | None]:
         """Execute a source node: ingest data.
 
@@ -245,7 +236,7 @@ class Workspace:
             (AgentResult, row_count or None on failure)
         """
         try:
-            row_count = await self._ingest_node(conn, node, client)
+            row_count = self._ingest_node(conn, node)
         except Exception as e:
             return _simple_result(False, f"Source ingestion failed: {e}"), None
         return _simple_result(True, f"OK ({row_count} rows)"), row_count
@@ -401,8 +392,8 @@ class Workspace:
 
                 # --- Phase 1: Execute (type-specific) ---
                 if node.is_source():
-                    result, row_count = await self._execute_source_node(
-                        conn, node, client
+                    result, row_count = self._execute_source_node(
+                        conn, node
                     )
                     if result.success and row_count is not None:
                         source_row_counts[node.name] = row_count
