@@ -351,6 +351,7 @@ class Workspace:
         model: str = DEFAULT_MODEL,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         max_concurrency: int = 50,
+        final_report: bool = False,
     ) -> WorkspaceResult:
         """Run the full workspace: resolve DAG, execute all nodes, export.
 
@@ -526,7 +527,7 @@ class Workspace:
                 dag_order = [n for layer in dag_layer_names for n in layer]
 
                 # --- Final report (author = LLM; harness-controlled, agentic) ---
-                final_report: dict[str, Any] = {
+                report_data: dict[str, Any] = {
                     "schema_version": 1,
                     "status": "skipped",
                     "author": "llm",
@@ -537,7 +538,7 @@ class Workspace:
                     "node": None,
                     "output_relation": None,
                 }
-                if client is not None:
+                if final_report and client is not None:
                     # Pick a report node name unlikely to collide with spec nodes.
                     existing = {n.name for n in self.nodes}
                     base = "tg_report"
@@ -707,7 +708,7 @@ class Workspace:
                             trace_id = int(row[0])
                             md_text = str(row[1] or "")
                     except Exception as e:
-                        final_report["error"] = str(e)
+                        report_data["error"] = str(e)
 
                     # Fallback: read markdown from the report output relation.
                     # (Kept for robustness if the trace row is missing.)
@@ -722,7 +723,7 @@ class Workspace:
                             md_text = "\n\n".join(p for p in md_parts if p.strip())
                         except Exception as e:
                             md_text = ""
-                            final_report["error"] = str(e)
+                            report_data["error"] = str(e)
 
                     md_text = md_text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -731,13 +732,13 @@ class Workspace:
                     if len(md_text) > max_md:
                         md_text = md_text[: max_md - 3] + "..."
 
-                    final_report.update(
+                    report_data.update(
                         {
                             "status": "ok" if report_result.success else "error",
                             "model": model,
                             "usage": dict(report_result.usage),
                             "md": md_text,
-                            "error": final_report.get("error")
+                            "error": report_data.get("error")
                             or (
                                 None
                                 if report_result.success
@@ -751,7 +752,7 @@ class Workspace:
 
                 upsert_workspace_meta(
                     conn,
-                    [("final_report", json.dumps(final_report, sort_keys=True))],
+                    [("final_report", json.dumps(report_data, sort_keys=True))],
                 )
             except Exception as e:
                 log.warning("Failed to build reports: %s", e)

@@ -114,8 +114,7 @@ SQL/prompt nodes: `sql` OR `prompt`, `output_columns`.
 - `output_columns` — (sql/prompt nodes only) maps `view_name -> [required_columns]`. Keys define which views must exist; values define required columns per view. Keys must start with `{name}_`.
 - `validate` — validation queries: `dict[check_name, query]`. Each query is wrapped into a view named `{name}__validation_{check_name}`.
 
-**Allowed libraries in spec modules**: stdlib (pathlib, csv, json, etc.), polars, openpyxl.
-No other third-party imports. Spec modules should be pure data + ingestion logic.
+Spec modules are regular Python modules — import any libraries you need.
 
 ## Key Design Decisions
 

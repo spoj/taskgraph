@@ -453,6 +453,11 @@ def _format_node_tree(nodes: list[Node]) -> list[str]:
     default=None,
     help="Reasoning effort level (default: low)",
 )
+@click.option(
+    "--report/--no-report",
+    default=False,
+    help="Generate LLM-authored final report (default: disabled)",
+)
 def run(
     spec: str | None,
     output: Path | None,
@@ -462,6 +467,7 @@ def run(
     quiet: bool,
     force: bool,
     reasoning_effort: str | None,
+    report: bool,
 ):
     """Run a Taskgraph workspace from a spec module."""
     # Configure logging
@@ -536,7 +542,7 @@ def run(
         log.info("")
 
     needs_llm = any(n.node_type() == "prompt" for n in nodes)
-    needs_client = needs_llm
+    needs_client = needs_llm or report
     if needs_client:
         _require_openrouter_api_key()
 
@@ -548,11 +554,13 @@ def run(
                     model=model,
                     max_iterations=max_iterations,
                     max_concurrency=max_concurrency,
+                    final_report=report,
                 )
         return await workspace.run(
             model=model,
             max_iterations=max_iterations,
             max_concurrency=max_concurrency,
+            final_report=report,
         )
 
     result = asyncio.run(_run())

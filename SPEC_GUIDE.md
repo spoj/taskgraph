@@ -184,7 +184,7 @@ Excel sheet selection uses a fragment:
 
 Relative file paths resolve from the spec file's directory.
 
-- **Allowed imports in spec modules**: `taskgraph`,, `polars`, `openpyxl`, and Python stdlib (`pathlib`, `csv`, `json`, etc.). No other third-party libraries.
+- Spec modules are regular Python modules — import any libraries you need.
 - Callables are invoked at ingest time, not import time. Exceptions are caught and reported with context.
 - Empty tables (0 rows) produce a warning but do not abort the run.
 - Polars handles type inference. If you need specific types, cast explicitly:
